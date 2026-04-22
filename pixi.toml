@@ -1,0 +1,69 @@
+[project]
+name = "duckicelake"
+version = "0.1.0"
+description = "Iceberg v3 REST Catalog proxy on top of DuckLake v1.0"
+authors = ["kevin@fineupp.com"]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[tasks]
+# Postgres lifecycle (uses local data dir under .pgdata)
+pg-init   = "scripts/pg.sh init"
+pg-start  = "scripts/pg.sh start"
+pg-stop   = "scripts/pg.sh stop"
+pg-status = "scripts/pg.sh status"
+pg-psql   = "scripts/pg.sh psql"
+
+# MinIO (S3-compatible) lifecycle
+minio-start = "scripts/minio.sh start"
+minio-stop  = "scripts/minio.sh stop"
+
+# Backends up together
+backends-up   = { depends-on = ["pg-start", "minio-start"] }
+backends-down = { depends-on = ["pg-stop"], cmd = "scripts/minio.sh stop" }
+
+# Catalog bootstrap (creates ducklake catalog in postgres + s3 bucket layout)
+ducklake-init = "python -m duckicelake.bootstrap"
+
+# Run the Iceberg REST proxy
+serve     = "uvicorn duckicelake.server:app --host 0.0.0.0 --port 8181 --reload"
+serve-hi  = "uvicorn duckicelake.server:app --host 0.0.0.0 --port 8181 --workers 4 --log-level warning"
+
+# Smoke test against a running server
+smoke = "python -m duckicelake.smoke"
+
+# Full-fat DuckDB-as-Iceberg-client test
+duckdb-client = "python -m duckicelake.duckdb_client"
+
+# Integration test suite
+test = "pytest -xvs tests/"
+
+[dependencies]
+python              = "3.12.*"
+postgresql          = ">=16,<17"
+duckdb              = ">=1.4,<2"
+python-duckdb       = ">=1.4,<2"
+fastapi             = ">=0.115,<1"
+uvicorn             = ">=0.32,<1"
+pydantic            = ">=2.9,<3"
+psycopg             = ">=3.2,<4"
+psycopg-pool        = ">=3.2,<4"
+httpx               = ">=0.27,<1"
+pyarrow             = ">=18,<22"
+orjson              = ">=3.10,<4"
+minio-server        = "*"
+boto3               = ">=1.35,<2"
+botocore            = ">=1.35,<2"
+defusedxml          = ">=0.7,<1"
+pytz                = "*"
+fastavro            = ">=1.9,<2"
+rich                = ">=13,<15"
+pyjwt               = ">=2.8,<3"
+python-multipart    = ">=0.0.17,<1"
+prometheus_client   = ">=0.20,<1"
+python-json-logger  = ">=2.0,<4"
+pytest              = ">=8,<9"
+
+[pypi-dependencies]
+duckicelake = { path = ".", editable = true }
+pyiceberg = { version = ">=0.10,<1", extras = ["pyarrow"] }

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.34.0
+          cache: true
+
+      # Start postgres + MinIO via the pixi tasks so the test runtime
+      # matches what developers see locally. scripts/{pg,minio}.sh
+      # daemonise and write PID files — we `backends-up` then rely on
+      # the session-scoped pytest fixture to bootstrap + spawn uvicorn.
+      - name: Start backends (postgres + minio)
+        run: pixi run pg-init && pixi run backends-up
+
+      - name: Bootstrap DuckLake catalog
+        run: pixi run ducklake-init
+
+      - name: Run integration tests
+        run: pixi run test
+
+      - name: End-to-end demo assertions
+        run: pixi run duckdb-client
+
+      - name: Stop backends
+        if: always()
+        run: pixi run backends-down

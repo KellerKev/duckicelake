@@ -1,0 +1,22 @@
+# Local backends (pixi-managed, never checked in)
+.pixi/
+.pgdata/
+.pgsock/
+.miniodata/
+.data/
+
+# Build / test artefacts
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editor / tool state
+.claude/
+.python-version
+.DS_Store
+
+# Secrets — never commit env files
+.env
+.env.*
+!.env.example
