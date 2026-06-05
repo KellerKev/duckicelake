@@ -7,6 +7,56 @@ demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`
 extension, Trino, Spark) read rows directly from S3 — and write back via
 register-in-place commits that DuckLake atomically records.
 
+## Demos
+
+Three short real-terminal recordings (vhs / ttyd, no animation, no mocks):
+
+### 🎯 Architectural proof — Iceberg view on top of DuckLake _(with code on screen)_
+
+Every step shows its source first, then runs it. Same Parquet on S3,
+same Postgres rows; two extension paths (Iceberg REST via PyIceberg +
+DuckDB iceberg-ext, and DuckLake direct via DuckDB ducklake-ext) see
+exactly the same data. A row written via DuckLake direct appears in
+both Iceberg readers automatically. Ends with the snapshot-id identity
+check: `DuckLake HEAD == Iceberg current-snapshot-id == ducklake.snapshot-id` property.
+
+**▶ [`demo_videos/duckicelake-demo_with_code.mp4`](demo_videos/duckicelake-demo_with_code.mp4)** (2:52 · 1700×1080 · 3.5 MB)
+
+<video src="https://github.com/KellerKev/duckicelake/raw/main/demo_videos/duckicelake-demo_with_code.mp4" controls width="100%"></video>
+
+### Iceberg spec coverage tour _(no code on screen)_
+
+Seven scenes walking through what the catalog actually implements:
+create / append, DuckDB-iceberg-ext readback, time travel via PyIceberg
++ DuckDB `AT (VERSION =>)`, schema evolution via REST `commit-table {
+add-schema + set-current-schema }`, `PyIceberg.delete(predicate)`,
+upgrade-format-version 2 → 3 via the `pyiceberg_v3` shim, final
+TableMetadata tour with refs/schemas/snapshots.
+
+**▶ [`demo_videos/duckicelake-demo_no_code.mp4`](demo_videos/duckicelake-demo_no_code.mp4)** (1:13 · 1700×1050 · 0.7 MB)
+
+<video src="https://github.com/KellerKev/duckicelake/raw/main/demo_videos/duckicelake-demo_no_code.mp4" controls width="100%"></video>
+
+### Companion: `lakesh`
+
+`lakesh` is a small DuckDB-powered SQL shell for Iceberg REST catalogs
+(and DuckLake direct). Profile-based connection management, an
+interactive REPL with `psql`-style meta-commands, one-shot `exec` mode
+for scripts, and an MCP server so LLM agents can query your catalogs
+through the same plumbing. It pairs naturally with duckicelake — just
+point it at the proxy. Source + docs at
+[github.com/KellerKev/lakesh](https://github.com/KellerKev/lakesh).
+
+**▶ [`demo_videos/lakesh-companion-demo.mp4`](demo_videos/lakesh-companion-demo.mp4)** (0:55 · 1700×1000 · 1.3 MB)
+
+<video src="https://github.com/KellerKev/duckicelake/raw/main/demo_videos/lakesh-companion-demo.mp4" controls width="100%"></video>
+
+> GitHub's README renders `<video>` tags inline on github.com — if your
+> viewer doesn't show the player, the markdown links above download or
+> open the file directly.
+
+---
+
 ```
   Iceberg REST client (PyIceberg, DuckDB iceberg ext, Trino, Spark, …)
               │  HTTP (Iceberg OpenAPI v3)
