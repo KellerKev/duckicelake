@@ -25,20 +25,6 @@ check: `DuckLake HEAD == Iceberg current-snapshot-id == ducklake.snapshot-id` pr
 📥 Full quality:
 [`duckicelake-demo_with_code.mp4`](demo_videos/duckicelake-demo_with_code.mp4) (2:52 · 1700×1080 · 3.5 MB)
 
-### Iceberg spec coverage tour _(no code on screen)_
-
-Seven scenes walking through what the catalog actually implements:
-create / append, DuckDB-iceberg-ext readback, time travel via PyIceberg
-+ DuckDB `AT (VERSION =>)`, schema evolution via REST `commit-table {
-add-schema + set-current-schema }`, `PyIceberg.delete(predicate)`,
-upgrade-format-version 2 → 3 via the `pyiceberg_v3` shim, final
-TableMetadata tour with refs/schemas/snapshots.
-
-![duckicelake feature tour](demo_videos/duckicelake-demo_no_code.gif)
-
-📥 Full quality:
-[`duckicelake-demo_no_code.mp4`](demo_videos/duckicelake-demo_no_code.mp4) (1:13 · 1700×1050 · 0.7 MB)
-
 ### Companion: `lakesh`
 
 `lakesh` is a small DuckDB-powered SQL shell for Iceberg REST catalogs
