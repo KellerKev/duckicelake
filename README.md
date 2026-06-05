@@ -20,9 +20,10 @@ exactly the same data. A row written via DuckLake direct appears in
 both Iceberg readers automatically. Ends with the snapshot-id identity
 check: `DuckLake HEAD == Iceberg current-snapshot-id == ducklake.snapshot-id` property.
 
-**▶ [`demo_videos/duckicelake-demo_with_code.mp4`](demo_videos/duckicelake-demo_with_code.mp4)** (2:52 · 1700×1080 · 3.5 MB)
+![duckicelake architectural proof demo](demo_videos/duckicelake-demo_with_code.gif)
 
-<video src="https://github.com/KellerKev/duckicelake/raw/main/demo_videos/duckicelake-demo_with_code.mp4" controls width="100%"></video>
+📥 Full quality:
+[`duckicelake-demo_with_code.mp4`](demo_videos/duckicelake-demo_with_code.mp4) (2:52 · 1700×1080 · 3.5 MB)
 
 ### Iceberg spec coverage tour _(no code on screen)_
 
@@ -33,9 +34,10 @@ add-schema + set-current-schema }`, `PyIceberg.delete(predicate)`,
 upgrade-format-version 2 → 3 via the `pyiceberg_v3` shim, final
 TableMetadata tour with refs/schemas/snapshots.
 
-**▶ [`demo_videos/duckicelake-demo_no_code.mp4`](demo_videos/duckicelake-demo_no_code.mp4)** (1:13 · 1700×1050 · 0.7 MB)
+![duckicelake feature tour](demo_videos/duckicelake-demo_no_code.gif)
 
-<video src="https://github.com/KellerKev/duckicelake/raw/main/demo_videos/duckicelake-demo_no_code.mp4" controls width="100%"></video>
+📥 Full quality:
+[`duckicelake-demo_no_code.mp4`](demo_videos/duckicelake-demo_no_code.mp4) (1:13 · 1700×1050 · 0.7 MB)
 
 ### Companion: `lakesh`
 
@@ -47,13 +49,10 @@ through the same plumbing. It pairs naturally with duckicelake — just
 point it at the proxy. Source + docs at
 [github.com/KellerKev/lakesh](https://github.com/KellerKev/lakesh).
 
-**▶ [`demo_videos/lakesh-companion-demo.mp4`](demo_videos/lakesh-companion-demo.mp4)** (0:55 · 1700×1000 · 1.3 MB)
+![lakesh companion demo](demo_videos/lakesh-companion-demo.gif)
 
-<video src="https://github.com/KellerKev/duckicelake/raw/main/demo_videos/lakesh-companion-demo.mp4" controls width="100%"></video>
-
-> GitHub's README renders `<video>` tags inline on github.com — if your
-> viewer doesn't show the player, the markdown links above download or
-> open the file directly.
+📥 Full quality:
+[`lakesh-companion-demo.mp4`](demo_videos/lakesh-companion-demo.mp4) (0:55 · 1700×1000 · 1.3 MB)
 
 ---
 
