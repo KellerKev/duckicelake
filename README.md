@@ -4,7 +4,7 @@
   <img src="assets/duckicelake-logo.svg" alt="duckicelake — ducks around an iceberg in a lake" width="640"/>
 </p>
 
-An **Iceberg REST Catalog** proxy on top of **DuckLake v1.0**, with
+An **Iceberg REST Catalog** proxy on top of **DuckLake**, with
 MinIO-backed object storage and real STS credential vending. Materialises
 DuckLake's snapshot / schema / stats state into Iceberg-spec manifests on
 demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "duckicelake"
 version = "0.1.0"
-description = "Iceberg v3 REST Catalog proxy on top of DuckLake v1.0"
+description = "Iceberg v3 REST Catalog proxy on top of DuckLake"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115",
