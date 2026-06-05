@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#cfeaff"/>
+      <stop offset="100%" stop-color="#ffe6c2"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5fb3d6"/>
+      <stop offset="100%" stop-color="#1e6a8c"/>
+    </linearGradient>
+    <linearGradient id="iceTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#bfe5f5"/>
+    </linearGradient>
+    <linearGradient id="iceBot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8ec9dc"/>
+      <stop offset="100%" stop-color="#2f7a96"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff2a8"/>
+      <stop offset="100%" stop-color="#ffcf6b"/>
+    </radialGradient>
+  </defs>
+
+  <!-- sky -->
+  <rect width="800" height="240" fill="url(#sky)"/>
+  <!-- sun -->
+  <circle cx="660" cy="80" r="42" fill="url(#sun)"/>
+  <!-- distant mountains -->
+  <path d="M0,200 L120,130 L220,200 Z" fill="#9bb7c6" opacity="0.6"/>
+  <path d="M180,200 L320,110 L460,200 Z" fill="#7a9caf" opacity="0.55"/>
+  <path d="M420,200 L560,140 L700,200 Z" fill="#9bb7c6" opacity="0.55"/>
+
+  <!-- water -->
+  <rect y="240" width="800" height="160" fill="url(#water)"/>
+  <!-- water highlights -->
+  <path d="M30,270 q20,-6 40,0 t40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.7"/>
+  <path d="M520,290 q20,-6 40,0 t40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.6"/>
+  <path d="M620,350 q20,-6 40,0 t40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.6"/>
+  <path d="M60,340 q20,-6 40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.6"/>
+
+  <!-- ICEBERG: above water -->
+  <polygon points="320,250 400,120 480,250" fill="url(#iceTop)" stroke="#7fb6cf" stroke-width="1"/>
+  <polygon points="400,120 480,250 440,250 410,170" fill="#a8d6e6" opacity="0.7"/>
+  <!-- iceberg "DL" label so it reads as the catalog -->
+  <text x="400" y="220" text-anchor="middle" font-size="28" font-weight="700" fill="#1e6a8c" opacity="0.55">❄</text>
+  <!-- iceberg: below water (submerged mass) -->
+  <polygon points="290,250 510,250 460,360 340,360" fill="url(#iceBot)" opacity="0.85"/>
+  <polygon points="340,360 460,360 420,380 380,380" fill="#1e6a8c" opacity="0.7"/>
+  <!-- water line on iceberg -->
+  <line x1="290" y1="250" x2="510" y2="250" stroke="#ffffff" stroke-width="2" opacity="0.6"/>
+
+  <!-- DUCK 1: left, facing right -->
+  <g transform="translate(140,265)">
+    <ellipse cx="0" cy="10" rx="34" ry="14" fill="#f7d04a"/>
+    <circle cx="26" cy="-4" r="14" fill="#f7d04a"/>
+    <polygon points="38,-4 56,-1 38,4" fill="#ff8c2a"/>
+    <circle cx="29" cy="-7" r="2.2" fill="#222"/>
+    <!-- happy beak smile via tiny curve -->
+    <path d="M22,18 q6,4 14,0" stroke="#d99a2b" stroke-width="1.5" fill="none"/>
+    <!-- wing -->
+    <path d="M-6,4 q12,-10 22,2 q-10,6 -22,-2 z" fill="#e8b624"/>
+    <!-- ripple -->
+    <ellipse cx="0" cy="26" rx="40" ry="3" fill="#ffffff" opacity="0.4"/>
+  </g>
+
+  <!-- DUCK 2: right, facing left -->
+  <g transform="translate(620,278) scale(-1,1)">
+    <ellipse cx="0" cy="10" rx="32" ry="13" fill="#f7d04a"/>
+    <circle cx="24" cy="-3" r="13" fill="#f7d04a"/>
+    <polygon points="36,-3 52,0 36,5" fill="#ff8c2a"/>
+    <circle cx="26" cy="-6" r="2" fill="#222"/>
+    <path d="M20,17 q6,4 13,0" stroke="#d99a2b" stroke-width="1.5" fill="none"/>
+    <path d="M-6,3 q12,-10 22,2 q-10,6 -22,-2 z" fill="#e8b624"/>
+    <ellipse cx="0" cy="24" rx="38" ry="3" fill="#ffffff" opacity="0.4"/>
+  </g>
+
+  <!-- DUCK 3: small duckling, front-left -->
+  <g transform="translate(230,340)">
+    <ellipse cx="0" cy="6" rx="22" ry="9" fill="#f7d04a"/>
+    <circle cx="17" cy="-3" r="9" fill="#f7d04a"/>
+    <polygon points="24,-3 35,-1 24,3" fill="#ff8c2a"/>
+    <circle cx="19" cy="-5" r="1.6" fill="#222"/>
+    <path d="M14,11 q4,3 9,0" stroke="#d99a2b" stroke-width="1.2" fill="none"/>
+    <ellipse cx="0" cy="18" rx="26" ry="2" fill="#ffffff" opacity="0.4"/>
+  </g>
+
+  <!-- DUCK 4: small duckling, front-right -->
+  <g transform="translate(540,345) scale(-1,1)">
+    <ellipse cx="0" cy="6" rx="22" ry="9" fill="#f7d04a"/>
+    <circle cx="17" cy="-3" r="9" fill="#f7d04a"/>
+    <polygon points="24,-3 35,-1 24,3" fill="#ff8c2a"/>
+    <circle cx="19" cy="-5" r="1.6" fill="#222"/>
+    <path d="M14,11 q4,3 9,0" stroke="#d99a2b" stroke-width="1.2" fill="none"/>
+    <ellipse cx="0" cy="18" rx="26" ry="2" fill="#ffffff" opacity="0.4"/>
+  </g>
+
+  <!-- tiny hearts above ducks for "everyone is happy" -->
+  <text x="160" y="240" font-size="14" fill="#e85a7a">♥</text>
+  <text x="600" y="252" font-size="14" fill="#e85a7a">♥</text>
+  <text x="400" y="100" font-size="16" fill="#e85a7a">♥</text>
+
+  <!-- wordmark -->
+  <text x="400" y="385" text-anchor="middle" font-size="22" font-weight="700" fill="#ffffff" letter-spacing="2">
+    duckicelake
+  </text>
+</svg>
