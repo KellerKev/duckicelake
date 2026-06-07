@@ -802,3 +802,38 @@ def _next_metadata_version(client, bucket: str, prefix: str, current_snap_id: in
         if e.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey"}:
             raise
     return 1
+
+
+def materialise_table(
+    catalog: DuckLakeCatalog,
+    ns: list[str],
+    table: str,
+) -> dict[str, Any]:
+    """Build base metadata for a table and run materialize_all against it.
+
+    Mirrors the construction in server._build_load_response so the
+    NOTIFY listener can materialise without going through the HTTP path.
+    Returns the final metadata dict (same shape materialize_all returns).
+    """
+    from .iceberg import build_table_metadata
+
+    columns = catalog.get_columns(ns, table)
+    table_uuid = catalog.table_uuid(ns, table)
+    s3 = catalog.settings.s3
+    table_prefix = s3.table_prefix(ns[0], table)
+    loc = f"s3://{s3.bucket}/{table_prefix}".rstrip("/")
+    metadata_prefix = f"{table_prefix}metadata/"
+
+    base_metadata = build_table_metadata(
+        table_uuid=table_uuid,
+        location=loc,
+        columns=columns,
+        properties=None,
+    )
+    return materialize_all(
+        catalog=catalog,
+        ns=ns,
+        table=table,
+        base_metadata=base_metadata,
+        metadata_prefix=metadata_prefix,
+    )

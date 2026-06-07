@@ -960,6 +960,134 @@ class DuckLakeCatalog:
             )
         """)
 
+    # ---- eager-materialisation sidecar --------------------------------
+    # DuckLake-direct writes (DuckDB clients attaching `ducklake:` and
+    # running INSERT/UPDATE/DELETE) commit straight into
+    # public.ducklake_snapshot without going through the REST proxy. The
+    # lazy LoadTable path still materialises them on first read, but
+    # external readers pay that cost. The trigger + listener below
+    # materialise eagerly so S3 metadata is warm immediately after the
+    # DuckLake commit.
+
+    def _ensure_materialisation_sidecar(self, cur) -> None:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.duckicelake_materialisation_log (
+                ducklake_snapshot_id  BIGINT PRIMARY KEY,
+                status                TEXT NOT NULL,
+                iceberg_snapshot_id   BIGINT,
+                error                 TEXT,
+                materialised_at       TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        # Notify function. Fires `NOTIFY duckicelake_snapshot, '<snap_id>'`
+        # after every insert into ducklake_snapshot. CREATE OR REPLACE so
+        # re-running on a newer proxy version cleanly updates the body.
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION public.duckicelake_notify_snapshot()
+            RETURNS trigger AS $$
+            BEGIN
+              PERFORM pg_notify('duckicelake_snapshot', NEW.snapshot_id::text);
+              RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        # Trigger creation guarded — DROP IF EXISTS so we can re-create
+        # idempotently without leaking duplicate triggers.
+        cur.execute("""
+            DROP TRIGGER IF EXISTS duckicelake_snapshot_notify
+            ON public.ducklake_snapshot
+        """)
+        cur.execute("""
+            CREATE TRIGGER duckicelake_snapshot_notify
+            AFTER INSERT ON public.ducklake_snapshot
+            FOR EACH ROW
+            EXECUTE FUNCTION public.duckicelake_notify_snapshot()
+        """)
+
+    def tables_touched_by_snapshot(
+        self, snapshot_id: int,
+    ) -> list[tuple[str, str]]:
+        """Return (schema, table) pairs whose data files reference this
+        DuckLake snapshot — either as `begin_snapshot` (file added) or
+        `end_snapshot` (file expired). Used by the notify listener to
+        decide which tables to materialise after each DuckLake commit.
+
+        Mirrors the touched-snapshot CTE from list_snapshots but inverts
+        the direction: snapshot → tables instead of table → snapshots.
+        """
+        with self.pg_cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT s.schema_name, t.table_name
+                FROM public.ducklake_data_file d
+                JOIN public.ducklake_table  t ON t.table_id = d.table_id
+                JOIN public.ducklake_schema s ON s.schema_id = t.schema_id
+                WHERE (d.begin_snapshot = %s OR d.end_snapshot = %s)
+                  AND t.end_snapshot IS NULL
+                  AND s.end_snapshot IS NULL
+                """,
+                (snapshot_id, snapshot_id),
+            )
+            return [(r[0], r[1]) for r in cur.fetchall()]
+
+    def record_materialisation(
+        self,
+        snapshot_id: int,
+        *,
+        status: str,
+        iceberg_snapshot_id: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Upsert a row in duckicelake_materialisation_log. status is one
+        of 'pending' | 'done' | 'failed'."""
+        with self.pg_cursor() as cur:
+            self._ensure_materialisation_sidecar(cur)
+            cur.execute(
+                """
+                INSERT INTO public.duckicelake_materialisation_log
+                    (ducklake_snapshot_id, status, iceberg_snapshot_id,
+                     error, materialised_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (ducklake_snapshot_id) DO UPDATE
+                  SET status              = EXCLUDED.status,
+                      iceberg_snapshot_id = EXCLUDED.iceberg_snapshot_id,
+                      error               = EXCLUDED.error,
+                      materialised_at     = EXCLUDED.materialised_at
+                """,
+                (snapshot_id, status, iceberg_snapshot_id, error),
+            )
+
+    def pending_materialisations(self, lookback_minutes: int = 60) -> list[int]:
+        """Snapshot ids that exist in `ducklake_snapshot` but have no
+        `done` row in our log within the lookback window. Driven by the
+        catch-up scan on listener startup so a brief listener outage
+        doesn't leave snapshots unmaterialised.
+        """
+        with self.pg_cursor() as cur:
+            self._ensure_materialisation_sidecar(cur)
+            cur.execute(
+                """
+                SELECT s.snapshot_id
+                FROM public.ducklake_snapshot s
+                LEFT JOIN public.duckicelake_materialisation_log l
+                  ON l.ducklake_snapshot_id = s.snapshot_id
+                  AND l.status = 'done'
+                WHERE s.snapshot_id IS NOT NULL
+                  AND s.snapshot_time > now() - (%s || ' minutes')::interval
+                  AND l.ducklake_snapshot_id IS NULL
+                ORDER BY s.snapshot_id
+                """,
+                (str(lookback_minutes),),
+            )
+            return [int(r[0]) for r in cur.fetchall()]
+
+    def pg_conninfo(self) -> str:
+        """Public accessor for the Postgres DSN. The notify listener
+        needs an `psycopg.AsyncConnection` separate from the sync pool
+        (LISTEN requires its own conn).
+        """
+        return self._pg_conninfo()
+
     def upsert_table_properties(
         self, ns: list[str], name: str,
         *,

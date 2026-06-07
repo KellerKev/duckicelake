@@ -11,6 +11,22 @@ demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`
 extension, Trino, Spark) read rows directly from S3 — and write back via
 register-in-place commits that DuckLake atomically records.
 
+**Hybrid write model.** Clients can write via the Iceberg REST path *or*
+via DuckLake-direct (DuckDB sessions ATTACHing `ducklake:` and running
+`INSERT` / `UPDATE` / `DELETE`). REST commits build the Iceberg
+metadata inline; DuckLake-direct commits are picked up by a Postgres
+`LISTEN`/`NOTIFY` hook that materialises the Iceberg metadata chain
+(manifest, manifest-list, `metadata.json`, position-delete manifest
+when applicable) on S3 within ~1s of the DuckLake commit. A fresh
+PyIceberg / Trino / Spark reader hits a warm S3 chain on its first
+`LoadTable` — it never has to wait on materialisation. The lazy
+`LoadTable` path is kept as the correctness floor: if the listener is
+down or a notification is lost, the next reader still gets correct
+data; the eager path is a pure latency optimisation. Single elected
+worker per fleet (PG advisory lock), with a startup catch-up scan so
+brief listener outages self-heal. See
+[`src/duckicelake/notify.py`](src/duckicelake/notify.py).
+
 ## Demos
 
 Three short real-terminal recordings (vhs / ttyd, no animation, no mocks):

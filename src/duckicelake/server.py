@@ -30,6 +30,7 @@ from .catalog import DuckLakeCatalog
 from .config import load_settings
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
+from .notify import run_listener as run_notify_listener
 from .models import (
     CommitTableRequest,
     ConfigResponse,
@@ -97,11 +98,25 @@ if os.environ.get("DUCKICELAKE_REQUIRE_AUTH", "0") == "1" and not auth_cfg.enabl
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
     catalog.connect()
     log.info("DuckLake catalog connected: %s", settings.ducklake_uri)
+    # Eager DuckLake-to-Iceberg materialisation listener. Elects one
+    # worker via PG advisory lock; the others poll the lock so they take
+    # over if the elected worker dies. See src/duckicelake/notify.py.
+    listener_task = asyncio.create_task(
+        run_notify_listener(catalog), name="duckicelake-notify-listener",
+    )
     try:
         yield
     finally:
+        listener_task.cancel()
+        try:
+            await listener_task
+        except (asyncio.CancelledError, Exception):
+            # CancelledError is the normal shutdown path; any other
+            # exception we've already logged inside the listener itself.
+            pass
         catalog.close()
 
 
