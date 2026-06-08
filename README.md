@@ -11,21 +11,45 @@ demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`
 extension, Trino, Spark) read rows directly from S3 — and write back via
 register-in-place commits that DuckLake atomically records.
 
-**Hybrid write model.** Clients can write via the Iceberg REST path *or*
-via DuckLake-direct (DuckDB sessions ATTACHing `ducklake:` and running
-`INSERT` / `UPDATE` / `DELETE`). REST commits build the Iceberg
-metadata inline; DuckLake-direct commits are picked up by a Postgres
-`LISTEN`/`NOTIFY` hook that materialises the Iceberg metadata chain
-(manifest, manifest-list, `metadata.json`, position-delete manifest
-when applicable) on S3 within ~1s of the DuckLake commit. A fresh
-PyIceberg / Trino / Spark reader hits a warm S3 chain on its first
-`LoadTable` — it never has to wait on materialisation. The lazy
-`LoadTable` path is kept as the correctness floor: if the listener is
-down or a notification is lost, the next reader still gets correct
-data; the eager path is a pure latency optimisation. Single elected
-worker per fleet (PG advisory lock), with a startup catch-up scan so
-brief listener outages self-heal. See
-[`src/duckicelake/notify.py`](src/duckicelake/notify.py).
+## ⭐ Hybrid write model — write via either path, read from anywhere
+
+The defining feature: **clients can write via the Iceberg REST path
+*or* via DuckLake-direct, and Iceberg readers see both within ~1s**.
+No "sync job", no manual rewrite step, no second-class write path.
+
+- **Iceberg REST writes** (PyIceberg / Trino / Spark `commit-table`):
+  manifest chain + `metadata.json` built inline as part of the commit.
+- **DuckLake-direct writes** (DuckDB sessions ATTACHing `ducklake:` and
+  running `INSERT` / `UPDATE` / `DELETE`): a Postgres `LISTEN`/`NOTIFY`
+  hook fires on the DuckLake commit and the proxy eagerly materialises
+  the full Iceberg metadata chain on S3 — manifest, manifest-list,
+  versioned `vN.metadata.json`, and position-delete manifest when an
+  UPDATE/DELETE produces one. A fresh PyIceberg / Trino / Spark reader
+  hits a warm S3 chain on its first `LoadTable`; nobody waits on
+  materialisation.
+- **Correctness floor**: the lazy `LoadTable` path stays in place. If
+  the listener is disabled (`DUCKICELAKE_DISABLE_NOTIFY=1`), crashes,
+  or misses a notification, the next reader still gets correct data —
+  the eager path is a pure latency optimisation, not the source of
+  truth.
+- **Single elected listener per fleet** via PG advisory lock; other
+  workers poll and take over if the elected one dies. Startup catch-up
+  scan walks any DuckLake snapshots that landed during a listener
+  outage. See [`src/duckicelake/notify.py`](src/duckicelake/notify.py).
+
+### Requirements
+
+> **PostgreSQL is required as the DuckLake metastore.**
+> The proxy talks to DuckLake's catalog tables through a psycopg pool
+> (this is true regardless of the eager hook). The hybrid write model
+> additionally relies on PostgreSQL-specific machinery —
+> `LISTEN` / `NOTIFY`, an `AFTER INSERT` trigger on
+> `ducklake_snapshot`, and `pg_try_advisory_lock` for single-listener
+> election. DuckLake itself supports other backends (SQLite, MySQL,
+> DuckDB), but those would forgo the eager path: writes are still
+> visible through the lazy `LoadTable` materialisation, just without
+> the ~1s warm-S3 guarantee. Switching backends is not currently
+> wired through the proxy's config.
 
 ## Demos
 
