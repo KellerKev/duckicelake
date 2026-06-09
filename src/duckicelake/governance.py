@@ -86,6 +86,17 @@ def ensure_governance_sidecars(cur) -> None:
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
+    # Phase 2 enforcement column: roles that *bypass* the policy. In
+    # Snowflake the policy body inspects CURRENT_ROLE(); rather than execute
+    # SQL per-principal we make the bypass set explicit + declarative. A
+    # principal holding any role in `unmasked_roles` sees unmasked data /
+    # unfiltered rows. `body_sql` stays the masked-value / filter expression
+    # used to synthesise the view-fallback SQL. NULL/empty = nobody bypasses.
+    for _pt in ("duckicelake_masking_policy", "duckicelake_row_access_policy"):
+        cur.execute(
+            f"ALTER TABLE public.{_pt} "
+            f"ADD COLUMN IF NOT EXISTS unmasked_roles TEXT[]"
+        )
     # --- policy attachments ---------------------------------------------
     # A masking policy attaches to a tag or a single column; a row-access
     # policy attaches to a table on a column-list. `columns` holds the
@@ -331,6 +342,21 @@ class GovernanceStore:
             ),
         )
 
+    def audit_load(self, *, principal: str, object_: str, masked_cols: list[str],
+                   applied_policies: list[str], row_filtered: bool) -> None:
+        """Record an enforced LoadTable decision (Phase 2). Best-effort —
+        a failure here must never break the read path, so callers wrap it."""
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            self.audit(
+                cur, principal=principal, operation="load_table",
+                object_=object_,
+                decision="masked" if (masked_cols or row_filtered) else "ok",
+                masked_cols=masked_cols or None,
+                applied_policies=applied_policies or None,
+                detail={"row_filtered": row_filtered},
+            )
+
     def list_audit(self, limit: int = 200) -> list[dict]:
         with self.catalog.pg_cursor(autocommit=False) as cur:
             ensure_governance_sidecars(cur)
@@ -405,31 +431,36 @@ class GovernanceStore:
     # -- policies ---------------------------------------------------------
 
     def create_masking_policy(self, principal: str, name: str,
-                              signature_sql: str, body_sql: str) -> None:
+                              signature_sql: str, body_sql: str,
+                              unmasked_roles: list[str] | None = None) -> None:
         self._create_policy("duckicelake_masking_policy", "create_masking_policy",
-                            principal, name, signature_sql, body_sql)
+                            principal, name, signature_sql, body_sql, unmasked_roles)
 
     def create_row_access_policy(self, principal: str, name: str,
-                                 signature_sql: str, body_sql: str) -> None:
+                                 signature_sql: str, body_sql: str,
+                                 unmasked_roles: list[str] | None = None) -> None:
         self._create_policy("duckicelake_row_access_policy", "create_row_access_policy",
-                            principal, name, signature_sql, body_sql)
+                            principal, name, signature_sql, body_sql, unmasked_roles)
 
     def _create_policy(self, table: str, op: str, principal: str, name: str,
-                       signature_sql: str, body_sql: str) -> None:
+                       signature_sql: str, body_sql: str,
+                       unmasked_roles: list[str] | None) -> None:
         with self.catalog.pg_cursor() as cur:
             ensure_governance_sidecars(cur)
             cur.execute(
                 f"""
-                INSERT INTO public.{table} (name, signature_sql, body_sql)
-                VALUES (%s, %s, %s)
+                INSERT INTO public.{table} (name, signature_sql, body_sql, unmasked_roles)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (name) DO UPDATE
                   SET signature_sql = EXCLUDED.signature_sql,
-                      body_sql = EXCLUDED.body_sql
+                      body_sql = EXCLUDED.body_sql,
+                      unmasked_roles = EXCLUDED.unmasked_roles
                 """,
-                (name, signature_sql, body_sql),
+                (name, signature_sql, body_sql, unmasked_roles),
             )
             self.audit(cur, principal=principal, operation=op, object_=name,
-                       detail={"signature": signature_sql})
+                       detail={"signature": signature_sql,
+                               "unmasked_roles": unmasked_roles})
 
     def attach_policy(self, principal: str, *, policy_kind: str, policy_name: str,
                       target_kind: str, tag_ns: str | None = None,
@@ -521,24 +552,13 @@ class GovernanceStore:
     def effective_policies(self, *, principal: str, schema: str, table: str) -> dict:
         """Fetch the rows needed to derive the policy set for principal +
         table, then delegate to the pure `resolve_effective_policies`."""
-        columns = [c.name for c in self.catalog.get_columns([schema], table)]
-        with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
-            object_tags = self._fetch_object_tags(cur, schema, table)
-            attachments = self._fetch_attachments(cur)
-            masking_bodies = self._fetch_policy_bodies(cur, "duckicelake_masking_policy")
-            row_bodies = self._fetch_policy_bodies(cur, "duckicelake_row_access_policy")
-            cur.execute(
-                "SELECT role_name FROM public.duckicelake_role_grant "
-                "WHERE principal_sub = %s ORDER BY role_name",
-                (principal,),
-            )
-            roles = [r[0] for r in cur.fetchall()]
+        inp = self.resolution_inputs(schema, table)
+        roles = self.roles_for_principal(principal)
         return resolve_effective_policies(
-            principal=principal, schema=schema, table=table, columns=columns,
-            roles_for_principal=roles, object_tags=object_tags,
-            attachments=attachments, masking_bodies=masking_bodies,
-            row_bodies=row_bodies,
+            principal=principal, schema=schema, table=table,
+            columns=inp["columns"], roles_for_principal=roles,
+            object_tags=inp["object_tags"], attachments=inp["attachments"],
+            masking_bodies=inp["masking_bodies"], row_bodies=inp["row_bodies"],
         )
 
     @staticmethod
@@ -574,7 +594,31 @@ class GovernanceStore:
 
     @staticmethod
     def _fetch_policy_bodies(cur, table: str) -> dict[str, dict]:
-        cur.execute(f"SELECT name, signature_sql, body_sql FROM public.{table}")
+        cur.execute(
+            f"SELECT name, signature_sql, body_sql, unmasked_roles FROM public.{table}"
+        )
         return {
-            r[0]: {"signature": r[1], "body": r[2]} for r in cur.fetchall()
+            r[0]: {"signature": r[1], "body": r[2], "unmasked_roles": r[3] or []}
+            for r in cur.fetchall()
+        }
+
+    def resolution_inputs(self, schema: str, table: str) -> dict:
+        """Fetch every row needed to derive policies for `schema.table`.
+
+        Shared by `effective_policies` (descriptive) and the Phase 2
+        `PolicyEngine` (enforcing) so both see an identical model.
+        """
+        columns = [c.name for c in self.catalog.get_columns([schema], table)]
+        with self.catalog.pg_cursor(autocommit=False) as cur:
+            ensure_governance_sidecars(cur)
+            object_tags = self._fetch_object_tags(cur, schema, table)
+            attachments = self._fetch_attachments(cur)
+            masking_bodies = self._fetch_policy_bodies(cur, "duckicelake_masking_policy")
+            row_bodies = self._fetch_policy_bodies(cur, "duckicelake_row_access_policy")
+        return {
+            "columns": columns,
+            "object_tags": object_tags,
+            "attachments": attachments,
+            "masking_bodies": masking_bodies,
+            "row_bodies": row_bodies,
         }

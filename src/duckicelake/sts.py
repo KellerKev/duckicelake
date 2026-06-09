@@ -137,6 +137,7 @@ def vend_credentials(
     data_file_uris: list[str] | None = None,
     duration_seconds: int = 3600,
     session_name: str | None = None,
+    principal: str | None = None,
 ) -> VendedCredentials:
     """Mint temporary credentials for a single table.
 
@@ -147,6 +148,11 @@ def vend_credentials(
     from DuckLake's `ducklake_data_file` catalog table). When provided,
     reads are restricted to exactly those object keys. For writes we still
     have to allow the DuckLake data-path prefix (we can't predict filenames).
+
+    `principal` (governance) stamps the STS session name so MinIO audit logs
+    attribute vended creds to a principal. The Phase 2 hook for *withholding*
+    creds from principals who must be masked (coarse, file-granularity) lands
+    with the pre-masked-file work in Phase 4 — see GOVERNANCE.md.
     """
     write_prefix = s3.data_prefix  # DuckLake's flat layout
     read_keys = _keys_from_uris(data_file_uris or [], s3.bucket)
@@ -159,7 +165,8 @@ def vend_credentials(
     sts = _sts_client(s3)
     resp = sts.assume_role(
         RoleArn=DEFAULT_ROLE_ARN,
-        RoleSessionName=session_name or f"iceberg-{namespace}-{table}"[:64],
+        RoleSessionName=(session_name
+                         or f"ice-{principal or 'anon'}-{namespace}-{table}"[:64]),
         Policy=json.dumps(policy),
         DurationSeconds=duration_seconds,
     )

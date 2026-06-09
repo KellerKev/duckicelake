@@ -5,10 +5,10 @@ phasing live in [`duckicelake_governance.md`](duckicelake_governance.md).
 This document tracks what is **actually implemented** on the
 `experimental_governance` branch.
 
-> **Status: Phase 1 only.** The authoring surface + audit trail are live.
-> **Nothing is enforced yet** — no column is masked, no row is filtered, no
-> credential is withheld. Phase 1 is pure foundation, zero behavioural risk
-> to the existing read/write paths.
+> **Status: Phases 1 + 2.** Phase 1 = authoring surface + audit. Phase 2 =
+> Iceberg REST enforcement at LoadTable (per-principal column masking + row
+> filter signals, audited). Phases 3–5 (DuckLake-direct RLS, pre-masked
+> files, LLM-agent surface) are not yet built.
 
 ## What Phase 1 ships
 
@@ -27,6 +27,41 @@ borrowing the catalog's Postgres pool. The REST router is mounted additively
 in [server.py](src/duckicelake/server.py) via `include_router`, so the core
 Iceberg REST surface is untouched.
 
+## What Phase 2 ships — Iceberg REST enforcement
+
+| Piece | Where |
+|---|---|
+| Policy engine: per-principal plan, view-SQL generation, metadata stamping | [src/duckicelake/policies.py](src/duckicelake/policies.py) |
+| LoadTable enforcement (read path) threading principal claims | `_build_load_response` in [server.py](src/duckicelake/server.py) |
+| `unmasked_roles` bypass on masking / row-access policies | [governance.py](src/duckicelake/governance.py) |
+| STS vending: principal-stamped session names | [sts.py](src/duckicelake/sts.py) |
+
+**How enforcement is decided.** At `GET LoadTable` the proxy reads the
+caller's claims (`sub` + `roles`), asks the `PolicyEngine` for the table's
+plan, and stamps the returned metadata. The bypass is **declarative**: a
+principal holding any role in a policy's `unmasked-roles` sees unmasked data.
+This replaces evaluating Snowflake's `CURRENT_ROLE()` in the policy body —
+the body is used purely as the masked-value / filter expression.
+
+**What gets stamped** (per masked principal):
+
+- Column `doc` annotation on every masked field (universal "this is governed" signal).
+- `duckicelake.masked-columns` = comma-list; `duckicelake.mask.<col>` = the masked SQL expression.
+- `duckicelake.row-filter` **and** `iceberg.row-filter` (the Trino/Spark fast-path key) when a row policy applies.
+- `duckicelake.masking-view-sql` — the `SELECT` a PyIceberg/DuckDB deployment materialises as an Iceberg view for byte-level masking.
+- One `load_table` row in the audit trail recording the masked columns + applied policies.
+
+**Honest enforcement limits (by engine).** An Iceberg REST client reads the
+Parquet bytes itself, so editing metadata cannot mask bytes on its own:
+
+- **Trino / Spark** — honor the `iceberg.row-filter` + column-mask properties → real enforcement.
+- **PyIceberg / DuckDB** — ignore those properties; byte-level masking needs the emitted view SQL materialised as an Iceberg view, or pre-masked files (Phase 4). Phase 2 emits the view SQL + annotations; wiring the view-materialisation round-trip is the remaining Phase 2→3 step.
+- **STS** — sessions are now principal-stamped for MinIO audit. Coarse credential withholding for masked principals is file-granularity and lands with Phase 4.
+
+Enforcement is **read-path only** (`GET LoadTable`); create/commit responses
+are unchanged. It is fully defensive — any error in the policy engine logs
+and serves unmasked rather than failing the read.
+
 ## REST surface
 
 All under `/v1/{prefix}/governance` (prefix = catalog name, default `lake`).
@@ -38,8 +73,8 @@ construction in Phase 1.
 ```
 POST /v1/{prefix}/governance/tags                 {namespace, name, allowed-values?}
 POST /v1/{prefix}/governance/object-tags          {object-kind, schema, object?, column?, tag-namespace, tag-name, value?}
-POST /v1/{prefix}/governance/masking-policies      {name, signature, body}
-POST /v1/{prefix}/governance/row-access-policies   {name, signature, body}
+POST /v1/{prefix}/governance/masking-policies      {name, signature, body, unmasked-roles?}
+POST /v1/{prefix}/governance/row-access-policies   {name, signature, body, unmasked-roles?}
 POST /v1/{prefix}/governance/policy-attachments    {policy-kind, policy-name, target-kind, tag-namespace?, tag-name?, schema?, object?, column?, columns?}
 POST /v1/{prefix}/governance/roles                 {name}
 POST /v1/{prefix}/governance/role-grants           {role, principal}
@@ -79,12 +114,12 @@ curl "localhost:8181$P/effective-policies?table=analytics.events&principal=agent
 curl "localhost:8181$P/audit"
 ```
 
-## Not yet implemented (Phase 2+)
+## Not yet implemented (Phase 3+)
 
-- **Phase 2** — Iceberg REST enforcement: thread principal claims into
-  `_build_load_response`, schema-rewrite / view-fallback masking, Trino/Spark
-  property fast-path, STS vending tightening (`policies.py`).
+- **Phase 2 remainder** — materialise the emitted masking view SQL as a real
+  Iceberg view and return its metadata for PyIceberg/DuckDB byte-level masking.
 - **Phase 3** — DuckLake-direct enforcement: Postgres RLS on
   `ducklake_table`/`_column`/`_data_file` + credential gating.
-- **Phase 4** — pre-masked physical files (airtight, 2× storage).
+- **Phase 4** — pre-masked physical files (airtight, 2× storage); coarse STS
+  credential withholding for masked principals.
 - **Phase 5** — LLM-agent surface (`agent` role, `lakesh mcp --as agent`).

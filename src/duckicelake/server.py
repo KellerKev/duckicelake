@@ -26,9 +26,12 @@ from .auth import (
     make_bearer_dependency,
     oauth_token_endpoint,
 )
+from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
 from .config import load_settings
+from .governance import GovernanceStore
 from .governance_api import build_governance_router
+from .policies import PolicyEngine, apply_plan_to_metadata
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
 from .notify import run_listener as run_notify_listener
@@ -82,6 +85,12 @@ settings = load_settings()
 catalog = DuckLakeCatalog(settings)
 auth_cfg: AuthConfig = load_auth_config()
 require_bearer = make_bearer_dependency(auth_cfg)
+
+# Phase 2 governance enforcement. The store/engine share the catalog's PG
+# pool; they're consulted on the read path (LoadTable) to mask columns +
+# filter rows per principal. No-op when no governance objects are authored.
+governance_store = GovernanceStore(catalog)
+policy_engine = PolicyEngine(governance_store)
 
 
 # `DUCKICELAKE_REQUIRE_AUTH=1` fails startup when no OAuth clients are
@@ -454,6 +463,7 @@ def load_table(
     prefix: str,
     namespace: str,
     table: str,
+    request: Request,
     snapshot_id: int | None = None,   # time-travel
     x_iceberg_access_delegation: str | None = Header(default=None),
 ) -> LoadTableResponse:
@@ -468,6 +478,7 @@ def load_table(
         delegation_header=x_iceberg_access_delegation,
         read_only=True,
         snapshot_id_override=snapshot_id,
+        principal_claims=claims_from_request(auth_cfg, request),
     )
 
 
@@ -1201,6 +1212,7 @@ def _build_load_response(
     delegation_header: str | None = None,
     read_only: bool = True,
     snapshot_id_override: int | None = None,
+    principal_claims: dict | None = None,
 ) -> LoadTableResponse:
     columns = catalog.get_columns(ns, table)
     uuid = catalog.table_uuid(ns, table)
@@ -1244,6 +1256,32 @@ def _build_load_response(
         metadata["current-snapshot-id"] = snapshot_id_override
         metadata["refs"] = {"main": {"type": "branch", "snapshot-id": snapshot_id_override}}
 
+    # ---- Phase 2 governance enforcement (read path only) ----
+    # When the caller supplied principal claims (the GET LoadTable path),
+    # consult the policy engine and stamp the returned metadata with the
+    # per-principal masking / row-filter signals. No-op when nothing is
+    # governed. Wrapped defensively: governance must never break a read.
+    principal_for_creds: str | None = None
+    if principal_claims is not None:
+        principal_for_creds = principal_claims.get("sub") or "anonymous"
+        try:
+            plan = policy_engine.plan_for(
+                principal=principal_for_creds,
+                roles=list(principal_claims.get("roles") or []),
+                schema=ns[0], table=table,
+            )
+            if not plan.is_empty():
+                metadata = apply_plan_to_metadata(metadata, plan)
+                governance_store.audit_load(
+                    principal=principal_for_creds, object_=f"{ns[0]}.{table}",
+                    masked_cols=plan.masked_columns,
+                    applied_policies=plan.applied_policies,
+                    row_filtered=plan.row_filter is not None,
+                )
+        except Exception:
+            log.exception("governance enforcement failed for %s.%s — serving unmasked",
+                          ns[0], table)
+
     config_out: dict[str, str] = _base_s3_config()
     if _wants_vended_credentials(delegation_header):
         snap = metadata.get("current-snapshot-id") or 0
@@ -1266,6 +1304,7 @@ def _build_load_response(
             table=table,
             read_only=False,           # see comment above
             data_file_uris=allow_uris,
+            principal=principal_for_creds,
         )
         config_out.update(
             {

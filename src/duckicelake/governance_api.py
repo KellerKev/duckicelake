@@ -26,6 +26,7 @@ from .governance import (
     POLICY_KINDS,
     GovernanceStore,
 )
+from .policies import PolicyEngine
 
 
 # ---- request models ---------------------------------------------------
@@ -52,6 +53,9 @@ class CreatePolicyRequest(BaseModel):
     name: str
     signature_sql: str = Field(alias="signature")
     body_sql: str = Field(alias="body")
+    # Roles that bypass this policy (Phase 2 enforcement). A principal
+    # holding any of these sees unmasked data / unfiltered rows.
+    unmasked_roles: list[str] | None = Field(default=None, alias="unmasked-roles")
     model_config = {"populate_by_name": True}
 
 
@@ -95,6 +99,7 @@ def build_governance_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/v1/{prefix}/governance", tags=["governance"])
     store = GovernanceStore(catalog)
+    engine = PolicyEngine(store)
 
     def _check_prefix(prefix: str) -> None:
         if prefix != settings.catalog_name:
@@ -125,13 +130,15 @@ def build_governance_router(
     @router.post("/masking-policies", status_code=200)
     def create_masking_policy(prefix: str, req: CreatePolicyRequest, request: Request):
         _check_prefix(prefix)
-        store.create_masking_policy(_principal(request), req.name, req.signature_sql, req.body_sql)
+        store.create_masking_policy(_principal(request), req.name, req.signature_sql,
+                                    req.body_sql, req.unmasked_roles)
         return {"status": "created", "policy": req.name}
 
     @router.post("/row-access-policies", status_code=200)
     def create_row_access_policy(prefix: str, req: CreatePolicyRequest, request: Request):
         _check_prefix(prefix)
-        store.create_row_access_policy(_principal(request), req.name, req.signature_sql, req.body_sql)
+        store.create_row_access_policy(_principal(request), req.name, req.signature_sql,
+                                       req.body_sql, req.unmasked_roles)
         return {"status": "created", "policy": req.name}
 
     @router.post("/policy-attachments", status_code=200)
@@ -178,8 +185,22 @@ def build_governance_router(
         if "." not in table:
             raise HTTPException(400, "table must be 'schema.table'")
         schema, tbl = table.split(".", 1)
-        return store.effective_policies(principal=principal or "anonymous",
-                                        schema=schema, table=tbl)
+        principal = principal or "anonymous"
+        derived = store.effective_policies(principal=principal, schema=schema, table=tbl)
+        # Phase 2: also show what would *actually* be enforced for this
+        # principal (after applying the unmasked-roles bypass), using the
+        # principal's authored roles.
+        plan = engine.plan_for(
+            principal=principal, roles=store.roles_for_principal(principal),
+            schema=schema, table=tbl,
+        )
+        derived["enforcement"] = {
+            "masked_columns": plan.masked_columns,
+            "row_filter": plan.row_filter,
+            "applied_policies": plan.applied_policies,
+            "view_sql": plan.view_sql,
+        }
+        return derived
 
     @router.get("/audit", status_code=200)
     def audit(prefix: str, limit: int = 200):
