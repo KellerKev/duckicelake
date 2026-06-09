@@ -40,7 +40,11 @@ DEFAULT_TTL_SECONDS = 3600
 @dataclass(frozen=True)
 class AuthConfig:
     jwt_secret: bytes
-    # client_id -> {"secret": str, "scope": str (space-separated caps)}
+    # client_id -> {"secret": str, "scope": str (space-separated caps),
+    #               "roles": str (space-separated role names)}
+    # `roles` feeds the governance `roles` JWT claim (Phase 1 governance
+    # layer). Empty string = no roles. The policy engine (Phase 2) reads
+    # these to decide masking; in Phase 1 they're authored + carried only.
     clients: dict[str, dict[str, str]]
     ttl_seconds: int
     issuer: str                 # "iss" claim — proxy identity
@@ -64,20 +68,29 @@ WRITE_ACTIONS = {"POST", "PUT", "DELETE", "PATCH"}
 
 
 def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
-    """Parse `id1:secret1|scope,id2:secret2|scope` — empty entries ignored.
+    """Parse `id1:secret1|scope|roles,id2:secret2|scope,...` — empty entries
+    ignored.
 
-    `scope` is optional; default is `*:*:*` (superuser, for dev). Use `|`
-    as the scope separator so secrets can still contain `:`.
+    `scope` and `roles` are optional, in that order, `|`-delimited so
+    secrets can still contain `:`. Defaults: scope `*:*:*` (superuser, for
+    dev), roles empty. `roles` is a space-separated list of governance role
+    names surfaced in the JWT `roles` claim.
     """
     out: dict[str, dict[str, str]] = {}
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair:
             continue
-        # Split off optional scope first.
+        # Split off optional scope + roles first.
         scope = "*:*:*"
+        roles = ""
         if "|" in pair:
-            pair, scope = pair.split("|", 1)
+            fields = pair.split("|")
+            pair = fields[0]
+            if len(fields) >= 2 and fields[1].strip():
+                scope = fields[1].strip()
+            if len(fields) >= 3:
+                roles = fields[2].strip()
         if ":" not in pair:
             raise ValueError(
                 f"DUCKICELAKE_OAUTH_CLIENTS entry missing ':' in {pair!r}"
@@ -85,27 +98,36 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
         cid, csecret = pair.split(":", 1)
         if not cid or not csecret:
             raise ValueError(f"empty id or secret in {pair!r}")
-        out[cid] = {"secret": csecret, "scope": scope.strip()}
+        out[cid] = {"secret": csecret, "scope": scope, "roles": roles}
     return out
 
 
 def _parse_clients_file(path: str) -> dict[str, dict[str, str]]:
-    """JSON file mapping client_id -> {"secret": ..., "scope": ...}.
+    """JSON file mapping client_id -> {"secret": ..., "scope": ..., "roles": ...}.
     Also accepts legacy str values (treated as secret with `*:*:*` scope).
+
+    `roles` may be a list of strings or a single space-separated string;
+    both are normalised to a space-separated string.
     """
     data = json.loads(Path(path).read_text())
     if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a JSON object of id->{{secret,scope}}")
+        raise ValueError(f"{path}: expected a JSON object of id->{{secret,scope,roles}}")
     out: dict[str, dict[str, str]] = {}
     for k, v in data.items():
         if not isinstance(k, str):
             raise ValueError(f"{path}: non-string id {k!r}")
         if isinstance(v, str):
-            out[k] = {"secret": v, "scope": "*:*:*"}
+            out[k] = {"secret": v, "scope": "*:*:*", "roles": ""}
         elif isinstance(v, dict) and "secret" in v:
-            out[k] = {"secret": str(v["secret"]), "scope": str(v.get("scope", "*:*:*"))}
+            raw_roles = v.get("roles", "")
+            roles = " ".join(raw_roles) if isinstance(raw_roles, list) else str(raw_roles)
+            out[k] = {
+                "secret": str(v["secret"]),
+                "scope": str(v.get("scope", "*:*:*")),
+                "roles": roles.strip(),
+            }
         else:
-            raise ValueError(f"{path}: entry {k!r} must be str or {{secret, scope}}")
+            raise ValueError(f"{path}: entry {k!r} must be str or {{secret, scope, roles}}")
     return out
 
 
@@ -145,7 +167,12 @@ def load_auth_config() -> AuthConfig:
 
 # ---------- endpoint-agnostic helpers --------------------------------
 
-def issue_token(cfg: AuthConfig, client_id: str, scope: str | None = None) -> dict:
+def issue_token(
+    cfg: AuthConfig,
+    client_id: str,
+    scope: str | None = None,
+    roles: str | None = None,
+) -> dict:
     now = int(time.time())
     payload: dict[str, object] = {
         "iss": cfg.issuer,
@@ -155,6 +182,10 @@ def issue_token(cfg: AuthConfig, client_id: str, scope: str | None = None) -> di
     }
     if scope:
         payload["scope"] = scope
+    # Governance roles claim (Phase 1). Emitted as a list so the policy
+    # engine can index it directly; absent when the client holds no roles.
+    if roles:
+        payload["roles"] = roles.split()
     token = jwt.encode(payload, cfg.jwt_secret, algorithm=JWT_ALGORITHM)
     return {
         "access_token": token,
@@ -205,7 +236,25 @@ async def oauth_token_endpoint(
     # For this prototype we just bind the full client scope — refining via
     # intersection would be a follow-up.
     effective_scope = entry.get("scope") or "*:*:*"
-    return issue_token(cfg, client_id=client_id, scope=effective_scope)
+    effective_roles = entry.get("roles") or ""
+    return issue_token(
+        cfg, client_id=client_id, scope=effective_scope, roles=effective_roles,
+    )
+
+
+def claims_from_request(cfg: AuthConfig, request: Request) -> dict:
+    """Best-effort decode of the caller's claims for attribution/audit.
+
+    When auth is disabled returns an `anonymous` stub so callers always get
+    a `sub`. When enabled the bearer middleware has already rejected bad
+    tokens before the handler runs, so a decode failure here is unexpected
+    and surfaces as 401.
+    """
+    if not cfg.enabled:
+        return {"sub": "anonymous", "scope": "*:*:*", "roles": []}
+    claims = verify_bearer(cfg, request.headers.get("authorization"))
+    claims.setdefault("roles", [])
+    return claims
 
 
 def make_bearer_dependency(cfg: AuthConfig):

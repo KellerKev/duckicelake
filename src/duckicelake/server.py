@@ -28,6 +28,7 @@ from .auth import (
 )
 from .catalog import DuckLakeCatalog
 from .config import load_settings
+from .governance_api import build_governance_router
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
 from .notify import run_listener as run_notify_listener
@@ -199,6 +200,13 @@ async def oauth_tokens(
     )
 
 
+# ---- governance layer (Phase 1, experimental) -------------------------
+# Snowflake-shaped authoring surface + audit. Additive: mounted as its own
+# router so the core Iceberg REST surface above is untouched. No enforcement
+# yet — see GOVERNANCE.md and src/duckicelake/governance.py.
+app.include_router(build_governance_router(catalog, settings, auth_cfg))
+
+
 # ---- error handling ---------------------------------------------------
 
 @app.exception_handler(HTTPException)
@@ -256,6 +264,17 @@ SUPPORTED_ENDPOINTS = [
     "POST /v1/{prefix}/namespaces/{namespace}/views",
     "GET /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
+    # --- Phase 1 governance layer (experimental) ---
+    "POST /v1/{prefix}/governance/tags",
+    "POST /v1/{prefix}/governance/object-tags",
+    "POST /v1/{prefix}/governance/masking-policies",
+    "POST /v1/{prefix}/governance/row-access-policies",
+    "POST /v1/{prefix}/governance/policy-attachments",
+    "POST /v1/{prefix}/governance/roles",
+    "POST /v1/{prefix}/governance/role-grants",
+    "POST /v1/{prefix}/governance/object-grants",
+    "GET /v1/{prefix}/governance/effective-policies",
+    "GET /v1/{prefix}/governance/audit",
 ]
 
 
