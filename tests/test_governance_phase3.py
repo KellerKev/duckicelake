@@ -514,3 +514,175 @@ def test_fail_open_on_unmaterializable_view(client, settings):
     vends = [e for e in audit if e["operation"] == "ducklake_credentials"
              and e["object"] == f"{ns}.events"]
     assert vends and vends[0]["decision"] == "error_unmasked"
+
+
+# ---- Phase 3a: PG reader role + RLS -----------------------------------------
+
+from datetime import datetime, timedelta, timezone
+
+from duckicelake import pg_rls
+
+
+def _vend(client, ns: str, sub: str, table: str = "events") -> dict:
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"table": table, "principal": sub})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_rls_principal_role_name_pure():
+    a = pg_rls.principal_role_name("bob")
+    b = pg_rls.principal_role_name("bob")
+    assert a == b and a.startswith("duckicelake_p_bob_") and len(a) <= 63
+    hostile = pg_rls.principal_role_name("Robert'); DROP TABLE x;-- " + "x" * 100)
+    assert len(hostile) <= 63
+    # same sanitized form, different subs → distinct roles
+    assert pg_rls.principal_role_name("a.b") != pg_rls.principal_role_name("a_b")
+
+
+def test_rls_ensure_idempotent(settings, direct_catalog):
+    pg_rls.ensure_rls(direct_catalog, settings)
+    pg_rls.ensure_rls(direct_catalog, settings)
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT tablename, count(*) FROM pg_policies "
+            "WHERE policyname = 'duckicelake_rls' GROUP BY tablename")
+        rows = dict(cur.fetchall())
+        # exactly one policy per policied table, on the expected anchors
+        assert all(n == 1 for n in rows.values())
+        assert "ducklake_table" in rows and "ducklake_data_file" in rows
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s",
+                    (settings.reader_group_role,))
+        assert cur.fetchone()
+        # inlined-data payload tables carry no reader grant
+        cur.execute("""
+            SELECT count(*) FROM information_schema.role_table_grants
+            WHERE grantee = %s AND table_name LIKE 'ducklake\\_inlined\\_data\\_%%'
+              AND table_name <> 'ducklake_inlined_data_tables'
+        """, (settings.reader_group_role,))
+        assert cur.fetchone()[0] == 0
+
+
+def test_rls_vended_dsn_is_reader(client, settings):
+    ns = _ns("rdsn")
+    _make_table(client, ns, "events")
+    body = _vend(client, ns, "bob")
+    assert body["pg_role"] and body["pg_role"].startswith("duckicelake_p_bob_")
+    assert "password=" in body["ducklake_dsn"]
+    assert f"user={body['pg_role']}" in body["ducklake_dsn"]
+    assert "READ_ONLY" in body["ducklake_attach_sql"]
+    assert body["pg_valid_until"] is not None
+    with psycopg.connect(body["ducklake_dsn"], autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT session_user, public.duckicelake_session_principal()")
+        role, principal = cur.fetchone()
+        assert role == body["pg_role"] and principal == "bob"
+        # governance sidecars are not readable by the reader
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute("SELECT count(*) FROM public.duckicelake_role_grant")
+
+
+def test_rls_object_grant_allowlist(client, settings):
+    """An explicit select object-grant flips the table to allowlist:
+    ungranted principals can't even see it; granted ones and the owner
+    are unaffected."""
+    ns = _ns("acl")
+    _make_table(client, ns, "events")
+    _seed_rows(settings, ns)
+    client.post("/v1/lake/governance/roles",
+                json={"name": "analysts"}).raise_for_status()
+    client.post("/v1/lake/governance/object-grants",
+                json={"object-kind": "table", "schema": ns, "object": "events",
+                      "privilege": "select", "role": "analysts"}).raise_for_status()
+    client.post("/v1/lake/governance/role-grants",
+                json={"role": "analysts", "principal": "alice"}).raise_for_status()
+
+    bob = _vend(client, ns, "bob")
+    con = _vended_duckdb(settings, bob)
+    with pytest.raises(duckdb.Error, match="does not exist"):
+        con.execute(f'SELECT count(*) FROM lake."{ns}".events')
+    con.close()
+
+    alice = _vend(client, ns, "alice")
+    con = _vended_duckdb(settings, alice)
+    assert con.execute(f'SELECT count(*) FROM lake."{ns}".events').fetchone()[0] == 2
+    con.close()
+
+    # the owner (proxy) is never affected — RLS is not FORCEd
+    con = _root_duckdb(settings)
+    assert con.execute(f'SELECT count(*) FROM lake."{ns}".events').fetchone()[0] == 2
+    con.close()
+
+
+def test_rls_file_layer_interlock(client, settings, direct_catalog):
+    """The dormant Phase-4 contract: the two table properties hide base
+    file rows from non-bypass principals; bypass roles and the owner are
+    unaffected. (Phase 4 sets these when masked exports exist.)"""
+    ns = _ns("ilock")
+    _make_table(client, ns, "events")
+    _seed_rows(settings, ns)
+    client.post("/v1/lake/governance/roles",
+                json={"name": "pii_reader"}).raise_for_status()
+    client.post("/v1/lake/governance/role-grants",
+                json={"role": "pii_reader", "principal": "alice"}).raise_for_status()
+    direct_catalog.upsert_table_properties([ns], "events", set_map={
+        "duckicelake.file-layer-masking": "true",
+        "duckicelake.file-layer-bypass-roles": "pii_reader",
+    })
+
+    bob = _vend(client, ns, "bob")
+    con = _vended_duckdb(settings, bob)
+    assert con.execute(f'SELECT count(*) FROM lake."{ns}".events').fetchone()[0] == 0
+    con.close()
+
+    alice = _vend(client, ns, "alice")
+    con = _vended_duckdb(settings, alice)
+    assert con.execute(f'SELECT count(*) FROM lake."{ns}".events').fetchone()[0] == 2
+    con.close()
+
+    con = _root_duckdb(settings)
+    assert con.execute(f'SELECT count(*) FROM lake."{ns}".events').fetchone()[0] == 2
+    con.close()
+
+
+def test_rls_reader_is_readonly(client, settings):
+    ns = _ns("rro")
+    _make_table(client, ns, "events")
+    bob = _vend(client, ns, "bob")
+    con = _vended_duckdb(settings, bob)
+    with pytest.raises(duckdb.Error, match="read-only"):
+        con.execute(f'INSERT INTO lake."{ns}".events VALUES (9, \'x@x.com\')')
+    con.close()
+    # PG-level belt-and-braces: direct INSERT as the reader role is denied
+    with psycopg.connect(bob["ducklake_dsn"], autocommit=True) as c, c.cursor() as cur:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute("INSERT INTO public.ducklake_metadata VALUES ('x','y',1,NULL)")
+
+
+def test_rls_revend_rotates(client, settings):
+    ns = _ns("rot")
+    _make_table(client, ns, "events")
+    first = _vend(client, ns, "carol")
+    second = _vend(client, ns, "carol")
+    assert first["pg_role"] == second["pg_role"]
+    assert first["ducklake_dsn"] != second["ducklake_dsn"]   # new password
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT expires_at FROM public.duckicelake_pg_principal "
+                    "WHERE pg_role = %s", (first["pg_role"],))
+        assert cur.fetchone()[0] >= datetime.now(timezone.utc) + timedelta(minutes=50)
+    # rotated creds still connect (trust auth in dev; verifies bookkeeping)
+    con = _vended_duckdb(settings, second)
+    con.execute("SELECT 1")
+    con.close()
+
+
+def test_rls_gc_expired_roles(settings, direct_catalog):
+    role, _pw = pg_rls.provision_principal_role(
+        direct_catalog, settings, "ghost-principal",
+        datetime.now(timezone.utc) - timedelta(days=30))
+    pg_rls.gc_expired_roles(direct_catalog)
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        assert cur.fetchone() is None        # past drop grace → dropped
+        cur.execute("SELECT 1 FROM public.duckicelake_pg_principal "
+                    "WHERE pg_role = %s", (role,))
+        assert cur.fetchone() is None
