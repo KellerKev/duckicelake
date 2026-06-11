@@ -136,6 +136,22 @@ class Settings:
     # __masked_{sig} schema via post_attach_sql). Probe-verified; the
     # flag is an opt-out in case a DuckDB release regresses.
     transparent_masking: bool = True
+    # PG row-level security for DuckLake-direct readers: per-principal
+    # LOGIN roles in a duckicelake_reader group, RLS policies on the
+    # ducklake_* catalog tables. Opt-out flag; under dev trust-auth the
+    # predicates run but authentication is not enforceable (documented
+    # in GOVERNANCE.md).
+    rls_enabled: bool = True
+    # NOLOGIN group role carrying all reader grants + RLS targets.
+    reader_group_role: str = "duckicelake_reader"
+
+    def pg_dsn_for(self, user: str, password: str) -> str:
+        """DSN for a vended (non-owner) PG role. Passwords we generate are
+        token_hex — alphanumeric, no conninfo quoting needed."""
+        return (
+            f"dbname={self.pg_database} host={self.pg_host} "
+            f"port={self.pg_port} user={user} password={password}"
+        )
 
     @property
     def pg_dsn(self) -> str:
@@ -175,4 +191,7 @@ def load_settings() -> Settings:
             "DUCKICELAKE_SUPPRESS_ROOT_CREDS", "1") == "1",
         transparent_masking=os.environ.get(
             "DUCKICELAKE_TRANSPARENT_MASKING", "1") == "1",
+        rls_enabled=os.environ.get("DUCKICELAKE_RLS", "1") == "1",
+        reader_group_role=os.environ.get(
+            "DUCKICELAKE_READER_GROUP_ROLE", "duckicelake_reader"),
     )
