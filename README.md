@@ -11,6 +11,13 @@ demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`
 extension, Trino, Spark) read rows directly from S3 — and write back via
 register-in-place commits that DuckLake atomically records.
 
+> **This branch** (`experimental_governance`) additionally ships a
+> Snowflake-style **governance layer** — tags, RBAC, column masking and
+> row-access policies, enforced on *both* read paths (Iceberg REST and
+> DuckLake-direct) and aimed squarely at the "LLM agents must never see
+> PII" use case. See the Governance section below and
+> [GOVERNANCE.md](GOVERNANCE.md).
+
 ## ⭐ Hybrid write model — write via either path, read from anywhere
 
 The defining feature: **clients can write via the Iceberg REST path
@@ -50,6 +57,67 @@ No "sync job", no manual rewrite step, no second-class write path.
 > visible through the lazy `LoadTable` materialisation, just without
 > the ~1s warm-S3 guarantee. Switching backends is not currently
 > wired through the proxy's config.
+
+## 🛡️ Governance: tags, RBAC, masking (experimental)
+
+Snowflake-shaped governance enforced by the catalog, so the same policy
+masks a column for every engine that respects it — authored once, applied
+per principal. The design + phasing live in
+[duckicelake_governance.md](duckicelake_governance.md); what is actually
+implemented is tracked in [GOVERNANCE.md](GOVERNANCE.md).
+
+**The model** (Phase 1): object tags (`pii.email`, hierarchical cascade
+schema → table → column), masking policies + row-access policies (SQL
+bodies with a declarative `unmasked-roles` bypass), policy attachments
+(to a tag or directly to columns/tables), roles + grants, and a complete
+audit trail — all stored in `duckicelake_*` Postgres sidecars and authored
+over REST (`/v1/{prefix}/governance/*`).
+
+**Iceberg REST enforcement** (Phase 2): at `LoadTable` the proxy resolves
+the caller's principal + roles (JWT `roles` claim ∪ sidecar grants) into a
+per-table enforcement plan and stamps the returned metadata — column `doc`
+annotations, `duckicelake.mask.<col>` expressions, `iceberg.row-filter`
+(the Trino/Spark fast-path key), and the generated masking-view SQL. Every
+decision is audited.
+
+**Ad-hoc masking views, both read paths** (Phase 3): the engine
+materialises one physical DuckLake view per (table, mask-signature) —
+`__mask_{table}__{sig}` — that *executes* the mask:
+
+- View-capable REST engines (PyIceberg / Trino / Spark) load it via
+  `GET …/views/…`; LoadTable advertises the caller's view name via the
+  `duckicelake.masking-view-name` property.
+- DuckLake-direct DuckDB clients call
+  `GET /v1/{prefix}/namespaces/{ns}/ducklake-credentials?table=…` and get
+  the PG DSN + ATTACH statement, **read-only prefix-scoped STS creds**
+  (files committed after vending stay readable), their masked view name,
+  and `post_attach_sql` that makes masking **transparent** for unqualified
+  queries (`SET search_path` onto a `__masked_{sig}` schema).
+- Policy or schema changes rotate the signature; stale views are
+  garbage-collected. Per-table opt-out via the
+  `duckicelake.masking-disabled` property.
+
+Everything is **fail-open** (a governance error never breaks a read — it
+serves unmasked and audits the failure) and **root S3 keys are no longer
+embedded in responses by default**, so the cooperative boundary actually
+holds: clients see only vended credentials. The boundary itself is
+documented honestly — a client that names the base table directly still
+reads cleartext; PG RLS and pre-masked physical files are the later,
+airtight tiers ([MISSING.md](MISSING.md)).
+
+Try it against a running stack:
+
+```bash
+./scripts/governance_demo.sh    # author tags/policies/roles via REST + SQL proof
+./scripts/lakesh_demo.sh        # lakesh: unmasked REST read vs vended masked view
+pixi run pytest -q tests/test_governance.py tests/test_governance_phase3.py
+```
+
+The LLM-agent story this is built for: give the agent's token a role
+without the `unmasked-roles` bypass (or no roles at all), point it at the
+proxy — REST or `ducklake-credentials` — and it reads `al***` where a
+human analyst holding `pii_reader` reads `alice@example.com`, through the
+same API, with every access audited.
 
 ## Demos
 
@@ -277,20 +345,6 @@ endpoint/region/url-style; clients are expected to use vended credentials
 convenience set `suppress_root_creds = false` in `duckicelake.toml` (or
 `DUCKICELAKE_SUPPRESS_ROOT_CREDS=0`).
 
-### Configuration
-
-Every `DUCKICELAKE_*` setting can come from, in precedence order:
-
-1. real environment variables,
-2. a `.env` file in the working directory (`DUCKICELAKE_*` keys only),
-3. `./duckicelake.toml` — or the file `DUCKICELAKE_CONFIG_FILE` points at.
-
-See [duckicelake.toml.example](duckicelake.toml.example) for the full key
-map (`[s3] endpoint` ↔ `DUCKICELAKE_S3_ENDPOINT`, top-level
-`suppress_root_creds` ↔ `DUCKICELAKE_SUPPRESS_ROOT_CREDS`, …). File values
-are injected at startup without overriding the real environment, so they
-also feed auth, logging, and the notify listener.
-
 ### Throughput / scale
 
 - Postgres `ConnectionPool` (psycopg-pool) — most LoadTable work hits
@@ -337,8 +391,12 @@ machine.
 
 ### Tests + CI
 
-- 19 `pytest` integration tests covering REST surface, cache LRU,
-  metrics endpoint, Puffin writer byte-level structure.
+- 53 `pytest` tests covering the REST surface, cache LRU, metrics
+  endpoint, Puffin writer byte-level structure, the eager-materialisation
+  listener, config-file loading, and the governance layer end-to-end —
+  including the load-bearing proof that a roleless principal ATTACHing
+  vended DuckLake credentials reads masked rows while a privileged one
+  reads cleartext.
 - GitHub Actions workflow at [.github/workflows/ci.yml](.github/workflows/ci.yml)
   runs `backends-up` + `pytest` + the full `duckdb-client` demo on
   every push.
@@ -402,7 +460,11 @@ Teardown: `pixi run backends-down`.
 | DELETE | `/v1/{prefix}/namespaces/{ns}/tables/{tbl}` | DROP TABLE; `?purgeRequested=true` to clean S3 |
 | POST | `/v1/{prefix}/namespaces/{ns}/tables/{tbl}` | commit (full action set above) |
 | POST | `/v1/{prefix}/tables/rename` | same-namespace rename |
-| GET / POST / DELETE | `/v1/{prefix}/namespaces/{ns}/views[/{v}]` | view CRUD (SQL stored in DuckLake) |
+| GET / POST / DELETE | `/v1/{prefix}/namespaces/{ns}/views[/{v}]` | view CRUD (SQL stored in DuckLake); `__mask_*` names reserved + hidden from listings |
+| GET | `/v1/{prefix}/namespaces/{ns}/ducklake-credentials` | DuckLake-direct vending: DSN + scoped STS creds + masked view + transparent routing (`?table=`, governance Phase 3) |
+| POST | `/v1/{prefix}/governance/{tags, object-tags, masking-policies, row-access-policies, policy-attachments, roles, role-grants, object-grants}` | governance authoring (admin-scoped) |
+| GET | `/v1/{prefix}/governance/effective-policies` | derived policy set for `?table=…&principal=…` |
+| GET | `/v1/{prefix}/governance/audit` | governance + enforcement audit trail |
 | POST | `/v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` | DuckLake compaction + file cleanup |
 
 ## Layout
@@ -415,12 +477,23 @@ duckicelake/
 ├── .github/workflows/ci.yml      # CI: backends-up + pytest + demo
 ├── scripts/
 │   ├── pg.sh                     # Postgres lifecycle
-│   └── minio.sh                  # MinIO lifecycle
+│   ├── minio.sh                  # MinIO lifecycle
+│   ├── governance_demo.sh        # author tags/policies/roles via REST + SQL proof
+│   ├── lakesh_demo.sh            # lakesh against the governed catalog (vended creds)
+│   ├── sql_proof.py              # masked-vs-unmasked rows from the live policy SQL
+│   └── probe_searchpath.py       # DuckDB search_path transparency probe (Phase 3)
+├── duckicelake.toml.example      # config-file template (env ↔ TOML key map)
 ├── src/duckicelake/
-│   ├── config.py                 # env-driven settings
-│   ├── auth.py                   # OAuth2 + JWT + scope grammar
+│   ├── config.py                 # settings: env > .env > duckicelake.toml
+│   ├── auth.py                   # OAuth2 + JWT + scope grammar + roles claim
 │   ├── catalog.py                # DuckLake wrapper: PG pool + DuckDB read/write split
 │   │                             #   + sidecar tables + LRU metadata cache + S3 client
+│   ├── governance.py             # governance sidecars: tags/policies/roles/grants/audit
+│   ├── governance_api.py         # REST authoring router (/v1/{prefix}/governance/*)
+│   ├── policies.py               # policy engine: per-principal plan, mask signature,
+│   │                             #   masked-view SQL, metadata stamping
+│   ├── masking_views.py          # ad-hoc DuckLake masking views: materialise/GC/transparent
+│   ├── notify.py                 # eager materialisation listener (LISTEN/NOTIFY + election)
 │   ├── types.py                  # Iceberg ↔ DuckDB ↔ DuckLake type translation
 │   ├── bounds.py                 # Iceberg binary bound encoders
 │   ├── iceberg.py                # TableMetadata scaffold
@@ -431,7 +504,7 @@ duckicelake/
 │   ├── pyiceberg_v3.py           # client-side shim: v3 types + v3 manifest writers
 │   ├── materialize.py            # full snapshot-chain materialiser (lazy + cached)
 │   ├── read_manifest.py          # parses client-supplied manifest chains on commit
-│   ├── sts.py                    # MinIO STS AssumeRole + session policies
+│   ├── sts.py                    # MinIO STS AssumeRole + session policies (file/prefix scoped)
 │   ├── observability.py          # Prometheus metrics + JSON logging
 │   ├── models.py                 # Pydantic REST request/response models
 │   ├── server.py                 # FastAPI app: endpoints + middleware + handlers
@@ -442,10 +515,28 @@ duckicelake/
     ├── conftest.py               # session-scoped uvicorn + clean-state fixtures
     ├── test_catalog_surface.py   # REST surface smoke
     ├── test_cache_and_observability.py
+    ├── test_config.py            # config-file loading + precedence + root-key suppression
+    ├── test_governance.py        # Phase 1/2: authoring, audit, plan, LoadTable stamping
+    ├── test_governance_phase3.py # masking views, ducklake-credentials, STS scoping, fail-open
+    ├── test_notify_materialise.py# eager materialisation end-to-end
     └── test_puffin.py            # byte-level Puffin writer tests
 ```
 
 ## Configuration
+
+Every `DUCKICELAKE_*` setting can come from, in precedence order:
+
+1. real environment variables,
+2. a `.env` file in the working directory (`DUCKICELAKE_*` keys only),
+3. `./duckicelake.toml` — or the file `DUCKICELAKE_CONFIG_FILE` points at.
+
+See [duckicelake.toml.example](duckicelake.toml.example) for the TOML key
+map: top-level `key` ↔ `DUCKICELAKE_KEY`, `[section] key` ↔
+`DUCKICELAKE_SECTION_KEY` (so `[s3] endpoint` is `DUCKICELAKE_S3_ENDPOINT`),
+booleans as `true`/`false`. File values are injected at startup without
+overriding the real environment, so they also feed auth, logging, and the
+notify listener. `duckicelake.toml` and `.env` are gitignored — they may
+carry secrets.
 
 | Var | Default | Purpose |
 |---|---|---|
@@ -459,6 +550,11 @@ duckicelake/
 | `DUCKICELAKE_S3_BUCKET` | `lakehouse` | |
 | `DUCKICELAKE_S3_ROOT_KEY` / `_ROOT_SECRET` | `minioadmin` | dev defaults; production: IAM role / IRSA / Vault |
 | `DUCKICELAKE_S3_PREFIX` | `data/` | |
+| `DUCKICELAKE_S3_PATH_STYLE` | `1` | path-style addressing (MinIO) |
+| `DUCKICELAKE_CONFIG_FILE` | *(unset → `./duckicelake.toml`)* | alternate TOML config path |
+| `DUCKICELAKE_SUPPRESS_ROOT_CREDS` | `1` | omit root S3 keys from response configs; `0` is dev-only (bypasses governance masking) |
+| `DUCKICELAKE_TRANSPARENT_MASKING` | `1` | `SET search_path` transparent routing from `ducklake-credentials` |
+| `DUCKICELAKE_DISABLE_NOTIFY` | *(unset)* | `1` → disable the eager materialisation listener |
 | `DUCKICELAKE_DEFAULT_FORMAT_VERSION` | `2` | flip to `3` once your writer ecosystem supports it |
 | `DUCKICELAKE_CACHE_MAX` | `1024` | LRU cap for in-process metadata cache |
 | `DUCKICELAKE_LOG_FORMAT` | `json` | `json` for prod, `text` for dev |
@@ -496,6 +592,11 @@ surface is effectively complete; remaining gaps are:
 
 - **Architectural** (DuckLake-blocked): true divergent branches,
   per-table `set-location`, real KMS envelope encryption.
+- **Governance escalation tiers**: the implemented masking is
+  cooperative-client by design; PG row-level security behind a dedicated
+  reader role and pre-masked physical files (airtight, 2× storage) are
+  the planned hardening for adversarial clients — see
+  [GOVERNANCE.md](GOVERNANCE.md) and [MISSING.md](MISSING.md).
 - **Upstream** (other-project-blocked): Spark v3-format writes (Spark
   3.x), DuckDB iceberg-ext v3 features, DuckDB session TZ shifting
   timestamp stats.
