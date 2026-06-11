@@ -117,6 +117,19 @@ class S3Settings:
         # Used for scoping STS policies to a specific table's objects.
         return f"{self.data_prefix}{namespace}/{table}/"
 
+    def masked_table_prefix(self, namespace: str, table: str) -> str:
+        """Root of a table's file-layer masked exports. Deliberately under
+        `data_prefix` (the vended ListBucket condition covers globbing)
+        but disjoint from `table_prefix` — masked-only credentials must
+        never reach base bytes, and DuckLake's own cleanup tooling must
+        never encounter foreign Parquet inside a table dir."""
+        return f"{self.data_prefix}__masked__/{namespace}/{table}/"
+
+    def masked_sig_prefix(self, namespace: str, table: str, sig: str) -> str:
+        """One mask-signature's export tree: the credential boundary —
+        masked principals are vended GetObject on exactly this prefix."""
+        return f"{self.masked_table_prefix(namespace, table)}{sig}/"
+
 
 @dataclass(frozen=True)
 class Settings:

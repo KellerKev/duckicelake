@@ -127,6 +127,8 @@ class DuckLakeCatalog:
         self._lock = threading.Lock()                 # serialises the DuckDB write conn
         self._conn: duckdb.DuckDBPyConnection | None = None  # DuckDB write conn
         self._read_conns: queue.Queue | None = None   # DuckDB read pool
+        self._export_lock = threading.Lock()          # serialises file-layer COPY exports
+        self._export_conn: duckdb.DuckDBPyConnection | None = None
         self._pg_pool: ConnectionPool | None = None   # Postgres pool
         self._s3_client: Any = None                   # shared boto3 S3 client
         # Bounded LRU metadata cache keyed on (ns, table) → (snapshot_id, metadata).
@@ -229,6 +231,9 @@ class DuckLakeCatalog:
                 except queue.Empty:
                     break
             self._read_conns = None
+        if self._export_conn is not None:
+            self._export_conn.close()
+            self._export_conn = None
         if self._pg_pool is not None:
             self._pg_pool.close()
             self._pg_pool = None
@@ -273,6 +278,20 @@ class DuckLakeCatalog:
             yield conn
         finally:
             self._read_conns.put(conn)
+
+    @contextmanager
+    def export_cursor(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Dedicated DuckDB connection for long-running COPY exports
+        (governance file-layer masking). Deliberately NOT the write conn —
+        a multi-minute COPY there would hold `_lock` and block every
+        commit — and not the small read pool, which REST reads depend on.
+        Lazily built, serialized by its own lock (exports are naturally
+        sequential: the notify listener is single-elected and request-path
+        exports take a PG advisory lock)."""
+        with self._export_lock:
+            if self._export_conn is None:
+                self._export_conn = self._build_duckdb_conn()
+            yield self._export_conn
 
     @contextmanager
     def pg_cursor(self, *, autocommit: bool = True) -> Iterator[psycopg.Cursor]:
