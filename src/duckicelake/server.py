@@ -36,7 +36,7 @@ from .masking_views import (
     MaskingViewManager,
 )
 from .governance_api import build_governance_router
-from .policies import PolicyEngine, apply_plan_to_metadata
+from .policies import PolicyEngine, apply_plan_to_metadata, mask_signature
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
 from .notify import run_listener as run_notify_listener
@@ -101,6 +101,20 @@ policy_engine = PolicyEngine(governance_store)
 # DuckLake-direct and view-capable REST clients can execute the mask.
 masking_view_manager = MaskingViewManager(catalog, settings)
 
+
+# `DUCKICELAKE_SUPPRESS_ROOT_CREDS=1` omits the root S3 key pair from every
+# response config. Default off (the demo flow hands out root MinIO keys),
+# but any deployment relying on the governance cooperative boundary must
+# set it — with root keys in client hands, masking is bypassable in one line.
+SUPPRESS_ROOT_CREDS = os.environ.get("DUCKICELAKE_SUPPRESS_ROOT_CREDS", "0") == "1"
+
+# Transparent DuckLake-direct masking (`SET search_path` onto a
+# `__masked_{sig}` schema, returned as post_attach_sql by the
+# ducklake-credentials endpoint). Probe-verified to work
+# (scripts/probe_searchpath.py); the flag is an opt-out in case a DuckDB
+# release regresses unqualified-name resolution across attached schemas.
+# The by-name `masked_view` in the response works regardless.
+TRANSPARENT_MASKING = os.environ.get("DUCKICELAKE_TRANSPARENT_MASKING", "1") == "1"
 
 # `DUCKICELAKE_REQUIRE_AUTH=1` fails startup when no OAuth clients are
 # configured — a safety-belt for production deploys so ops can't
@@ -282,6 +296,8 @@ SUPPORTED_ENDPOINTS = [
     "POST /v1/{prefix}/namespaces/{namespace}/views",
     "GET /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
+    # --- Phase 3 governance: DuckLake-direct credential vending ---
+    "GET /v1/{prefix}/namespaces/{namespace}/ducklake-credentials",
     # --- Phase 1 governance layer (experimental) ---
     "POST /v1/{prefix}/governance/tags",
     "POST /v1/{prefix}/governance/object-tags",
@@ -668,6 +684,164 @@ def _build_view_response(ns: list[str], view: str) -> dict[str, Any]:
         "metadata": md,
         "config": _base_s3_config(),
     }
+
+
+# ---- DuckLake-direct credentials (governance Phase 3) ------------------
+
+@app.get("/v1/{prefix}/namespaces/{namespace}/ducklake-credentials")
+def ducklake_credentials(
+    prefix: str,
+    namespace: str,
+    request: Request,
+    table: str | None = None,
+    duration_seconds: int = 3600,
+    principal: str | None = None,
+) -> dict[str, Any]:
+    """Vend everything a DuckLake-direct DuckDB client needs, with the
+    caller's masking applied cooperatively:
+
+      * the Postgres DSN / ATTACH statement for the DuckLake catalog,
+      * read-only S3 creds scoped to the table's (or namespace's) data
+        prefix — prefix- not file-scoped, so files committed after vending
+        stay readable for the session's lifetime,
+      * the caller's masking view (`masked_view`) when a policy applies,
+      * `post_attach_sql` that re-routes *unqualified* queries to the
+        masked view via DuckDB `SET search_path` (`transparent: true`).
+
+    GET + namespace-scoped path so read-only `ns:r` tokens (the LLM-agent
+    shape) pass the bearer middleware. `principal` is honored only when
+    auth is off (dev/test; same precedent as governance/effective-policies).
+
+    Fail-open like the LoadTable path: a governance error degrades to
+    unmasked vending (audited as error_unmasked), never a 500. The masking
+    here is cooperative — see GOVERNANCE.md for the boundary.
+    """
+    _check_prefix(prefix)
+    ns = _parse_namespace(namespace)
+    if not catalog.namespace_exists(ns):
+        raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
+    if table is not None and not catalog.table_exists(ns, table):
+        raise HTTPException(status_code=404, detail=f"Table does not exist: {ns}.{table}")
+
+    claims = claims_from_request(auth_cfg, request)
+    sub = claims.get("sub") or "anonymous"
+    if principal and not auth_cfg.enabled:
+        sub = principal
+
+    alias = settings.catalog_name
+    out: dict[str, Any] = {
+        "ducklake_dsn": settings.pg_dsn,
+        "ducklake_attach_sql": (
+            f"ATTACH '{settings.ducklake_uri}' AS {alias} "
+            f"(DATA_PATH '{settings.ducklake_data_path}')"
+        ),
+        "post_attach_sql": [],
+        "masked_view": None,
+        "mask_signature": None,
+        "transparent": False,
+    }
+
+    decision = "ok"
+    masked_cols: list[str] = []
+    applied: list[str] = []
+    row_filtered = False
+    try:
+        roles = sorted(
+            set(claims.get("roles") or [])
+            | set(governance_store.roles_for_principal(sub))
+        )
+        if table is not None:
+            plan = policy_engine.plan_for(
+                principal=sub, roles=roles, schema=ns[0], table=table,
+            )
+            if not plan.is_empty():
+                masked_cols = plan.masked_columns
+                applied = plan.applied_policies
+                row_filtered = plan.row_filter is not None
+                view = masking_view_manager.ensure_view_for_plan(ns, table, plan)
+                if view:
+                    decision = "masked"
+                    out["masked_view"] = f"{ns[0]}.{view}"
+                    out["mask_signature"] = mask_signature(plan)
+                    if TRANSPARENT_MASKING:
+                        schema = masking_view_manager.ensure_transparent_schema(
+                            ns, table, plan,
+                        )
+                        if schema:
+                            out["transparent"] = True
+                            out["post_attach_sql"] = [
+                                f"SET search_path = '{alias}.{schema},{alias}.{ns[0]}'"
+                            ]
+                else:
+                    # plan demands masking but no view could be materialized
+                    # — fail-open, flag it in the audit trail
+                    decision = "error_unmasked"
+    except Exception:
+        log.exception("ducklake-credentials governance failed for %s.%s "
+                      "— vending unmasked", ns[0], table)
+        decision = "error_unmasked"
+
+    s3 = settings.s3
+    read_prefixes = (
+        [s3.table_prefix(ns[0], table)] if table is not None
+        else [f"{s3.data_prefix}{ns[0]}/"]
+    )
+    try:
+        creds = vend_credentials(
+            s3,
+            namespace=ns[0],
+            table=table or "*",
+            read_only=True,
+            read_prefixes=read_prefixes,
+            duration_seconds=max(900, min(43200, duration_seconds)),
+            principal=sub,
+        )
+        out["s3"] = {
+            "endpoint": s3.endpoint,
+            "region": s3.region,
+            "path-style-access": s3.path_style,
+            "access-key-id": creds.access_key_id,
+            "secret-access-key": creds.secret_access_key,
+            "session-token": creds.session_token,
+            "expiration": creds.expiration_iso,
+        }
+    except Exception:
+        log.exception("ducklake-credentials STS vending failed for %s — %s",
+                      ns[0], "falling back to root keys"
+                      if not SUPPRESS_ROOT_CREDS else "no creds returned")
+        if SUPPRESS_ROOT_CREDS:
+            out["s3"] = None
+            decision = "error_no_creds"
+        else:
+            out["s3"] = {
+                "endpoint": s3.endpoint,
+                "region": s3.region,
+                "path-style-access": s3.path_style,
+                "access-key-id": s3.root_access_key,
+                "secret-access-key": s3.root_secret_key,
+                "session-token": None,
+                "expiration": None,
+            }
+            decision = "error_unmasked" if decision != "masked" else decision
+
+    try:
+        governance_store.audit_load(
+            principal=sub,
+            object_=f"{ns[0]}.{table or '*'}",
+            masked_cols=masked_cols,
+            applied_policies=applied,
+            row_filtered=row_filtered,
+            operation="ducklake_credentials",
+            decision=decision,
+            detail={
+                "transparent": out["transparent"],
+                "masked_view": out["masked_view"],
+            },
+        )
+    except Exception:
+        log.exception("ducklake-credentials audit failed")
+
+    return out
 
 
 @app.post("/v1/{prefix}/tables/rename", status_code=204)
@@ -1224,15 +1398,20 @@ def _wants_vended_credentials(header: str | None) -> bool:
 def _base_s3_config() -> dict[str, str]:
     """Static S3 client config every Iceberg client gets, vended creds or not."""
     s3 = settings.s3
-    return {
+    cfg = {
         "s3.endpoint": s3.endpoint,
         "s3.region": s3.region,
         "s3.path-style-access": "true" if s3.path_style else "false",
-        "s3.access-key-id": s3.root_access_key,
-        "s3.secret-access-key": s3.root_secret_key,
         # DuckDB-style keys (the iceberg extension reads these as-is).
         "s3.url-style": "path" if s3.path_style else "vhost",
     }
+    if not SUPPRESS_ROOT_CREDS:
+        # Demo/dev convenience only — root keys in client hands make every
+        # governance masking layer bypassable. Production sets
+        # DUCKICELAKE_SUPPRESS_ROOT_CREDS=1 and clients rely on vended creds.
+        cfg["s3.access-key-id"] = s3.root_access_key
+        cfg["s3.secret-access-key"] = s3.root_secret_key
+    return cfg
 
 
 def _build_load_response(

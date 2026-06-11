@@ -343,18 +343,23 @@ class GovernanceStore:
         )
 
     def audit_load(self, *, principal: str, object_: str, masked_cols: list[str],
-                   applied_policies: list[str], row_filtered: bool) -> None:
-        """Record an enforced LoadTable decision (Phase 2). Best-effort —
-        a failure here must never break the read path, so callers wrap it."""
+                   applied_policies: list[str], row_filtered: bool,
+                   operation: str = "load_table", decision: str | None = None,
+                   detail: dict | None = None) -> None:
+        """Record an enforced read-path decision (LoadTable, or Phase 3's
+        ducklake-credentials vending via `operation`/`decision`/`detail`).
+        Best-effort — a failure here must never break the read path, so
+        callers wrap it. Defaults preserve the Phase 2 LoadTable shape."""
         with self.catalog.pg_cursor() as cur:
             ensure_governance_sidecars(cur)
             self.audit(
-                cur, principal=principal, operation="load_table",
+                cur, principal=principal, operation=operation,
                 object_=object_,
-                decision="masked" if (masked_cols or row_filtered) else "ok",
+                decision=decision
+                or ("masked" if (masked_cols or row_filtered) else "ok"),
                 masked_cols=masked_cols or None,
                 applied_policies=applied_policies or None,
-                detail={"row_filtered": row_filtered},
+                detail={"row_filtered": row_filtered, **(detail or {})},
             )
 
     def list_audit(self, limit: int = 200) -> list[dict]:

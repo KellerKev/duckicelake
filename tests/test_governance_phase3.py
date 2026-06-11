@@ -4,11 +4,17 @@ Layers (grown stage by stage):
   * `test_view_manager_*` — the MaskingViewManager primitive against the
     live catalog (a direct DuckLakeCatalog beside the session proxy, the
     test_notify_materialise.py pattern).
+  * `test_loadtable_*` / `test_reserved_*` — the REST read path.
+  * `test_ducklake_credentials_*` — the DuckLake-direct vending endpoint,
+    including the load-bearing proof that a roleless principal ATTACHing
+    the vended DSN + creds gets masked rows.
 """
 from __future__ import annotations
 
 import uuid
 
+import boto3
+import duckdb
 import psycopg
 import pytest
 
@@ -228,3 +234,203 @@ def test_masked_namespaces_hidden_from_listing(client, settings, direct_catalog)
     flat = [n[0] for n in namespaces]
     assert ns in flat
     assert schema not in flat
+
+
+# ---- DuckLake-direct credential vending (stage 3) ---------------------------
+
+def _root_duckdb(settings) -> duckdb.DuckDBPyConnection:
+    """A DuckLake-direct session with root creds (operator shape) — used to
+    seed rows the way the demo does."""
+    s3 = settings.s3
+    con = duckdb.connect(":memory:")
+    for ext in ("ducklake", "postgres", "httpfs"):
+        con.execute(f"INSTALL {ext}")
+        con.execute(f"LOAD {ext}")
+    con.execute(
+        f"""
+        CREATE OR REPLACE SECRET root_s3 (
+            TYPE S3, KEY_ID '{s3.root_access_key}',
+            SECRET '{s3.root_secret_key}', REGION '{s3.region}',
+            ENDPOINT '{s3.host}', USE_SSL {str(s3.use_ssl).lower()},
+            URL_STYLE '{"path" if s3.path_style else "vhost"}'
+        )
+        """
+    )
+    con.execute(
+        f"ATTACH 'ducklake:postgres:{settings.pg_dsn}' AS lake "
+        f"(DATA_PATH 's3://{s3.bucket}/{s3.data_prefix}', "
+        f" DATA_INLINING_ROW_LIMIT 0)"
+    )
+    return con
+
+
+def _vended_duckdb(settings, vended: dict) -> duckdb.DuckDBPyConnection:
+    """A DuckLake-direct session shaped exactly like a client following the
+    ducklake-credentials response: returned ATTACH + vended S3 creds."""
+    s3c = vended["s3"]
+    con = duckdb.connect(":memory:")
+    for ext in ("ducklake", "postgres", "httpfs"):
+        con.execute(f"INSTALL {ext}")
+        con.execute(f"LOAD {ext}")
+    host = s3c["endpoint"].rsplit("://", 1)[-1]
+    con.execute(
+        f"""
+        CREATE OR REPLACE SECRET vended_s3 (
+            TYPE S3, KEY_ID '{s3c["access-key-id"]}',
+            SECRET '{s3c["secret-access-key"]}',
+            SESSION_TOKEN '{s3c["session-token"]}',
+            REGION '{s3c["region"]}', ENDPOINT '{host}',
+            USE_SSL {str(s3c["endpoint"].startswith("https")).lower()},
+            URL_STYLE '{"path" if s3c["path-style-access"] else "vhost"}'
+        )
+        """
+    )
+    con.execute(vended["ducklake_attach_sql"])
+    for stmt in vended["post_attach_sql"]:
+        con.execute(stmt)
+    return con
+
+
+def _seed_rows(settings, ns: str) -> None:
+    con = _root_duckdb(settings)
+    con.execute(
+        f'INSERT INTO lake."{ns}".events VALUES '
+        f"(1, 'alice@example.com'), (2, 'bob@example.com')"
+    )
+    con.close()
+
+
+def test_ducklake_credentials_masked_vs_privileged(client, settings):
+    """The load-bearing proof: bob (no roles) sees masked rows through the
+    vended view — transparently for unqualified queries — while alice
+    (pii_reader via sidecar grant) gets no view and reads cleartext. The
+    qualified base table stays readable: this is the cooperative-client
+    boundary, documented in GOVERNANCE.md."""
+    ns = _ns("cred")
+    _make_table(client, ns, "events")
+    _author_demo_policy(client, ns, "events")
+    client.post("/v1/lake/governance/roles",
+                json={"name": "pii_reader"}).raise_for_status()
+    client.post("/v1/lake/governance/role-grants",
+                json={"role": "pii_reader", "principal": "alice"}).raise_for_status()
+    _seed_rows(settings, ns)
+
+    # ---- bob: roleless → masked ----
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"table": "events", "principal": "bob"})
+    assert r.status_code == 200, r.text
+    bob = r.json()
+    assert bob["masked_view"] == f"{ns}.__mask_events__{bob['mask_signature']}"
+    assert bob["transparent"] is True and bob["post_attach_sql"]
+    assert bob["s3"]["session-token"]
+
+    con = _vended_duckdb(settings, bob)
+    # transparent: unqualified query resolves to the masking view
+    emails = {r0[0] for r0 in
+              con.execute("SELECT email FROM events").fetchall()}
+    assert emails == {"al***", "bo***"}
+    # by-name fallback works too
+    sch, view = bob["masked_view"].split(".", 1)
+    emails = {r0[0] for r0 in con.execute(
+        f'SELECT email FROM lake."{sch}"."{view}"').fetchall()}
+    assert emails == {"al***", "bo***"}
+    # cooperative boundary: the qualified base table is still cleartext —
+    # ad-hoc views cannot stop a client that names the base table directly
+    raw = {r0[0] for r0 in con.execute(
+        f'SELECT email FROM lake."{ns}".events').fetchall()}
+    assert raw == {"alice@example.com", "bob@example.com"}
+    con.close()
+
+    # ---- alice: pii_reader (sidecar grant) → unmasked, no view ----
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"table": "events", "principal": "alice"})
+    alice = r.json()
+    assert alice["masked_view"] is None
+    assert alice["transparent"] is False and not alice["post_attach_sql"]
+
+    con = _vended_duckdb(settings, alice)
+    raw = {r0[0] for r0 in con.execute(
+        f'SELECT email FROM lake."{ns}".events').fetchall()}
+    assert raw == {"alice@example.com", "bob@example.com"}
+    con.close()
+
+    # the vending decisions were audited with the new operation
+    audit = client.get("/v1/lake/governance/audit").json()["entries"]
+    vends = [e for e in audit if e["operation"] == "ducklake_credentials"]
+    assert any(e["principal"] == "bob" and e["decision"] == "masked"
+               for e in vends)
+    assert any(e["principal"] == "alice" and e["decision"] == "ok"
+               for e in vends)
+
+
+def test_ducklake_credentials_sts_prefix_scoping(client, settings):
+    """Vended creds are table-prefix-scoped: own table readable (including
+    files committed AFTER vending — the live-session fix), sibling tables
+    403."""
+    ns = _ns("scope")
+    _make_table(client, ns, "events")
+    _make_table_only(client, ns, "secrets")
+    _seed_rows(settings, ns)
+    con = _root_duckdb(settings)
+    con.execute(f'INSERT INTO lake."{ns}".secrets VALUES (1, \'topsecret@x.com\')')
+    con.close()
+
+    creds = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                       params={"table": "events", "principal": "bob"}).json()
+    s3c = creds["s3"]
+    s3 = settings.s3
+    vended = boto3.client(
+        "s3", endpoint_url=s3c["endpoint"], region_name=s3c["region"],
+        aws_access_key_id=s3c["access-key-id"],
+        aws_secret_access_key=s3c["secret-access-key"],
+        aws_session_token=s3c["session-token"],
+    )
+    root = boto3.client(
+        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
+        aws_access_key_id=s3.root_access_key,
+        aws_secret_access_key=s3.root_secret_key,
+    )
+
+    def _keys(prefix: str) -> list[str]:
+        out = []
+        for p in root.get_paginator("list_objects_v2").paginate(
+                Bucket=s3.bucket, Prefix=prefix):
+            out += [o["Key"] for o in p.get("Contents", [])]
+        return out
+
+    own = _keys(s3.table_prefix(ns, "events"))
+    other = _keys(s3.table_prefix(ns, "secrets"))
+    assert own and other, "expected parquet files for both tables"
+
+    vended.get_object(Bucket=s3.bucket, Key=own[0])          # own table: 200
+    import botocore.exceptions
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        vended.get_object(Bucket=s3.bucket, Key=other[0])    # sibling: denied
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+    # a file committed AFTER vending stays readable (prefix, not file list)
+    before = set(own)
+    _seed_rows(settings, ns)
+    new = [k for k in _keys(s3.table_prefix(ns, "events")) if k not in before]
+    assert new, "post-vend commit should add a data file"
+    vended.get_object(Bucket=s3.bucket, Key=new[0])           # still 200
+
+
+def _make_table_only(client, ns: str, table: str) -> None:
+    client.post(f"/v1/lake/namespaces/{ns}/tables",
+                json={"name": table, "schema": SCHEMA_JSON}).raise_for_status()
+
+
+def test_ducklake_credentials_namespace_only(client, settings):
+    """Without ?table the endpoint vends namespace-prefix creds and no view
+    (transparent mode v1 requires a table)."""
+    ns = _ns("nstop")
+    _make_table(client, ns, "events")
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"principal": "bob"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["masked_view"] is None
+    assert body["transparent"] is False
+    assert body["s3"]["session-token"]
+    assert "ATTACH" in body["ducklake_attach_sql"]

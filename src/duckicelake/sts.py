@@ -39,14 +39,20 @@ def _scoped_policy(
     write_prefix: str,
     read_only: bool,
     read_keys: list[str] | None = None,
+    read_prefixes: list[str] | None = None,
 ) -> dict:
     """Build an STS session policy.
 
     Scoping strategy:
-    - `read_only=True`: `s3:GetObject` scoped to the explicit list of
-      existing data/delete file keys, plus the table's metadata prefix.
-      This is the tightest possible read policy — a compromised token
-      can't enumerate or fetch sibling tables' files.
+    - `read_only=True` + `read_keys`: `s3:GetObject` scoped to the explicit
+      list of existing data/delete file keys. Tightest possible read policy
+      — a compromised token can't enumerate or fetch sibling tables' files.
+      Right for snapshot-pinned readers (REST LoadTable); wrong for live
+      DuckLake-direct sessions, which discover files from PG on every query
+      and would 403 on any file committed after vending.
+    - `read_only=True` + `read_prefixes`: `s3:GetObject` on `{prefix}*` —
+      covers a table's current *and future* files. The DuckLake-direct
+      shape (ducklake-credentials endpoint).
     - `read_only=False` (write): `s3:GetObject` widened to the DuckLake
       data prefix. An Iceberg writer HEADs its own newly-uploaded files
       before committing, and those files aren't in any pre-computed list
@@ -77,6 +83,17 @@ def _scoped_policy(
                     "Effect": "Allow",
                     "Action": ["s3:GetObject"],
                     "Resource": [f"arn:aws:s3:::{bucket}/{k}" for k in read_keys],
+                }
+            )
+        if read_prefixes:
+            statements.append(
+                {
+                    "Sid": "ReadOwnPrefixes",
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [
+                        f"arn:aws:s3:::{bucket}/{p}*" for p in read_prefixes
+                    ],
                 }
             )
     else:
@@ -135,6 +152,7 @@ def vend_credentials(
     table: str,
     read_only: bool = False,
     data_file_uris: list[str] | None = None,
+    read_prefixes: list[str] | None = None,
     duration_seconds: int = 3600,
     session_name: str | None = None,
     principal: str | None = None,
@@ -149,18 +167,23 @@ def vend_credentials(
     reads are restricted to exactly those object keys. For writes we still
     have to allow the DuckLake data-path prefix (we can't predict filenames).
 
+    `read_prefixes` (read-only) grants GetObject on whole key prefixes —
+    for long-lived DuckLake-direct sessions that must keep reading files
+    committed after vending (see `_scoped_policy`).
+
     `principal` (governance) stamps the STS session name so MinIO audit logs
     attribute vended creds to a principal. The Phase 2 hook for *withholding*
     creds from principals who must be masked (coarse, file-granularity) lands
     with the pre-masked-file work in Phase 4 — see GOVERNANCE.md.
     """
-    write_prefix = s3.data_prefix  # DuckLake's flat layout
+    write_prefix = s3.data_prefix  # DuckLake writes everything under this
     read_keys = _keys_from_uris(data_file_uris or [], s3.bucket)
     policy = _scoped_policy(
         s3.bucket,
         write_prefix=write_prefix,
         read_only=read_only,
         read_keys=read_keys,
+        read_prefixes=read_prefixes,
     )
     sts = _sts_client(s3)
     resp = sts.assume_role(

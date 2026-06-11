@@ -182,13 +182,17 @@ def mask_signature(plan: TablePolicyPlan, columns: list[str] | None = None) -> s
     Principals whose plans mask the same columns the same way (and share the
     row filter) get the same signature → one physical masking view serves
     them all. The base column set is folded in so an ADD/DROP COLUMN yields
-    a fresh signature (and therefore a fresh view) automatically. Empty plan
-    → "" (no view needed).
+    a fresh signature (and therefore a fresh view) automatically. The table
+    identity is folded in too: the transparent `__masked_{sig}` schema is
+    global, so two same-shaped tables in different namespaces must not
+    collide on it. Empty plan → "" (no view needed).
     """
     if plan.is_empty():
         return ""
     cols = plan.columns if columns is None else columns
     canonical = json.dumps([
+        plan.schema,
+        plan.table,
         sorted((m.column, m.mask_expr) for m in plan.masks),
         plan.row_filter,
         sorted(cols),
