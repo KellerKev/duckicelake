@@ -40,6 +40,7 @@ def _scoped_policy(
     read_only: bool,
     read_keys: list[str] | None = None,
     read_prefixes: list[str] | None = None,
+    deny_prefixes: list[str] | None = None,
 ) -> dict:
     """Build an STS session policy.
 
@@ -61,6 +62,10 @@ def _scoped_policy(
 
     `ListBucket` is always prefix-scoped so neither token can enumerate
     siblings outside the DuckLake data path.
+
+    `deny_prefixes` adds explicit Deny statements (Deny beats Allow in IAM
+    evaluation; MinIO honors it) — used by governance file-layer masking to
+    carve base-table bytes out of broader allows (namespace-level vending).
     """
     read_keys = read_keys or []
     statements: list[dict] = [
@@ -116,6 +121,18 @@ def _scoped_policy(
             }
         )
 
+    if deny_prefixes:
+        statements.append(
+            {
+                "Sid": "DenyGovernedBasePrefixes",
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": [
+                    f"arn:aws:s3:::{bucket}/{p}*" for p in deny_prefixes
+                ],
+            }
+        )
+
     return {"Version": "2012-10-17", "Statement": statements}
 
 
@@ -153,6 +170,7 @@ def vend_credentials(
     read_only: bool = False,
     data_file_uris: list[str] | None = None,
     read_prefixes: list[str] | None = None,
+    deny_prefixes: list[str] | None = None,
     duration_seconds: int = 3600,
     session_name: str | None = None,
     principal: str | None = None,
@@ -184,6 +202,7 @@ def vend_credentials(
         read_only=read_only,
         read_keys=read_keys,
         read_prefixes=read_prefixes,
+        deny_prefixes=deny_prefixes,
     )
     sts = _sts_client(s3)
     resp = sts.assume_role(

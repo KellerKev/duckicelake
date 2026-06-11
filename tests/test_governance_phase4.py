@@ -192,3 +192,152 @@ def test_gc_and_purge(client, settings, direct_catalog):
     assert mgr.gc_table([ns], "events", keep=set()) == 1
     assert mgr.current_export([ns], "events", export.sig) is None
     assert mgr.list_export_files(export.prefix) == []
+
+
+# ---- DuckLake-direct hard enforcement (stage B2) -----------------------------
+
+import boto3
+import botocore.exceptions
+
+
+def _author_file_layer_policy(client, ns: str, table: str) -> None:
+    """pii.flemail tag + mask_email_fl policy with file-layer-masking=true,
+    bypassed by pii_reader. Distinct names from the phase-3 tests so the
+    flag never leaks into their (catalog-level) expectations."""
+    client.post("/v1/lake/governance/tags",
+                json={"namespace": "pii", "name": "flemail"}).raise_for_status()
+    client.post("/v1/lake/governance/object-tags",
+                json={"object-kind": "column", "schema": ns, "object": table,
+                      "column": "email", "tag-namespace": "pii",
+                      "tag-name": "flemail"}).raise_for_status()
+    client.post("/v1/lake/governance/masking-policies",
+                json={"name": "mask_email_fl", "signature": "(val VARCHAR)",
+                      "body": "left(val,2)||'***'",
+                      "unmasked-roles": ["pii_reader"],
+                      "file-layer-masking": True}).raise_for_status()
+    client.post("/v1/lake/governance/policy-attachments",
+                json={"policy-kind": "masking", "policy-name": "mask_email_fl",
+                      "target-kind": "tag", "tag-namespace": "pii",
+                      "tag-name": "flemail"}).raise_for_status()
+    client.post("/v1/lake/governance/roles",
+                json={"name": "pii_reader"}).raise_for_status()
+
+
+def _vend(client, ns: str, sub: str, table: str | None = "events") -> dict:
+    params = {"principal": sub}
+    if table:
+        params["table"] = table
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _s3_client_from(creds_s3: dict):
+    return boto3.client(
+        "s3", endpoint_url=creds_s3["endpoint"], region_name=creds_s3["region"],
+        aws_access_key_id=creds_s3["access-key-id"],
+        aws_secret_access_key=creds_s3["secret-access-key"],
+        aws_session_token=creds_s3["session-token"],
+    )
+
+
+def _base_keys(settings, ns: str, table: str = "events") -> list[str]:
+    s3 = settings.s3
+    root = boto3.client(
+        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
+        aws_access_key_id=s3.root_access_key,
+        aws_secret_access_key=s3.root_secret_key,
+    )
+    keys = []
+    for p in root.get_paginator("list_objects_v2").paginate(
+            Bucket=s3.bucket, Prefix=s3.table_prefix(ns, table)):
+        keys += [o["Key"] for o in p.get("Contents", [])
+                 if o["Key"].endswith(".parquet")]
+    return keys
+
+
+def test_file_layer_end_to_end(client, settings):
+    """THE Phase-4 proof: bob's vended credentials physically cannot read
+    base bytes (403) but read masked bytes; unqualified and by-name queries
+    return masked rows from the pre-masked Parquet; the base table is empty
+    for him even by name (RLS interlock). Alice (bypass) is untouched."""
+    ns = _ns("e2e")
+    _make_table(client, ns, "events")
+    _author_file_layer_policy(client, ns, "events")
+    client.post("/v1/lake/governance/role-grants",
+                json={"role": "pii_reader", "principal": "alice"}).raise_for_status()
+    _seed(settings, ns)
+
+    bob = _vend(client, ns, "bob")
+    assert bob["file_layer"] is True
+    assert bob["masked_view"] and bob["transparent"] is True
+    sig = bob["mask_signature"]
+
+    # ---- byte-level proof ----
+    s3c = _s3_client_from(bob["s3"])
+    base = _base_keys(settings, ns)
+    assert base, "expected base parquet files"
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        s3c.get_object(Bucket=settings.s3.bucket, Key=base[0])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    masked_prefix = settings.s3.masked_sig_prefix(ns, "events", sig)
+    masked_keys = [k for k, _ in
+                   MaskedExportManager(
+                       DuckLakeCatalog(settings), settings
+                   )._list_keys(masked_prefix) if k.endswith(".parquet")]
+    assert masked_keys
+    s3c.get_object(Bucket=settings.s3.bucket, Key=masked_keys[0])  # 200
+
+    # ---- query-level proof ----
+    con = _vended_duckdb(settings, bob)
+    emails = {r[0] for r in con.execute("SELECT email FROM events").fetchall()}
+    assert emails == {"al***", "bo***", "ca***"}
+    sch, view = bob["masked_view"].split(".", 1)
+    emails = {r[0] for r in con.execute(
+        f'SELECT email FROM lake."{sch}"."{view}"').fetchall()}
+    assert emails == {"al***", "bo***", "ca***"}
+    # base table by name: RLS interlock hides its file rows → empty
+    assert con.execute(
+        f'SELECT count(*) FROM lake."{ns}".events').fetchone()[0] == 0
+    con.close()
+
+    # ---- alice (bypass): untouched ----
+    alice = _vend(client, ns, "alice")
+    assert alice["file_layer"] is False and alice["masked_view"] is None
+    con = _vended_duckdb(settings, alice)
+    raw = {r[0] for r in con.execute(
+        f'SELECT email FROM lake."{ns}".events').fetchall()}
+    assert raw == {"alice@example.com", "bob@personal.io", "carol@work.net"}
+    con.close()
+
+    # ---- audited ----
+    audit = client.get("/v1/lake/governance/audit").json()["entries"]
+    assert any(e["operation"] == "ducklake_credentials"
+               and e["principal"] == "bob"
+               and e["decision"] == "masked_file_layer" for e in audit)
+    assert any(e["operation"] == "masked_export" for e in audit)
+
+
+def test_namespace_vend_denies_file_layer_base(client, settings):
+    """Namespace-level vending carves the file-layer table's base prefix
+    out of the namespace allow (IAM Deny) for masked principals; an
+    ungoverned sibling table stays readable."""
+    ns = _ns("nsdeny")
+    _make_table(client, ns, "events")
+    client.post(f"/v1/lake/namespaces/{ns}/tables",
+                json={"name": "open_t", "schema": SCHEMA_JSON}).raise_for_status()
+    _author_file_layer_policy(client, ns, "events")
+    _seed(settings, ns)
+    _seed(settings, ns, "open_t")
+    # a table-scoped vend first, so the export (and sidecar row) exists
+    _vend(client, ns, "bob")
+
+    nsbob = _vend(client, ns, "bob", table=None)
+    s3c = _s3_client_from(nsbob["s3"])
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        s3c.get_object(Bucket=settings.s3.bucket,
+                       Key=_base_keys(settings, ns)[0])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    open_keys = _base_keys(settings, ns, "open_t")
+    s3c.get_object(Bucket=settings.s3.bucket, Key=open_keys[0])  # 200

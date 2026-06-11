@@ -63,12 +63,26 @@ class MaskingViewManager:
 
     # ---- materialization -------------------------------------------------
 
+    def _view_sql(self, plan: TablePolicyPlan, export) -> str:
+        """The view body. With a file-layer export, the view reads the
+        pre-masked Parquet directly — the base table is never touched (its
+        bytes are not even credentialed for masked principals). Without
+        one, the Phase-3 expression SELECT computes the mask client-side."""
+        if export is not None:
+            return (f"SELECT * FROM read_parquet("
+                    f"'s3://{self.settings.s3.bucket}/{export.prefix}*.parquet')")
+        return plan.view_sql
+
     def ensure_view_for_plan(self, ns: list[str], table: str,
-                             plan: TablePolicyPlan) -> str | None:
+                             plan: TablePolicyPlan,
+                             export=None) -> str | None:
         """Idempotently materialize the plan's masking view; return its name.
 
         Empty plan, per-table opt-out, or any catalog error → None (callers
         treat that as "no view available" and serve unmasked signals only).
+        `export` (a masked_export.MaskedExport) switches the body to the
+        pre-masked Parquet glob; the view is repointed whenever the export's
+        snap dir changes.
         """
         sig = mask_signature(plan)
         if not sig or not plan.view_sql:
@@ -77,11 +91,12 @@ class MaskingViewManager:
         try:
             if self._masking_disabled(ns, table):
                 return None
-            if not self.catalog.view_exists(ns, name):
-                # plan.view_sql goes in verbatim: the unqualified
+            if not self._view_current(ns, name, export):
+                # Phase-3 body goes in verbatim: the unqualified
                 # "schema"."table" reference is load-bearing for
                 # DuckLake-direct resolution.
-                self.catalog.create_view(ns, name, plan.view_sql, replace=True)
+                self.catalog.create_view(ns, name, self._view_sql(plan, export),
+                                         replace=True)
             return name
         except Exception:
             log.exception(
@@ -91,7 +106,8 @@ class MaskingViewManager:
             return None
 
     def ensure_transparent_schema(self, ns: list[str], table: str,
-                                  plan: TablePolicyPlan) -> str | None:
+                                  plan: TablePolicyPlan,
+                                  export=None) -> str | None:
         """Materialize the `__masked_{sig}` schema holding a view named
         `{table}`, for search_path-based transparent routing. Returns the
         schema name, or None on empty plan / opt-out / error."""
@@ -104,8 +120,9 @@ class MaskingViewManager:
                 return None
             if not self.catalog.namespace_exists([schema]):
                 self.catalog.create_namespace([schema])
-            if not self.catalog.view_exists([schema], table):
-                self.catalog.create_view([schema], table, plan.view_sql,
+            if not self._view_current([schema], table, export):
+                self.catalog.create_view([schema], table,
+                                         self._view_sql(plan, export),
                                          replace=True)
             return schema
         except Exception:
@@ -114,6 +131,21 @@ class MaskingViewManager:
                 "(sig %s)", ns[0], table, sig,
             )
             return None
+
+    def _view_current(self, ns: list[str], name: str, export) -> bool:
+        """Does the stored view exist and (for file-layer) reference the
+        export's live snap dir? A stale reference triggers a repoint via
+        CREATE OR REPLACE — transactional for clients (ducklake_view is
+        snapshot-versioned)."""
+        if not self.catalog.view_exists(ns, name):
+            return False
+        defn = self.catalog.get_view_definition(ns, name) or ""
+        if export is None:
+            # fail-open path: if a previous file-layer body lingers, force a
+            # repoint back to the expression SELECT — otherwise the view
+            # would read a masked prefix the (base-scoped) creds don't cover
+            return "/__masked__/" not in defn
+        return export.prefix in defn
 
     # ---- cleanup ---------------------------------------------------------
 

@@ -303,3 +303,17 @@ class PolicyEngine:
             attachments=inp["attachments"], masking_bodies=inp["masking_bodies"],
             row_bodies=inp["row_bodies"],
         )
+
+    def file_layer_bypass_roles(self, schema: str, table: str,
+                                plan: TablePolicyPlan) -> list[str]:
+        """Union of unmasked_roles across the plan's applied file-layer
+        policies — written into the `duckicelake.file-layer-bypass-roles`
+        table property so the Phase-3a RLS predicate can honor bypasses
+        without re-deriving policy logic in SQL."""
+        inp = self.store.resolution_inputs(schema, table)
+        roles: set[str] = set()
+        for m in plan.masks:
+            body = inp["masking_bodies"].get(m.policy_name) or {}
+            if body.get("file_layer_masking"):
+                roles |= set(body.get("unmasked_roles") or [])
+        return sorted(roles)

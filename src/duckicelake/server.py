@@ -31,6 +31,7 @@ from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
 from .config import apply_file_config, load_settings
 from .governance import GovernanceStore
+from .masked_export import MaskedExportManager
 from .masking_views import (
     MASK_SCHEMA_PREFIX,
     MASK_VIEW_PREFIX,
@@ -106,6 +107,53 @@ policy_engine = PolicyEngine(governance_store)
 # (table, mask-signature), materialized on the read path so both
 # DuckLake-direct and view-capable REST clients can execute the mask.
 masking_view_manager = MaskingViewManager(catalog, settings)
+# Phase 4: masked Parquet exports for policies flagged file_layer_masking —
+# byte-level enforcement for engines that read Parquet directly.
+masked_export_manager = MaskedExportManager(catalog, settings,
+                                            store=governance_store)
+
+
+def _ensure_file_layer_properties(ns: list[str], table: str, plan) -> None:
+    """Write the Phase-3a interlock properties so RLS hides base file rows
+    from non-bypass principals. Best-effort — the masked-prefix credential
+    scope is the primary enforcement; RLS is defense-in-depth."""
+    try:
+        bypass = policy_engine.file_layer_bypass_roles(ns[0], table, plan)
+        catalog.upsert_table_properties(ns, table, set_map={
+            "duckicelake.file-layer-masking": "true",
+            "duckicelake.file-layer-bypass-roles": ",".join(bypass),
+        })
+        catalog.invalidate_metadata_cache(ns, table)
+    except Exception:
+        log.exception("file-layer property stamping failed for %s.%s",
+                      ns[0], table)
+
+
+def _file_layer_deny_prefixes(ns: list[str], sub: str) -> list[str] | None:
+    """For namespace-level vending: base prefixes of file-layer tables the
+    principal is masked on (Deny beats the namespace Allow). Best-effort —
+    None on any error (RLS still hides the file rows)."""
+    try:
+        with catalog.pg_cursor(autocommit=False) as cur:
+            cur.execute(
+                "SELECT DISTINCT table_name FROM public.duckicelake_masked_export "
+                "WHERE schema_name = %s AND current_prefix IS NOT NULL",
+                (ns[0],),
+            )
+            candidates = [r[0] for r in cur.fetchall()]
+        if not candidates:
+            return None
+        roles = sorted(set(governance_store.roles_for_principal(sub)))
+        deny: list[str] = []
+        for t in candidates:
+            plan = policy_engine.plan_for(principal=sub, roles=roles,
+                                          schema=ns[0], table=t)
+            if plan.file_layer and not plan.is_empty():
+                deny.append(settings.s3.table_prefix(ns[0], t))
+        return deny or None
+    except Exception:
+        log.exception("file-layer deny-prefix scan failed for %s", ns[0])
+        return None
 
 
 # Root-key suppression + transparent masking live on Settings
@@ -757,6 +805,7 @@ def ducklake_credentials(
         "masked_view": None,
         "mask_signature": None,
         "transparent": False,
+        "file_layer": False,
         "pg_role": None,
         "pg_valid_until": None,
     }
@@ -788,6 +837,7 @@ def ducklake_credentials(
     masked_cols: list[str] = []
     applied: list[str] = []
     row_filtered = False
+    export = None
     try:
         roles = sorted(
             set(claims.get("roles") or [])
@@ -801,14 +851,29 @@ def ducklake_credentials(
                 masked_cols = plan.masked_columns
                 applied = plan.applied_policies
                 row_filtered = plan.row_filter is not None
-                view = masking_view_manager.ensure_view_for_plan(ns, table, plan)
+                if plan.file_layer:
+                    # Phase 4: materialize (or reuse) the masked Parquet
+                    # export; on failure fall back to a possibly-stale
+                    # pointer (still masked, one snapshot behind), then to
+                    # catalog-level masking.
+                    export = (
+                        masked_export_manager.ensure_export_for_plan(
+                            ns, table, plan)
+                        or masked_export_manager.current_export(
+                            ns, table, mask_signature(plan))
+                    )
+                view = masking_view_manager.ensure_view_for_plan(
+                    ns, table, plan, export=export)
                 if view:
-                    decision = "masked"
+                    decision = "masked_file_layer" if export else "masked"
                     out["masked_view"] = f"{ns[0]}.{view}"
                     out["mask_signature"] = mask_signature(plan)
+                    out["file_layer"] = export is not None
+                    if export is not None:
+                        _ensure_file_layer_properties(ns, table, plan)
                     if settings.transparent_masking:
                         schema = masking_view_manager.ensure_transparent_schema(
-                            ns, table, plan,
+                            ns, table, plan, export=export,
                         )
                         if schema:
                             out["transparent"] = True
@@ -825,10 +890,20 @@ def ducklake_credentials(
         decision = "error_unmasked"
 
     s3 = settings.s3
-    read_prefixes = (
-        [s3.table_prefix(ns[0], table)] if table is not None
-        else [f"{s3.data_prefix}{ns[0]}/"]
-    )
+    deny_prefixes: list[str] | None = None
+    if table is not None:
+        if export is not None:
+            # file-layer: ONLY the masked sig prefix — base bytes are
+            # physically unreadable with these credentials
+            read_prefixes = [s3.masked_sig_prefix(
+                ns[0], table, out["mask_signature"])]
+        else:
+            read_prefixes = [s3.table_prefix(ns[0], table)]
+    else:
+        read_prefixes = [f"{s3.data_prefix}{ns[0]}/"]
+        # the namespace allow covers every table's base prefix — carve out
+        # the file-layer-masked tables this principal must not read raw
+        deny_prefixes = _file_layer_deny_prefixes(ns, sub)
     try:
         creds = vend_credentials(
             s3,
@@ -836,6 +911,7 @@ def ducklake_credentials(
             table=table or "*",
             read_only=True,
             read_prefixes=read_prefixes,
+            deny_prefixes=deny_prefixes,
             duration_seconds=clamped,
             principal=sub,
         )
@@ -880,6 +956,7 @@ def ducklake_credentials(
                 "transparent": out["transparent"],
                 "masked_view": out["masked_view"],
                 "reader_dsn": reader_dsn_ok,
+                "file_layer": out["file_layer"],
             },
         )
     except Exception:
