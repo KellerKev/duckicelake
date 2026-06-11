@@ -83,9 +83,10 @@ on vended STS creds (`X-Iceberg-Access-Delegation` on the REST path, the
 `ducklake-credentials` endpoint for DuckLake-direct). Flipping it off
 (`DUCKICELAKE_SUPPRESS_ROOT_CREDS=0` or `suppress_root_creds = false` in
 `duckicelake.toml`) makes the governance masking layer (GOVERNANCE.md)
-bypassable in one line — dev-only. The vended PG DSN is also still the
-owning `ducklake` role — a dedicated PG reader role + RLS is the remaining
-hardening (governance master plan, Phase 3a).
+bypassable in one line — dev-only. The vended PG DSN is a per-principal
+RLS-governed reader role (Phase 3a) — but the dev stack's trust-auth means
+PG *authentication* is only real under production scram+TLS; see the pg_hba
+recipe in GOVERNANCE.md.
 
 **Backup automation.** [OPERATIONS.md](OPERATIONS.md) describes the shape
 (`pg_dump` of `ducklake_*` + `duckicelake_*` schema, S3 versioning, cross-

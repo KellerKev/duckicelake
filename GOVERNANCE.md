@@ -5,13 +5,13 @@ phasing live in [`duckicelake_governance.md`](duckicelake_governance.md).
 This document tracks what is **actually implemented** on the
 `experimental_governance` branch.
 
-> **Status: Phases 1 + 2 + 3.** Phase 1 = authoring surface + audit. Phase 2 =
-> Iceberg REST enforcement at LoadTable (per-principal column masking + row
-> filter signals, audited). Phase 3 = ad-hoc masking views executed by both
-> read paths + the DuckLake-direct credential endpoint (cooperative-client
-> masking — see the boundary notes). PG RLS on the DuckLake catalog tables,
-> pre-masked files (airtight tier) and the LLM-agent surface are not yet
-> built.
+> **Status: Phases 1 + 2 + 3 + 3a.** Phase 1 = authoring surface + audit.
+> Phase 2 = Iceberg REST enforcement at LoadTable (per-principal column
+> masking + row filter signals, audited). Phase 3 = ad-hoc masking views
+> executed by both read paths + the DuckLake-direct credential endpoint.
+> Phase 3a = per-principal PG reader roles + RLS on the `ducklake_*`
+> catalog tables. Phase 4 (file-layer masking — pre-masked Parquet) is in
+> progress; the LLM-agent surface is not yet built.
 
 ## What Phase 1 ships
 
@@ -144,23 +144,79 @@ clients still see them in PG — that visibility is inherent. Per-table opt-out:
 set table property `duckicelake.masking-disabled=true` to skip view
 materialization.
 
-**The boundary — read this.** Phase 3 is **cooperative-client masking**. The
-view computes the mask in the *client's* engine, which must read the raw base
-bytes; the vended PG DSN is still the owning `ducklake` role. A determined
-client can query the base table directly (and, with root S3 keys, bypass
-everything). Consequences:
+**The boundary — read this.** The masking *views* are **cooperative-client
+masking**: the view computes the mask in the *client's* engine, which must
+read the raw base bytes. Consequences:
 
 - Response configs **omit the root MinIO key pair by default**
   (`suppress_root_creds`, settable via env / `.env` / `duckicelake.toml`);
   clients rely on vended creds. Only flip it off for dev stacks that don't
   care about the masking boundary.
-- A PG reader role + RLS on `ducklake_*` (master-plan Phase 3a) and pre-masked
-  physical files (airtight tier) remain the escalation path for adversarial
-  clients. Until then, treat Phase 3 as right for agents/BI/lakesh — clients
-  you configure, not clients you fight.
+- The PG side is hardened by Phase 3a below (per-principal reader roles +
+  RLS); byte-level enforcement for masked columns is Phase 4 (file-layer
+  masking, pre-masked Parquet).
 
 Everything stays **fail-open**: any governance error on either path logs,
 serves unmasked, and audits the failure — it never breaks a read.
+
+## What Phase 3a ships — PG reader roles + RLS on the DuckLake catalog
+
+| Piece | Where |
+|---|---|
+| Reader group + per-principal roles, predicate functions, RLS policies | [src/duckicelake/pg_rls.py](src/duckicelake/pg_rls.py) |
+| Startup `ensure_rls` + reader-DSN vending | [server.py](src/duckicelake/server.py) (lifespan + ducklake-credentials) |
+| `duckicelake_pg_principal` sidecar (pg_role → principal) | created by `ensure_rls` |
+
+`ducklake-credentials` no longer vends the owning PG role. Each principal
+gets its own LOGIN role `duckicelake_p_<sub>_<sha8>` — member of the NOLOGIN
+group `duckicelake_reader` that carries all SELECT grants and is the target
+of every RLS policy — with a random per-vend password (returned once, never
+persisted; PG keeps the SCRAM verifier) and `VALID UNTIL` aligned to the STS
+expiry. The ATTACH statement is `READ_ONLY`. RLS predicates resolve the
+principal from `session_user` via the sidecar — unforgeable after
+authentication. Expired roles are lazily NOLOGIN'd, then dropped.
+
+**Visibility model (v1).** Default-ALLOW — an ungoverned lake behaves as
+before. An explicit `select` **object-grant** (on the table or its schema)
+flips that table to allowlist: visible only to principals holding a granted
+role. File rows (`ducklake_data_file` & friends) are additionally hidden when
+the table carries `duckicelake.file-layer-masking=true` and the principal
+holds none of `duckicelake.file-layer-bypass-roles` — the **Phase-4
+interlock**, dormant until file-layer masking sets those properties. Plain
+masking policies never hide files: the Phase-3 view executes against the base
+table in the client's engine, so hiding its files would break exactly the
+principals the view serves. No per-column hiding in v1 (it would break the
+views' binder). RLS is never `FORCE`d — the proxy's owning connection
+bypasses it.
+
+**Limits, stated honestly:**
+
+- **Dev trust-auth cannot enforce authentication.** The pixi stack is
+  `initdb --auth=trust` on a unix socket: any local process can connect as
+  any role, including the owner. The predicates are fully exercised and
+  tested; the *authentication* only becomes real under production auth:
+
+  ```
+  # postgresql.conf: password_encryption = scram-sha-256, TLS on
+  # pg_hba.conf (order matters):
+  hostssl ducklake ducklake             <proxy-host>/32  scram-sha-256  # owner: proxy only
+  host    ducklake ducklake             0.0.0.0/0        reject
+  hostssl ducklake +duckicelake_reader  <client-cidr>    scram-sha-256  # all vended principals
+  ```
+
+  The proxy's prod role: non-superuser owner of the `ducklake_*` tables with
+  `CREATEROLE` (PG ≥ 16 auto-grants ADMIN on roles it creates).
+- **Data inlining is incompatible with the vended reader path.** Dynamic
+  `ducklake_inlined_data_*` payload tables carry raw rows with nothing to
+  police, so readers get no grant on them (verified live: granting them
+  bypasses every predicate). Write DuckLake-direct with
+  `DATA_INLINING_ROW_LIMIT 0` (the proxy's REST path never inlines).
+- Re-vending rotates the password; an earlier response's password stops
+  working for new connections. `VALID UNTIL` is checked at connect time only
+  (same semantics as STS expiry).
+- `ducklake_snapshot_changes` / `ducklake_view` are not row-filtered in v1:
+  hidden tables' *names* (and masking-view SQL bodies) remain readable to
+  readers. Tracked as follow-up hardening.
 
 ## REST surface
 
@@ -222,11 +278,10 @@ curl "localhost:8181$P/audit"
 > it is **Phase 3** in this numbering (its credential-gating half), built
 > before the PG-RLS half.
 
-- **Phase 3 remainder** — Postgres RLS on `ducklake_table`/`_column`/
-  `_data_file` behind a dedicated reader role, so DuckLake-direct visibility
-  is enforced server-side instead of cooperatively.
-- **Phase 4** — pre-masked physical files (airtight, 2× storage); coarse STS
-  credential withholding for masked principals.
+- **Phase 4** — file-layer masking: pre-masked physical Parquet per
+  (table, mask-signature) for policies flagged `file-layer-masking`, masked-
+  prefix-only credential vending, and shadow Iceberg metadata so every
+  direct-Parquet reader gets masked bytes. (In progress on this branch.)
 - **Phase 5** — LLM-agent surface (`agent` role, `lakesh mcp --as agent`).
 - A per-principal aggregated transparent schema (one `SET search_path` entry
   covering *all* of a principal's masked tables) — today transparent mode is

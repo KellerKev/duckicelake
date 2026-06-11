@@ -164,6 +164,27 @@ Production defaults:
   echo $TOKEN | cut -d. -f2 | base64 -d | jq
   ```
 
+### Governance reader roles (Phase 3a)
+
+`ducklake-credentials` vends per-principal PG roles
+(`duckicelake_p_<sub>_<sha8>`, group `duckicelake_reader`) with RLS on the
+`ducklake_*` catalog tables. The dev stack's trust-auth cannot enforce
+authentication — production must run Postgres with
+`password_encryption = scram-sha-256` + TLS and pg_hba in this order:
+
+```
+hostssl ducklake ducklake             <proxy-host>/32  scram-sha-256  # owner: proxy only
+host    ducklake ducklake             0.0.0.0/0        reject
+hostssl ducklake +duckicelake_reader  <client-cidr>    scram-sha-256  # all vended principals
+```
+
+The proxy's role: non-superuser owner of the `ducklake_*` tables with
+`CREATEROLE`. Vended passwords are per-request, never persisted, and expire
+with the STS creds (`VALID UNTIL`, connect-time check). Mandate
+`log_statement = none` (or `ddl`-exclusion) for the proxy role so `ALTER
+ROLE … PASSWORD` never lands in server logs. Expired roles are GC'd lazily
+by the proxy; `SELECT * FROM duckicelake_pg_principal` shows the live set.
+
 ## Known operational risks
 
 1. **DuckLake schema drift**: direct Postgres INSERT/UPDATE of `ducklake_delete_file`, `ducklake_sort_info`, `ducklake_data_file.end_snapshot`. A minor DuckLake version bump that changes these could silently break commits. **Mitigation**: pin DuckLake in `pixi.toml`, subscribe to DuckLake release notes, run the full integration suite before any version bump.
