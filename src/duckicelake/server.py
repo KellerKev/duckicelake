@@ -741,6 +741,7 @@ def ducklake_credentials(
     alias = settings.catalog_name
     out: dict[str, Any] = {
         "ducklake_dsn": settings.pg_dsn,
+        "ducklake_data_path": settings.ducklake_data_path,
         "ducklake_attach_sql": (
             f"ATTACH '{settings.ducklake_uri}' AS {alias} "
             f"(DATA_PATH '{settings.ducklake_data_path}')"

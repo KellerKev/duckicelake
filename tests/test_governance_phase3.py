@@ -468,3 +468,49 @@ def test_ducklake_credentials_namespace_only(client, settings):
     assert body["transparent"] is False
     assert body["s3"]["session-token"]
     assert "ATTACH" in body["ducklake_attach_sql"]
+
+
+def test_fail_open_on_unmaterializable_view(client, settings):
+    """A policy whose mask body is invalid SQL produces a plan whose view
+    cannot be created (DuckDB binds views at CREATE). Reads must survive:
+    LoadTable 200 with advisory signals but no view; the credentials
+    endpoint 200 with the failure audited as error_unmasked."""
+    ns = _ns("brkn")
+    tag = f"broken_{uuid.uuid4().hex[:6]}"
+    _make_table(client, ns, "events")
+    # isolated tag + policy names — the policy body is broken on purpose
+    # and must not leak into other tests' tables
+    client.post("/v1/lake/governance/tags",
+                json={"namespace": "pii", "name": tag}).raise_for_status()
+    client.post("/v1/lake/governance/object-tags",
+                json={"object-kind": "column", "schema": ns, "object": "events",
+                      "column": "email", "tag-namespace": "pii",
+                      "tag-name": tag}).raise_for_status()
+    client.post("/v1/lake/governance/masking-policies",
+                json={"name": f"mask_{tag}", "signature": "(val VARCHAR)",
+                      "body": "no_such_function_xyz(val)",
+                      "unmasked-roles": ["pii_reader"]}).raise_for_status()
+    client.post("/v1/lake/governance/policy-attachments",
+                json={"policy-kind": "masking", "policy-name": f"mask_{tag}",
+                      "target-kind": "tag", "tag-namespace": "pii",
+                      "tag-name": tag}).raise_for_status()
+
+    # LoadTable still 200: advisory stamping present, no view advertised
+    r = client.get(f"/v1/lake/namespaces/{ns}/tables/events")
+    assert r.status_code == 200, r.text
+    props = r.json()["metadata"]["properties"]
+    assert props["duckicelake.masked-columns"] == "email"
+    assert "duckicelake.masking-view-name" not in props
+
+    # credentials endpoint still 200, vending unmasked, audited as such
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"table": "events", "principal": "bob"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["masked_view"] is None
+    assert body["s3"] is not None
+
+    audit = client.get("/v1/lake/governance/audit").json()["entries"]
+    vends = [e for e in audit if e["operation"] == "ducklake_credentials"
+             and e["object"] == f"{ns}.events"]
+    assert vends and vends[0]["decision"] == "error_unmasked"

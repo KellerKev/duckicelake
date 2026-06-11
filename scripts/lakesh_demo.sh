@@ -74,22 +74,47 @@ echo "      them). Byte-level masking for DuckDB comes from the view SQL below."
 lakesh exec -p duckicelake -q "SELECT id, email, country FROM $CAT.analytics.events ORDER BY id"
 pause
 
-# ---- 5. masking the proxy decided for the principal -----------------------
-step "5. masking decided by the proxy for principal '$PRINCIPAL'"
-VIEW_SQL=$(curl -fsS "$P/effective-policies?table=analytics.events&principal=$PRINCIPAL" \
-            | jq -r '.enforcement.view_sql // empty')
-if [ -z "$VIEW_SQL" ]; then
+# ---- 5. fetch DuckLake-direct credentials for the principal ----------------
+step "5. GET /ducklake-credentials for principal '$PRINCIPAL' (governance Phase 3)"
+CREDS=$(curl -fsS "$BASE/v1/$WAREHOUSE/namespaces/analytics/ducklake-credentials?table=events&principal=$PRINCIPAL")
+echo "$CREDS" | jq '{masked_view, mask_signature, transparent, post_attach_sql}'
+MASKED_VIEW=$(echo "$CREDS" | jq -r '.masked_view // empty')
+
+if [ -z "$MASKED_VIEW" ]; then
   echo "principal '$PRINCIPAL' has no masking (holds an unmasked role) — sees the base table above."
 else
-  echo "engine-generated view SQL (fetched live):"
-  echo "    $VIEW_SQL"
-  # The proxy emits the table unqualified ("analytics"."events"); lakesh
-  # attaches the REST catalog as '$CAT', so qualify the reference.
-  LAKESH_SQL=${VIEW_SQL//\"analytics\".\"events\"/$CAT.\"analytics\".\"events\"}
-  step "6. lakesh exec — same query, MASKED for '$PRINCIPAL'"
-  lakesh exec -p duckicelake -q "$LAKESH_SQL ORDER BY id"
+  # ---- 6. DuckLake-direct profile from the vended response ----------------
+  # The proxy materialized the principal's masking view as a real DuckLake
+  # view and vended prefix-scoped read-only S3 creds — no manual SQL
+  # rewriting (the old catalog-prefix hack) needed anymore.
+  step "6. lakesh exec — DuckLake-direct, MASKED for '$PRINCIPAL'"
+  DCAT=$(echo "$CREDS" | jq -r '.ducklake_attach_sql' | sed -E "s/.* AS ([a-zA-Z0-9_]+) .*/\1/")
+  cat >> "$CFG" <<EOF
+
+[profiles.governed_direct]
+type         = "ducklake"
+postgres_dsn = "$(echo "$CREDS" | jq -r '.ducklake_dsn')"
+data_path    = "$(echo "$CREDS" | jq -r '.ducklake_data_path')"
+catalog      = "$DCAT"
+
+[profiles.governed_direct.s3]
+endpoint      = "$(echo "$CREDS" | jq -r '.s3.endpoint')"
+region        = "$(echo "$CREDS" | jq -r '.s3.region')"
+access_key    = "$(echo "$CREDS" | jq -r '.s3["access-key-id"]')"
+secret_key    = "$(echo "$CREDS" | jq -r '.s3["secret-access-key"]')"
+session_token = "$(echo "$CREDS" | jq -r '.s3["session-token"]')"
+path_style    = true
+EOF
+  VIEW_NS=${MASKED_VIEW%%.*}
+  VIEW_NAME=${MASKED_VIEW#*.}
+  lakesh exec -p governed_direct \
+    -q "SELECT * FROM $DCAT.\"$VIEW_NS\".\"$VIEW_NAME\" ORDER BY id"
   echo
-  echo "=> '$PRINCIPAL' sees masked email (al***); the base rows in step 4 are unchanged."
+  echo "=> '$PRINCIPAL' sees masked email (al***) through the vended masking view;"
+  echo "   the base rows in step 4 are unchanged. Clients that run the returned"
+  echo "   post_attach_sql (SET search_path) get this masking transparently for"
+  echo "   unqualified queries. Cooperative boundary: a client that names the"
+  echo "   base table directly still reads cleartext — see GOVERNANCE.md."
 fi
 
 rm -f "$CFG"
