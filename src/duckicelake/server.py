@@ -645,8 +645,18 @@ def _build_view_response(ns: list[str], view: str) -> dict[str, Any]:
     DuckDB resolves the view once so we get back concrete types."""
     sql = catalog.get_view_definition(ns, view) or ""
     view_uuid = catalog.table_uuid(ns, view)
-    # Concrete schema from information_schema.columns.
-    columns = catalog.get_columns(ns, view)
+    # Concrete schema from information_schema.columns. Binding can fail
+    # transiently (e.g. a just-materialized masking view racing the
+    # listener, or a base-table change mid-flight) — the SQL representation
+    # is the load-bearing part of a view response, so degrade to an empty
+    # schema instead of failing the load.
+    try:
+        columns = catalog.get_columns(ns, view)
+    except duckdb.Error:
+        log.exception("view column resolution failed for %s.%s — "
+                      "serving SQL representation with empty schema",
+                      ns[0], view)
+        columns = []
     from .types import duckdb_type_to_iceberg
     view_schema = {
         "schema-id": 0,
@@ -1084,6 +1094,11 @@ def commit_table(
     with catalog.commit_transaction():
         if new_schema is not None:
             _apply_schema_diff(ns, table, new_schema)
+            # Masking views project the pre-change column set; their
+            # signatures fold the columns in, so they're stale now. Drop
+            # them all (best-effort) — the next masked LoadTable recreates
+            # at the new signature.
+            masking_view_manager.gc_orphans(ns, table, keep=set())
 
         if pending_partition_spec is not None:
             _apply_partition_spec(ns, table, pending_partition_spec)

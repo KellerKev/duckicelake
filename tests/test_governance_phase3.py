@@ -421,6 +421,40 @@ def _make_table_only(client, ns: str, table: str) -> None:
                 json={"name": table, "schema": SCHEMA_JSON}).raise_for_status()
 
 
+def test_schema_change_drops_stale_masking_views(client, settings):
+    """ADD COLUMN via commit_table garbage-collects masking views built
+    against the old column set; the next masked LoadTable recreates the
+    view at the new signature."""
+    ns = _ns("alter")
+    _make_table(client, ns, "events")
+    _author_demo_policy(client, ns, "events")
+
+    md = client.get(f"/v1/lake/namespaces/{ns}/tables/events").json()["metadata"]
+    old_view = md["properties"]["duckicelake.masking-view-name"]
+    assert _live_view_rows(settings.pg_dsn, ns, old_view) == 1
+
+    wider = {
+        "type": "struct", "schema-id": 1,
+        "fields": SCHEMA_JSON["fields"] + [
+            {"id": 3, "name": "country", "required": False, "type": "string"},
+        ],
+    }
+    client.post(
+        f"/v1/lake/namespaces/{ns}/tables/events",
+        json={"requirements": [],
+              "updates": [{"action": "add-schema", "schema": wider},
+                          {"action": "set-current-schema", "schema-id": -1}]},
+    ).raise_for_status()
+
+    # stale view gone…
+    assert _live_view_rows(settings.pg_dsn, ns, old_view) == 0
+    # …and the next masked load materializes a fresh one at a new signature
+    md = client.get(f"/v1/lake/namespaces/{ns}/tables/events").json()["metadata"]
+    new_view = md["properties"]["duckicelake.masking-view-name"]
+    assert new_view != old_view
+    assert _live_view_rows(settings.pg_dsn, ns, new_view) == 1
+
+
 def test_ducklake_credentials_namespace_only(client, settings):
     """Without ?table the endpoint vends namespace-prefix creds and no view
     (transparent mode v1 requires a table)."""
