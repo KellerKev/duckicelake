@@ -5,10 +5,13 @@ phasing live in [`duckicelake_governance.md`](duckicelake_governance.md).
 This document tracks what is **actually implemented** on the
 `experimental_governance` branch.
 
-> **Status: Phases 1 + 2.** Phase 1 = authoring surface + audit. Phase 2 =
+> **Status: Phases 1 + 2 + 3.** Phase 1 = authoring surface + audit. Phase 2 =
 > Iceberg REST enforcement at LoadTable (per-principal column masking + row
-> filter signals, audited). Phases 3–5 (DuckLake-direct RLS, pre-masked
-> files, LLM-agent surface) are not yet built.
+> filter signals, audited). Phase 3 = ad-hoc masking views executed by both
+> read paths + the DuckLake-direct credential endpoint (cooperative-client
+> masking — see the boundary notes). PG RLS on the DuckLake catalog tables,
+> pre-masked files (airtight tier) and the LLM-agent surface are not yet
+> built.
 
 ## What Phase 1 ships
 
@@ -62,6 +65,101 @@ Enforcement is **read-path only** (`GET LoadTable`); create/commit responses
 are unchanged. It is fully defensive — any error in the policy engine logs
 and serves unmasked rather than failing the read.
 
+## What Phase 3 ships — ad-hoc masking views (both read paths)
+
+| Piece | Where |
+|---|---|
+| `MaskingViewManager`: materialization, transparent schemas, GC | [src/duckicelake/masking_views.py](src/duckicelake/masking_views.py) |
+| `mask_signature` (per-table mask-shape identity) | [src/duckicelake/policies.py](src/duckicelake/policies.py) |
+| LoadTable view materialization + `duckicelake.masking-view-name` stamp | `_build_load_response` in [server.py](src/duckicelake/server.py) |
+| `GET …/ducklake-credentials` vending endpoint | [server.py](src/duckicelake/server.py) |
+| Prefix-scoped read-only STS (`read_prefixes`) | [src/duckicelake/sts.py](src/duckicelake/sts.py) |
+| `search_path` transparency probe | [scripts/probe_searchpath.py](scripts/probe_searchpath.py) |
+| Tests | [tests/test_governance_phase3.py](tests/test_governance_phase3.py) |
+
+**The primitive.** One physical DuckLake view per (table, mask-signature):
+`__mask_{table}__{sig}` in the base table's namespace. The signature hashes
+the effective mask shape — masked columns + expressions, row filter, base
+column set, table identity — so principals with the same effective mask
+share one view, and an `ADD/DROP COLUMN` or policy edit automatically rotates
+to a fresh view (stale ones are garbage-collected on schema change). The
+stored SQL keeps the base table reference unqualified, so a DuckLake-direct
+client resolves it against its own attached catalog. Row filters are applied
+in a nested subquery, so they see **raw** column values (Snowflake row-policy
+semantics) and never collide with mask aliases.
+
+**Iceberg REST path.** A masked LoadTable materializes the caller's view and
+advertises it via the `duckicelake.masking-view-name` table property (all
+Phase 2 stamping unchanged). View-capable engines (PyIceberg / Trino / Spark)
+load it at `GET …/views/__mask_{table}__{sig}` and execute the mask
+themselves. The DuckDB `iceberg` extension has **no view support** — steer
+DuckDB users to the DuckLake-direct path below.
+
+**DuckLake-direct path.**
+
+```
+GET /v1/{prefix}/namespaces/{ns}/ducklake-credentials?table=events
+```
+
+returns everything a DuckLake-direct DuckDB session needs:
+
+```jsonc
+{
+  "ducklake_dsn": "...", "ducklake_data_path": "s3://lakehouse/data/",
+  "ducklake_attach_sql": "ATTACH 'ducklake:postgres:...' AS lake (DATA_PATH '...')",
+  "post_attach_sql": ["SET search_path = 'lake.__masked_<sig>,lake.<ns>'"],
+  "masked_view": "<ns>.__mask_events__<sig>", "mask_signature": "<sig>",
+  "transparent": true,
+  "s3": { "endpoint": "...", "access-key-id": "...", "secret-access-key": "...",
+          "session-token": "...", "expiration": "..." }
+}
+```
+
+- The S3 creds are **read-only and prefix-scoped to the table's data path**
+  (namespace path when `?table` is omitted) — prefix, not per-file, so files
+  committed after vending stay readable for the session's lifetime; clients
+  re-fetch on `expiration`.
+- A client that runs `post_attach_sql` gets masking **transparently**: DuckDB's
+  `SET search_path` resolves unqualified names through a `__masked_{sig}`
+  schema holding a view named exactly like the table (probe-verified; the
+  libpq `options=-c search_path` DSN trick does *not* work — it sets the
+  Postgres session path, not DuckDB's binder). Opt out with
+  `DUCKICELAKE_TRANSPARENT_MASKING=0`; the by-name `masked_view` always works.
+- GET + namespace-scoped path, so a read-only `ns:r` token (the LLM-agent
+  shape) passes the bearer middleware. When auth is off, a `principal` query
+  param is honored for dev/test (same precedent as `effective-policies`).
+- Vending decisions are audited as `operation=ducklake_credentials` with
+  `decision` ∈ `{ok, masked, error_unmasked, error_no_creds}`.
+
+**Roles are unioned.** Enforcement paths use the union of the JWT `roles`
+claim (operator-configured via `DUCKICELAKE_OAUTH_CLIENTS`) and the sidecar
+role grants. `effective-policies` remains store-only — it inspects arbitrary
+principals by name and cannot know their JWT claims, so it may under-report
+roles for JWT-only principals.
+
+**Hygiene.** `__mask_*` views and `__masked_*` schemas are reserved prefixes
+(user creation → 400) and are hidden from REST `list_views` /
+`list_namespaces`; they remain loadable/droppable by name. DuckLake-direct
+clients still see them in PG — that visibility is inherent. Per-table opt-out:
+set table property `duckicelake.masking-disabled=true` to skip view
+materialization.
+
+**The boundary — read this.** Phase 3 is **cooperative-client masking**. The
+view computes the mask in the *client's* engine, which must read the raw base
+bytes; the vended PG DSN is still the owning `ducklake` role. A determined
+client can query the base table directly (and, with root S3 keys, bypass
+everything). Consequences:
+
+- Production must set `DUCKICELAKE_SUPPRESS_ROOT_CREDS=1` so response configs
+  stop embedding the root MinIO key pair; clients then rely on vended creds.
+- A PG reader role + RLS on `ducklake_*` (master-plan Phase 3a) and pre-masked
+  physical files (airtight tier) remain the escalation path for adversarial
+  clients. Until then, treat Phase 3 as right for agents/BI/lakesh — clients
+  you configure, not clients you fight.
+
+Everything stays **fail-open**: any governance error on either path logs,
+serves unmasked, and audits the failure — it never breaks a read.
+
 ## REST surface
 
 All under `/v1/{prefix}/governance` (prefix = catalog name, default `lake`).
@@ -114,12 +212,20 @@ curl "localhost:8181$P/effective-policies?table=analytics.events&principal=agent
 curl "localhost:8181$P/audit"
 ```
 
-## Not yet implemented (Phase 3+)
+## Not yet implemented
 
-- **Phase 2 remainder** — materialise the emitted masking view SQL as a real
-  Iceberg view and return its metadata for PyIceberg/DuckDB byte-level masking.
-- **Phase 3** — DuckLake-direct enforcement: Postgres RLS on
-  `ducklake_table`/`_column`/`_data_file` + credential gating.
+> Naming note: the phase numbering here follows
+> [`duckicelake_governance.md`](duckicelake_governance.md). The implemented
+> ad-hoc-views phase was planned in a file named `governance_phase2.md`, but
+> it is **Phase 3** in this numbering (its credential-gating half), built
+> before the PG-RLS half.
+
+- **Phase 3 remainder** — Postgres RLS on `ducklake_table`/`_column`/
+  `_data_file` behind a dedicated reader role, so DuckLake-direct visibility
+  is enforced server-side instead of cooperatively.
 - **Phase 4** — pre-masked physical files (airtight, 2× storage); coarse STS
   credential withholding for masked principals.
 - **Phase 5** — LLM-agent surface (`agent` role, `lakesh mcp --as agent`).
+- A per-principal aggregated transparent schema (one `SET search_path` entry
+  covering *all* of a principal's masked tables) — today transparent mode is
+  per-table.

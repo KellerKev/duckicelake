@@ -77,6 +77,15 @@ env vars. Production needs Vault / AWS Secrets Manager / IRSA / Azure KV
 feeding them, plus a documented rotation runbook (dual-accept → drain
 old workers → remove old secret).
 
+**Root-key distribution is the prod no-go.** By default every REST response
+config embeds the root MinIO key pair, which makes the governance masking
+layer (GOVERNANCE.md) bypassable in one line. Production must set
+`DUCKICELAKE_SUPPRESS_ROOT_CREDS=1` and have clients rely on vended STS
+creds (`X-Iceberg-Access-Delegation` on the REST path, the
+`ducklake-credentials` endpoint for DuckLake-direct). The vended PG DSN is
+also still the owning `ducklake` role — a dedicated PG reader role + RLS is
+the remaining hardening (governance master plan, Phase 3a).
+
 **Backup automation.** [OPERATIONS.md](OPERATIONS.md) describes the shape
 (`pg_dump` of `ducklake_*` + `duckicelake_*` schema, S3 versioning, cross-
 region replication, lifecycle rules). You still have to schedule it,
