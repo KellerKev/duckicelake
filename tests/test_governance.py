@@ -329,3 +329,66 @@ def test_governance_loadtable_enforcement(client):
     audit = client.get("/v1/lake/governance/audit").json()["entries"]
     loads = [e for e in audit if e["operation"] == "load_table"]
     assert any(e["masked_cols"] == ["email"] for e in loads)
+
+
+# ---- Phase 4: file-layer masking (pure plumbing) ----------------------------
+
+from duckicelake.policies import (   # noqa: E402
+    build_masked_export_select,
+    plan_is_exportable,
+)
+
+
+def _file_layer_inputs(unmasked_roles, file_layer=True):
+    inputs = _mask_inputs(unmasked_roles)
+    inputs["masking_bodies"]["mask_email"]["file_layer_masking"] = file_layer
+    return inputs
+
+
+def test_plan_file_layer_flag_flows():
+    plan = build_plan(principal="bob", roles=[],
+                      **_file_layer_inputs(["pii_reader"]))
+    assert plan.file_layer is True
+    # bypass role → empty plan, no file-layer demand
+    bypassed = build_plan(principal="alice", roles=["pii_reader"],
+                          **_file_layer_inputs(["pii_reader"]))
+    assert bypassed.is_empty() and bypassed.file_layer is False
+
+
+def test_mask_signature_folds_file_layer_conditionally():
+    flat = build_plan(principal="p", roles=[],
+                      **_file_layer_inputs(["pii_reader"], file_layer=False))
+    layered = build_plan(principal="p", roles=[],
+                         **_file_layer_inputs(["pii_reader"], file_layer=True))
+    # flag off ⇒ byte-identical to a plan with no flag key at all
+    legacy = build_plan(principal="p", roles=[],
+                        **_mask_inputs(unmasked_roles=["pii_reader"]))
+    assert mask_signature(flat) == mask_signature(legacy)
+    # flag on ⇒ rotated signature
+    assert mask_signature(layered) != mask_signature(flat)
+
+
+def test_build_masked_export_select_shape():
+    plan = build_plan(principal="p", roles=[],
+                      **_file_layer_inputs(["pii_reader"]))
+    sql = build_masked_export_select(plan, catalog_name="lake", snapshot_id=42)
+    assert sql == (
+        'SELECT "id", left("email",2)||\'***\' AS "email" '
+        'FROM "lake"."analytics"."events" AT (VERSION => 42)'
+    )
+    # row filter nests around the pinned source
+    plan.row_filter = "(region = 'EU')"
+    sql = build_masked_export_select(plan, catalog_name="lake", snapshot_id=7)
+    assert 'FROM (SELECT * FROM "lake"."analytics"."events" AT (VERSION => 7) ' \
+           "WHERE (region = 'EU'))" in sql
+
+
+def test_plan_is_exportable_refuses_session_tokens():
+    plan = build_plan(principal="p", roles=[],
+                      **_file_layer_inputs(["pii_reader"]))
+    assert plan_is_exportable(plan)
+    bad = _file_layer_inputs(["pii_reader"])
+    bad["masking_bodies"]["mask_email"]["body"] = \
+        "CASE WHEN current_user = 'x' THEN val ELSE '***' END"
+    plan = build_plan(principal="p", roles=[], **bad)
+    assert not plan_is_exportable(plan)

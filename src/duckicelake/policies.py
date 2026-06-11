@@ -58,6 +58,9 @@ class TablePolicyPlan:
     row_policies: list[str] = field(default_factory=list)
     view_sql: str | None = None
     columns: list[str] = field(default_factory=list)   # base-table column set
+    # Phase 4: any applied (non-bypassed) mask policy demands the mask be
+    # materialized physically as masked Parquet copies.
+    file_layer: bool = False
 
     @property
     def masked_columns(self) -> list[str]:
@@ -126,6 +129,8 @@ def build_plan(
                 mask_expr=expr,
                 doc=f"[masked by policy '{pol['name']}' — principal lacks an unmasked role]",
             ))
+            if body.get("file_layer_masking"):
+                plan.file_layer = True
             break   # one mask per column is enough; first applicable wins
 
     predicates: list[str] = []
@@ -190,14 +195,64 @@ def mask_signature(plan: TablePolicyPlan, columns: list[str] | None = None) -> s
     if plan.is_empty():
         return ""
     cols = plan.columns if columns is None else columns
-    canonical = json.dumps([
+    canonical_parts: list = [
         plan.schema,
         plan.table,
         sorted((m.column, m.mask_expr) for m in plan.masks),
         plan.row_filter,
         sorted(cols),
-    ], separators=(",", ":"))
+    ]
+    # Folded only when set, so pre-Phase-4 signatures stay byte-identical.
+    # Toggling the flag must rotate the signature: the view body and the
+    # credential scope both key on it and would otherwise disagree.
+    if plan.file_layer:
+        canonical_parts.append("file_layer")
+    canonical = json.dumps(canonical_parts, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+
+#: Session-dependent SQL tokens that cannot be baked into physical bytes —
+#: a file-layer export with any of these in a mask/filter body is refused
+#: (fail-open to catalog-level masking).
+_SESSION_TOKENS = re.compile(
+    r"\b(current_user|session_user|current_setting|current_role|user)\b",
+    re.IGNORECASE,
+)
+
+
+def plan_is_exportable(plan: TablePolicyPlan) -> bool:
+    """File-layer exports bake the mask into Parquet; expressions that
+    depend on the executing session would freeze the *exporter's* identity
+    into the bytes."""
+    bodies = [m.mask_expr for m in plan.masks]
+    if plan.row_filter:
+        bodies.append(plan.row_filter)
+    return not any(_SESSION_TOKENS.search(b) for b in bodies)
+
+
+def build_masked_export_select(
+    plan: TablePolicyPlan,
+    *,
+    catalog_name: str,
+    snapshot_id: int | None = None,
+) -> str:
+    """The SELECT a file-layer export COPYs: same projection/filter
+    semantics as the masking view, but fully qualified against the proxy's
+    attached catalog and optionally pinned to a DuckLake snapshot so the
+    export is exactly attributable."""
+    projected = []
+    masks = {m.column: m.mask_expr for m in plan.masks}
+    for c in plan.columns:
+        if c in masks:
+            projected.append(f'{masks[c]} AS "{c}"')
+        else:
+            projected.append(f'"{c}"')
+    source = f'"{catalog_name}"."{plan.schema}"."{plan.table}"'
+    if snapshot_id is not None:
+        source += f" AT (VERSION => {int(snapshot_id)})"
+    if plan.row_filter:
+        source = f'(SELECT * FROM {source} WHERE {plan.row_filter}) AS "{plan.table}"'
+    return f'SELECT {", ".join(projected)} FROM {source}'
 
 
 def apply_plan_to_metadata(metadata: dict, plan: TablePolicyPlan) -> dict:

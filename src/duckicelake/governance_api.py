@@ -56,6 +56,10 @@ class CreatePolicyRequest(BaseModel):
     # Roles that bypass this policy (Phase 2 enforcement). A principal
     # holding any of these sees unmasked data / unfiltered rows.
     unmasked_roles: list[str] | None = Field(default=None, alias="unmasked-roles")
+    # Phase 4: also materialize the mask physically as masked Parquet
+    # copies (byte-level enforcement for direct Parquet readers; more
+    # storage). Masking policies only — ignored on row-access policies.
+    file_layer_masking: bool = Field(default=False, alias="file-layer-masking")
     model_config = {"populate_by_name": True}
 
 
@@ -131,7 +135,8 @@ def build_governance_router(
     def create_masking_policy(prefix: str, req: CreatePolicyRequest, request: Request):
         _check_prefix(prefix)
         store.create_masking_policy(_principal(request), req.name, req.signature_sql,
-                                    req.body_sql, req.unmasked_roles)
+                                    req.body_sql, req.unmasked_roles,
+                                    file_layer_masking=req.file_layer_masking)
         return {"status": "created", "policy": req.name}
 
     @router.post("/row-access-policies", status_code=200)

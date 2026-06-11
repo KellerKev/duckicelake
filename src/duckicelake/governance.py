@@ -97,6 +97,14 @@ def ensure_governance_sidecars(cur) -> None:
             f"ALTER TABLE public.{_pt} "
             f"ADD COLUMN IF NOT EXISTS unmasked_roles TEXT[]"
         )
+    # Phase 4: file-layer masking. When true, the proxy ALSO materializes
+    # the mask physically as masked Parquet copies (one per table +
+    # mask-signature) so engines that read Parquet directly get masked
+    # bytes. Default false = catalog-level masking only (views + signals).
+    cur.execute(
+        "ALTER TABLE public.duckicelake_masking_policy "
+        "ADD COLUMN IF NOT EXISTS file_layer_masking BOOLEAN NOT NULL DEFAULT false"
+    )
     # --- policy attachments ---------------------------------------------
     # A masking policy attaches to a tag or a single column; a row-access
     # policy attaches to a table on a column-list. `columns` holds the
@@ -437,9 +445,11 @@ class GovernanceStore:
 
     def create_masking_policy(self, principal: str, name: str,
                               signature_sql: str, body_sql: str,
-                              unmasked_roles: list[str] | None = None) -> None:
+                              unmasked_roles: list[str] | None = None,
+                              file_layer_masking: bool = False) -> None:
         self._create_policy("duckicelake_masking_policy", "create_masking_policy",
-                            principal, name, signature_sql, body_sql, unmasked_roles)
+                            principal, name, signature_sql, body_sql, unmasked_roles,
+                            file_layer_masking=file_layer_masking)
 
     def create_row_access_policy(self, principal: str, name: str,
                                  signature_sql: str, body_sql: str,
@@ -449,23 +459,42 @@ class GovernanceStore:
 
     def _create_policy(self, table: str, op: str, principal: str, name: str,
                        signature_sql: str, body_sql: str,
-                       unmasked_roles: list[str] | None) -> None:
+                       unmasked_roles: list[str] | None,
+                       file_layer_masking: bool | None = None) -> None:
         with self.catalog.pg_cursor() as cur:
             ensure_governance_sidecars(cur)
-            cur.execute(
-                f"""
-                INSERT INTO public.{table} (name, signature_sql, body_sql, unmasked_roles)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (name) DO UPDATE
-                  SET signature_sql = EXCLUDED.signature_sql,
-                      body_sql = EXCLUDED.body_sql,
-                      unmasked_roles = EXCLUDED.unmasked_roles
-                """,
-                (name, signature_sql, body_sql, unmasked_roles),
-            )
+            if file_layer_masking is None:
+                # row-access policies have no file_layer column
+                cur.execute(
+                    f"""
+                    INSERT INTO public.{table} (name, signature_sql, body_sql, unmasked_roles)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE
+                      SET signature_sql = EXCLUDED.signature_sql,
+                          body_sql = EXCLUDED.body_sql,
+                          unmasked_roles = EXCLUDED.unmasked_roles
+                    """,
+                    (name, signature_sql, body_sql, unmasked_roles),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    INSERT INTO public.{table}
+                        (name, signature_sql, body_sql, unmasked_roles, file_layer_masking)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE
+                      SET signature_sql = EXCLUDED.signature_sql,
+                          body_sql = EXCLUDED.body_sql,
+                          unmasked_roles = EXCLUDED.unmasked_roles,
+                          file_layer_masking = EXCLUDED.file_layer_masking
+                    """,
+                    (name, signature_sql, body_sql, unmasked_roles, file_layer_masking),
+                )
             self.audit(cur, principal=principal, operation=op, object_=name,
                        detail={"signature": signature_sql,
-                               "unmasked_roles": unmasked_roles})
+                               "unmasked_roles": unmasked_roles,
+                               **({"file_layer_masking": file_layer_masking}
+                                  if file_layer_masking is not None else {})})
 
     def attach_policy(self, principal: str, *, policy_kind: str, policy_name: str,
                       target_kind: str, tag_ns: str | None = None,
@@ -599,6 +628,17 @@ class GovernanceStore:
 
     @staticmethod
     def _fetch_policy_bodies(cur, table: str) -> dict[str, dict]:
+        if table == "duckicelake_masking_policy":
+            cur.execute(
+                f"SELECT name, signature_sql, body_sql, unmasked_roles, "
+                f"file_layer_masking FROM public.{table}"
+            )
+            return {
+                r[0]: {"signature": r[1], "body": r[2],
+                       "unmasked_roles": r[3] or [],
+                       "file_layer_masking": bool(r[4])}
+                for r in cur.fetchall()
+            }
         cur.execute(
             f"SELECT name, signature_sql, body_sql, unmasked_roles FROM public.{table}"
         )
