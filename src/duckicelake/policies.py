@@ -28,6 +28,8 @@ functions are pure and unit-tested without Postgres.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -55,6 +57,7 @@ class TablePolicyPlan:
     row_filter: str | None = None       # combined SQL predicate (true => keep row)
     row_policies: list[str] = field(default_factory=list)
     view_sql: str | None = None
+    columns: list[str] = field(default_factory=list)   # base-table column set
 
     @property
     def masked_columns(self) -> list[str]:
@@ -108,7 +111,8 @@ def build_plan(
         row_bodies=row_bodies,
     )
 
-    plan = TablePolicyPlan(principal=principal, roles=roles, schema=schema, table=table)
+    plan = TablePolicyPlan(principal=principal, roles=roles, schema=schema,
+                           table=table, columns=list(columns))
 
     for col in derived["column_masks"]:
         for pol in col["masking_policies"]:
@@ -154,18 +158,42 @@ def build_masked_view_sql(
     row_filter: str | None,
 ) -> str:
     """The view-fallback SELECT: masked columns replaced by their expression,
-    a WHERE for the row filter. This is what a PyIceberg/DuckDB deployment
-    would materialise as an Iceberg view to get byte-level masking."""
+    the row filter applied in a nested subquery. The nesting matters now that
+    views are executed, not advisory: a filter referencing a masked column
+    must see the *raw* value (Snowflake row-policy semantics), and a flat
+    WHERE after the mask aliases resolves alias-vs-base-column differently
+    per engine. The base table stays unqualified — a DuckLake-direct client
+    resolves it against its own attached catalog."""
     projected = []
     for c in columns:
         if c in masks:
             projected.append(f'{masks[c]} AS "{c}"')
         else:
             projected.append(f'"{c}"')
-    sql = f'SELECT {", ".join(projected)} FROM "{schema}"."{table}"'
+    source = f'"{schema}"."{table}"'
     if row_filter:
-        sql += f" WHERE {row_filter}"
-    return sql
+        source = f'(SELECT * FROM {source} WHERE {row_filter}) AS "{table}"'
+    return f'SELECT {", ".join(projected)} FROM {source}'
+
+
+def mask_signature(plan: TablePolicyPlan, columns: list[str] | None = None) -> str:
+    """Stable short id for a plan's *effective mask shape* on a table.
+
+    Principals whose plans mask the same columns the same way (and share the
+    row filter) get the same signature → one physical masking view serves
+    them all. The base column set is folded in so an ADD/DROP COLUMN yields
+    a fresh signature (and therefore a fresh view) automatically. Empty plan
+    → "" (no view needed).
+    """
+    if plan.is_empty():
+        return ""
+    cols = plan.columns if columns is None else columns
+    canonical = json.dumps([
+        sorted((m.column, m.mask_expr) for m in plan.masks),
+        plan.row_filter,
+        sorted(cols),
+    ], separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
 
 
 def apply_plan_to_metadata(metadata: dict, plan: TablePolicyPlan) -> dict:

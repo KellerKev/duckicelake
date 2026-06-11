@@ -17,6 +17,7 @@ from duckicelake.policies import (
     apply_plan_to_metadata,
     build_masked_view_sql,
     build_plan,
+    mask_signature,
 )
 
 
@@ -154,7 +155,12 @@ def test_plan_combines_row_filters():
                                 "body": "region = 'EU'", "unmasked_roles": []}},
     )
     assert plan.row_filter == "(region = 'EU')"
-    assert plan.view_sql.endswith("WHERE (region = 'EU')")
+    # filter applied in a nested subquery so it sees raw values and never
+    # collides with mask aliases (engine-dependent otherwise)
+    assert plan.view_sql == (
+        'SELECT "region" FROM '
+        '(SELECT * FROM "s"."t" WHERE (region = \'EU\')) AS "t"'
+    )
 
 
 def test_apply_plan_to_metadata_stamps_signals():
@@ -183,6 +189,41 @@ def test_build_masked_view_sql_passthrough_for_unmasked_cols():
     sql = build_masked_view_sql(schema="s", table="t", columns=["a", "b", "c"],
                                 masks={"b": "'***'"}, row_filter=None)
     assert sql == 'SELECT "a", \'***\' AS "b", "c" FROM "s"."t"'
+
+
+# ---- mask signatures (per-mask-shape view identity) ------------------------
+
+def test_mask_signature_stable_and_empty():
+    inputs = _mask_inputs(unmasked_roles=["pii_reader"])
+    masked = build_plan(principal="agent-1", roles=["agent"], **inputs)
+    masked_again = build_plan(principal="agent-2", roles=["other"], **inputs)
+    # same effective mask shape → same signature, regardless of principal
+    assert mask_signature(masked) == mask_signature(masked_again)
+    assert len(mask_signature(masked)) == 12
+
+    empty = build_plan(principal="human-1", roles=["pii_reader"], **inputs)
+    assert mask_signature(empty) == ""
+
+
+def test_mask_signature_sensitive_to_shape_changes():
+    base = build_plan(principal="p", roles=[],
+                      **_mask_inputs(unmasked_roles=["pii_reader"]))
+
+    # different mask body → different signature
+    other_body = _mask_inputs(unmasked_roles=["pii_reader"])
+    other_body["masking_bodies"]["mask_email"]["body"] = "'***'"
+    rebodied = build_plan(principal="p", roles=[], **other_body)
+    assert mask_signature(rebodied) != mask_signature(base)
+
+    # column add/drop → different signature (fresh view on schema change)
+    widened = _mask_inputs(unmasked_roles=["pii_reader"])
+    widened["columns"] = ["id", "email", "country"]
+    rewidened = build_plan(principal="p", roles=[], **widened)
+    assert mask_signature(rewidened) != mask_signature(base)
+
+    # explicit column override takes precedence over plan.columns
+    assert mask_signature(base, ["id", "email"]) == mask_signature(base)
+    assert mask_signature(base, ["id", "email", "x"]) != mask_signature(base)
 
 
 # ---- integration through the proxy ----------------------------------------
