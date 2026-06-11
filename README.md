@@ -270,6 +270,27 @@ keys + its `metadata/*` prefix. Returns
 `s3.access-key-id` / `s3.secret-access-key` / `s3.session-token` /
 `s3.credentials-expiration` in the LoadTable `config` map.
 
+**Root keys are not embedded by default.** Response configs carry only
+endpoint/region/url-style; clients are expected to use vended credentials
+(the delegation header, or `GET …/ducklake-credentials` for DuckLake-direct
+— see [GOVERNANCE.md](GOVERNANCE.md)). Dev stacks that want the old
+convenience set `suppress_root_creds = false` in `duckicelake.toml` (or
+`DUCKICELAKE_SUPPRESS_ROOT_CREDS=0`).
+
+### Configuration
+
+Every `DUCKICELAKE_*` setting can come from, in precedence order:
+
+1. real environment variables,
+2. a `.env` file in the working directory (`DUCKICELAKE_*` keys only),
+3. `./duckicelake.toml` — or the file `DUCKICELAKE_CONFIG_FILE` points at.
+
+See [duckicelake.toml.example](duckicelake.toml.example) for the full key
+map (`[s3] endpoint` ↔ `DUCKICELAKE_S3_ENDPOINT`, top-level
+`suppress_root_creds` ↔ `DUCKICELAKE_SUPPRESS_ROOT_CREDS`, …). File values
+are injected at startup without overriding the real environment, so they
+also feed auth, logging, and the notify listener.
+
 ### Throughput / scale
 
 - Postgres `ConnectionPool` (psycopg-pool) — most LoadTable work hits

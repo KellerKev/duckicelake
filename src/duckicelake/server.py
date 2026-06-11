@@ -28,7 +28,7 @@ from .auth import (
 )
 from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
-from .config import load_settings
+from .config import apply_file_config, load_settings
 from .governance import GovernanceStore
 from .masking_views import (
     MASK_SCHEMA_PREFIX,
@@ -61,6 +61,10 @@ from .observability import (
 )
 from .sts import vend_credentials
 
+
+# File-based config (.env / duckicelake.toml) must be in os.environ before
+# anything reads DUCKICELAKE_* — including setup_logging (LOG_FORMAT/LEVEL).
+apply_file_config()
 
 setup_logging()
 
@@ -102,19 +106,10 @@ policy_engine = PolicyEngine(governance_store)
 masking_view_manager = MaskingViewManager(catalog, settings)
 
 
-# `DUCKICELAKE_SUPPRESS_ROOT_CREDS=1` omits the root S3 key pair from every
-# response config. Default off (the demo flow hands out root MinIO keys),
-# but any deployment relying on the governance cooperative boundary must
-# set it — with root keys in client hands, masking is bypassable in one line.
-SUPPRESS_ROOT_CREDS = os.environ.get("DUCKICELAKE_SUPPRESS_ROOT_CREDS", "0") == "1"
-
-# Transparent DuckLake-direct masking (`SET search_path` onto a
-# `__masked_{sig}` schema, returned as post_attach_sql by the
-# ducklake-credentials endpoint). Probe-verified to work
-# (scripts/probe_searchpath.py); the flag is an opt-out in case a DuckDB
-# release regresses unqualified-name resolution across attached schemas.
-# The by-name `masked_view` in the response works regardless.
-TRANSPARENT_MASKING = os.environ.get("DUCKICELAKE_TRANSPARENT_MASKING", "1") == "1"
+# Root-key suppression + transparent masking live on Settings
+# (config.py) so they're configurable via env, .env, or duckicelake.toml.
+# Suppression defaults ON: with root keys in client hands, the governance
+# masking layer is bypassable in one line. See GOVERNANCE.md.
 
 # `DUCKICELAKE_REQUIRE_AUTH=1` fails startup when no OAuth clients are
 # configured — a safety-belt for production deploys so ops can't
@@ -774,7 +769,7 @@ def ducklake_credentials(
                     decision = "masked"
                     out["masked_view"] = f"{ns[0]}.{view}"
                     out["mask_signature"] = mask_signature(plan)
-                    if TRANSPARENT_MASKING:
+                    if settings.transparent_masking:
                         schema = masking_view_manager.ensure_transparent_schema(
                             ns, table, plan,
                         )
@@ -819,8 +814,8 @@ def ducklake_credentials(
     except Exception:
         log.exception("ducklake-credentials STS vending failed for %s — %s",
                       ns[0], "falling back to root keys"
-                      if not SUPPRESS_ROOT_CREDS else "no creds returned")
-        if SUPPRESS_ROOT_CREDS:
+                      if not settings.suppress_root_creds else "no creds returned")
+        if settings.suppress_root_creds:
             out["s3"] = None
             decision = "error_no_creds"
         else:
@@ -1421,7 +1416,7 @@ def _base_s3_config() -> dict[str, str]:
         # DuckDB-style keys (the iceberg extension reads these as-is).
         "s3.url-style": "path" if s3.path_style else "vhost",
     }
-    if not SUPPRESS_ROOT_CREDS:
+    if not settings.suppress_root_creds:
         # Demo/dev convenience only — root keys in client hands make every
         # governance masking layer bypassable. Production sets
         # DUCKICELAKE_SUPPRESS_ROOT_CREDS=1 and clients rely on vended creds.

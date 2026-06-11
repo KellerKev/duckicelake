@@ -150,8 +150,10 @@ bytes; the vended PG DSN is still the owning `ducklake` role. A determined
 client can query the base table directly (and, with root S3 keys, bypass
 everything). Consequences:
 
-- Production must set `DUCKICELAKE_SUPPRESS_ROOT_CREDS=1` so response configs
-  stop embedding the root MinIO key pair; clients then rely on vended creds.
+- Response configs **omit the root MinIO key pair by default**
+  (`suppress_root_creds`, settable via env / `.env` / `duckicelake.toml`);
+  clients rely on vended creds. Only flip it off for dev stacks that don't
+  care about the masking boundary.
 - A PG reader role + RLS on `ducklake_*` (master-plan Phase 3a) and pre-masked
   physical files (airtight tier) remain the escalation path for adversarial
   clients. Until then, treat Phase 3 as right for agents/BI/lakesh — clients
