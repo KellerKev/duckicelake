@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import duckdb
@@ -36,6 +37,7 @@ from .masking_views import (
     MaskingViewManager,
 )
 from .governance_api import build_governance_router
+from .pg_rls import ensure_rls, gc_expired_roles, provision_principal_role
 from .policies import PolicyEngine, apply_plan_to_metadata, mask_signature
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
@@ -129,6 +131,15 @@ async def lifespan(app: FastAPI):
     import asyncio
     catalog.connect()
     log.info("DuckLake catalog connected: %s", settings.ducklake_uri)
+    # Phase 3a: reader role + RLS on the ducklake_* catalog tables for
+    # vended DuckLake-direct credentials. Fail-open — an RLS setup error
+    # must never stop the proxy; vending degrades to the owner DSN.
+    if settings.rls_enabled:
+        try:
+            ensure_rls(catalog, settings)
+        except Exception:
+            log.exception("RLS setup failed — ducklake-credentials will "
+                          "vend the owner DSN")
     # Eager DuckLake-to-Iceberg materialisation listener. Elects one
     # worker via PG advisory lock; the others poll the lock so they take
     # over if the elected worker dies. See src/duckicelake/notify.py.
@@ -734,6 +745,7 @@ def ducklake_credentials(
         sub = principal
 
     alias = settings.catalog_name
+    clamped = max(900, min(43200, duration_seconds))
     out: dict[str, Any] = {
         "ducklake_dsn": settings.pg_dsn,
         "ducklake_data_path": settings.ducklake_data_path,
@@ -745,7 +757,32 @@ def ducklake_credentials(
         "masked_view": None,
         "mask_signature": None,
         "transparent": False,
+        "pg_role": None,
+        "pg_valid_until": None,
     }
+
+    # Phase 3a: vend a per-principal RLS-governed reader role instead of
+    # the owning DSN. Failure degrades to the owner DSN (current behavior)
+    # and is flagged in the audit detail — never blocks vending.
+    reader_dsn_ok = False
+    if settings.rls_enabled:
+        try:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=clamped)
+            pg_role, pg_password = provision_principal_role(
+                catalog, settings, sub, expires_at)
+            reader_dsn = settings.pg_dsn_for(pg_role, pg_password)
+            out["ducklake_dsn"] = reader_dsn
+            out["ducklake_attach_sql"] = (
+                f"ATTACH 'ducklake:postgres:{reader_dsn}' AS {alias} "
+                f"(DATA_PATH '{settings.ducklake_data_path}', READ_ONLY)"
+            )
+            out["pg_role"] = pg_role
+            out["pg_valid_until"] = expires_at.isoformat()
+            reader_dsn_ok = True
+            gc_expired_roles(catalog)
+        except Exception:
+            log.exception("reader-role provisioning failed for %s — "
+                          "vending owner DSN", sub)
 
     decision = "ok"
     masked_cols: list[str] = []
@@ -799,7 +836,7 @@ def ducklake_credentials(
             table=table or "*",
             read_only=True,
             read_prefixes=read_prefixes,
-            duration_seconds=max(900, min(43200, duration_seconds)),
+            duration_seconds=clamped,
             principal=sub,
         )
         out["s3"] = {
@@ -842,6 +879,7 @@ def ducklake_credentials(
             detail={
                 "transparent": out["transparent"],
                 "masked_view": out["masked_view"],
+                "reader_dsn": reader_dsn_ok,
             },
         )
     except Exception:
