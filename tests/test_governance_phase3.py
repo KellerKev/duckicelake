@@ -153,3 +153,78 @@ def test_view_manager_transparent_schema(client, settings, direct_catalog):
     # gc of the signature also removes the transparent schema
     mgr.gc_orphans([ns], "events", keep=set())
     assert _live_view_rows(settings.pg_dsn, schema, "events") == 0
+
+
+# ---- REST read path (stage 2) ----------------------------------------------
+
+def _author_demo_policy(client, ns: str, table: str) -> None:
+    """pii.email tag on ns.table.email + mask_email policy attached to the
+    tag, bypassed by the pii_reader role (the test_governance.py shape)."""
+    client.post("/v1/lake/governance/tags",
+                json={"namespace": "pii", "name": "email"}).raise_for_status()
+    client.post("/v1/lake/governance/object-tags",
+                json={"object-kind": "column", "schema": ns, "object": table,
+                      "column": "email", "tag-namespace": "pii",
+                      "tag-name": "email"}).raise_for_status()
+    client.post("/v1/lake/governance/masking-policies",
+                json={"name": "mask_email", "signature": "(val VARCHAR)",
+                      "body": "left(val,2)||'***'",
+                      "unmasked-roles": ["pii_reader"]}).raise_for_status()
+    client.post("/v1/lake/governance/policy-attachments",
+                json={"policy-kind": "masking", "policy-name": "mask_email",
+                      "target-kind": "tag", "tag-namespace": "pii",
+                      "tag-name": "email"}).raise_for_status()
+
+
+def test_loadtable_materializes_and_stamps_view(client, settings):
+    """A masked LoadTable materializes the masking view and advertises it
+    via the duckicelake.masking-view-name property; the view is loadable
+    over REST but hidden from list_views."""
+    ns = _ns("stamp")
+    _make_table(client, ns, "events")
+    _author_demo_policy(client, ns, "events")
+
+    md = client.get(f"/v1/lake/namespaces/{ns}/tables/events").json()["metadata"]
+    view_name = md["properties"].get("duckicelake.masking-view-name")
+    assert view_name and view_name.startswith("__mask_events__")
+    # Phase-2 advisory stamping is intact alongside the new property
+    assert md["properties"]["duckicelake.masked-columns"] == "email"
+
+    # physically materialized…
+    assert _live_view_rows(settings.pg_dsn, ns, view_name) == 1
+    # …loadable by name over REST (the PyIceberg/Trino path)…
+    v = client.get(f"/v1/lake/namespaces/{ns}/views/{view_name}")
+    assert v.status_code == 200, v.text
+    rep = v.json()["metadata"]["versions"][0]["representations"][0]
+    # DuckLake stores the SQL as DuckDB rebound it (normalized quoting), so
+    # assert the mask semantics rather than the exact text
+    assert "left" in rep["sql"].lower() and "'***'" in rep["sql"]
+    # …but hidden from enumeration
+    listed = client.get(f"/v1/lake/namespaces/{ns}/views").json()["identifiers"]
+    assert view_name not in [i["name"] for i in listed]
+
+
+def test_reserved_prefixes_rejected(client):
+    ns = _ns("resv")
+    client.post("/v1/lake/namespaces", json={"namespace": [ns]}).raise_for_status()
+    r = client.post(f"/v1/lake/namespaces/{ns}/views",
+                    json={"name": "__mask_x", "view-version": {
+                        "representations": [{"type": "sql", "sql": "SELECT 1",
+                                             "dialect": "duckdb"}]}})
+    assert r.status_code == 400
+    r = client.post("/v1/lake/namespaces",
+                    json={"namespace": ["__masked_deadbeef"]})
+    assert r.status_code == 400
+
+
+def test_masked_namespaces_hidden_from_listing(client, settings, direct_catalog):
+    ns = _ns("hidden")
+    _make_table(client, ns, "events")
+    mgr = MaskingViewManager(direct_catalog, settings)
+    plan = _mask_plan(ns, "events")
+    schema = mgr.ensure_transparent_schema([ns], "events", plan)
+    assert schema is not None
+    namespaces = client.get("/v1/lake/namespaces").json()["namespaces"]
+    flat = [n[0] for n in namespaces]
+    assert ns in flat
+    assert schema not in flat

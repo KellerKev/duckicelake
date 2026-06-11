@@ -30,6 +30,11 @@ from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
 from .config import load_settings
 from .governance import GovernanceStore
+from .masking_views import (
+    MASK_SCHEMA_PREFIX,
+    MASK_VIEW_PREFIX,
+    MaskingViewManager,
+)
 from .governance_api import build_governance_router
 from .policies import PolicyEngine, apply_plan_to_metadata
 from .iceberg import build_table_metadata, schema_to_columns_ddl
@@ -91,6 +96,10 @@ require_bearer = make_bearer_dependency(auth_cfg)
 # filter rows per principal. No-op when no governance objects are authored.
 governance_store = GovernanceStore(catalog)
 policy_engine = PolicyEngine(governance_store)
+# Phase 3: ad-hoc masking views — one physical DuckLake view per
+# (table, mask-signature), materialized on the read path so both
+# DuckLake-direct and view-capable REST clients can execute the mask.
+masking_view_manager = MaskingViewManager(catalog, settings)
 
 
 # `DUCKICELAKE_REQUIRE_AUTH=1` fails startup when no OAuth clients are
@@ -356,7 +365,13 @@ def _check_prefix(prefix: str) -> None:
 def list_namespaces(prefix: str, parent: str | None = None) -> ListNamespacesResponse:
     _check_prefix(prefix)
     parent_list = parent.split(NAMESPACE_SEP) if parent else None
-    return ListNamespacesResponse(namespaces=catalog.list_namespaces(parent_list))
+    # Transparent-masking schemas (`__masked_{sig}`) are plumbing, not user
+    # namespaces — keep REST enumeration clean. (DuckLake-direct clients
+    # still see them in PG; that visibility is inherent.)
+    return ListNamespacesResponse(namespaces=[
+        n for n in catalog.list_namespaces(parent_list)
+        if not n[0].startswith(MASK_SCHEMA_PREFIX)
+    ])
 
 
 @app.post(
@@ -368,6 +383,12 @@ def create_namespace(
     prefix: str, req: CreateNamespaceRequest
 ) -> CreateNamespaceResponse:
     _check_prefix(prefix)
+    if req.namespace and req.namespace[0].startswith(MASK_SCHEMA_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Namespaces starting with '{MASK_SCHEMA_PREFIX}' are "
+                   "reserved for governance masking schemas",
+        )
     if catalog.namespace_exists(req.namespace):
         raise HTTPException(
             status_code=409,
@@ -551,7 +572,11 @@ def list_views(prefix: str, namespace: str) -> dict[str, Any]:
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
-    names = catalog.list_views(ns)
+    # Masking views stay out of enumeration (they're advertised per-principal
+    # via the `duckicelake.masking-view-name` LoadTable property) but remain
+    # loadable/droppable by name. Filtered here, not in catalog.list_views —
+    # gc_orphans needs the unfiltered list.
+    names = [n for n in catalog.list_views(ns) if not n.startswith(MASK_VIEW_PREFIX)]
     return {"identifiers": [{"namespace": ns, "name": n} for n in names]}
 
 
@@ -562,6 +587,12 @@ def create_view(prefix: str, namespace: str, body: dict[str, Any]) -> dict[str, 
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
     name = body["name"]
+    if name.startswith(MASK_VIEW_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"View names starting with '{MASK_VIEW_PREFIX}' are reserved "
+                   "for governance masking views",
+        )
     view_version = body.get("view-version") or {}
     reps = view_version.get("representations", [])
     sqls = [r["sql"] for r in reps if r.get("type") == "sql" and r.get("dialect", "").lower() in ("", "duckdb", "postgresql", "spark", "trino")]
@@ -1265,13 +1296,28 @@ def _build_load_response(
     if principal_claims is not None:
         principal_for_creds = principal_claims.get("sub") or "anonymous"
         try:
+            # Roles are the UNION of the JWT claim (operator-configured via
+            # DUCKICELAKE_OAUTH_CLIENTS) and the sidecar role grants — either
+            # source can carry an unmasked-role bypass.
+            roles = sorted(
+                set(principal_claims.get("roles") or [])
+                | set(governance_store.roles_for_principal(principal_for_creds))
+            )
             plan = policy_engine.plan_for(
                 principal=principal_for_creds,
-                roles=list(principal_claims.get("roles") or []),
+                roles=roles,
                 schema=ns[0], table=table,
             )
             if not plan.is_empty():
                 metadata = apply_plan_to_metadata(metadata, plan)
+                # Phase 3: materialize the plan's masking view so cooperative
+                # clients (DuckLake-direct, view-capable REST engines) can
+                # execute the mask; advertise it via a table property.
+                view_name = masking_view_manager.ensure_view_for_plan(
+                    ns, table, plan
+                )
+                if view_name:
+                    metadata["properties"]["duckicelake.masking-view-name"] = view_name
                 governance_store.audit_load(
                     principal=principal_for_creds, object_=f"{ns[0]}.{table}",
                     masked_cols=plan.masked_columns,
