@@ -46,6 +46,7 @@ from .policies import (
     MaskDecision,
     TablePolicyPlan,
     build_masked_export_select,
+    build_masked_view_sql,
     mask_signature,
     plan_is_exportable,
 )
@@ -93,10 +94,12 @@ class MaskedExportManager:
     """Materialize / discover / refresh / GC masked Parquet exports."""
 
     def __init__(self, catalog: DuckLakeCatalog, settings: Settings,
-                 store=None) -> None:
+                 store=None, view_manager=None) -> None:
         self.catalog = catalog
         self.settings = settings
-        self.store = store          # GovernanceStore, for audit (optional)
+        self.store = store                  # GovernanceStore, for audit (optional)
+        self.view_manager = view_manager    # MaskingViewManager: repoint views
+        #                                     to the fresh snap dir after export
 
     # ---- discovery -------------------------------------------------------
 
@@ -235,8 +238,10 @@ class MaskedExportManager:
                                     "files": len(files), "duration_ms": ms})
                 log.info("masked export %s.%s sig=%s snap=%s: %d files in %dms",
                          ns[0], table, sig, snap, len(files), ms)
-                return MaskedExport(schema=ns[0], table=table, sig=sig,
-                                    snapshot=snap, prefix=prefix)
+                export = MaskedExport(schema=ns[0], table=table, sig=sig,
+                                      snapshot=snap, prefix=prefix)
+                self._repoint_views(ns, table, plan, export)
+                return export
             finally:
                 lock_cur.execute("SELECT pg_advisory_unlock(%s)",
                                  (_lock_key(ns[0], table, sig),))
@@ -278,19 +283,44 @@ class MaskedExportManager:
                 continue
             self.ensure_export_for_plan(ns, table, plan)
 
+    def _repoint_views(self, ns: list[str], table: str,
+                       plan: TablePolicyPlan, export: MaskedExport) -> None:
+        """After a fresh export, swing the masking view (and transparent
+        schema view) onto the new snap dir — listener-driven refreshes
+        must update what existing client sessions resolve. Best-effort."""
+        if self.view_manager is None:
+            return
+        try:
+            self.view_manager.ensure_view_for_plan(ns, table, plan,
+                                                   export=export)
+            if self.settings.transparent_masking:
+                self.view_manager.ensure_transparent_schema(ns, table, plan,
+                                                            export=export)
+        except Exception:
+            log.exception("view repoint failed for %s.%s sig %s",
+                          ns[0], table, export.sig)
+
     @staticmethod
     def _plan_from_recipe(schema: str, table: str, masks_json,
                           row_filter: str | None,
                           columns: list[str]) -> TablePolicyPlan:
         masks = masks_json if isinstance(masks_json, list) else json.loads(masks_json)
+        decisions = [MaskDecision(column=m["column"],
+                                  policy_name=m.get("policy_name", ""),
+                                  mask_expr=m["mask_expr"], doc="")
+                     for m in masks]
         return TablePolicyPlan(
             principal="__refresh__", roles=[], schema=schema, table=table,
-            masks=[MaskDecision(column=m["column"],
-                                policy_name=m.get("policy_name", ""),
-                                mask_expr=m["mask_expr"], doc="")
-                   for m in masks],
+            masks=decisions,
             row_filter=row_filter,
             columns=list(columns),
+            # view_sql is required by the view-manager guard; for
+            # export-backed views it is also the fail-open expression body
+            view_sql=build_masked_view_sql(
+                schema=schema, table=table, columns=list(columns),
+                masks={d.column: d.mask_expr for d in decisions},
+                row_filter=row_filter,
+            ),
             file_layer=True,
         )
 

@@ -341,3 +341,52 @@ def test_namespace_vend_denies_file_layer_base(client, settings):
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
     open_keys = _base_keys(settings, ns, "open_t")
     s3c.get_object(Bucket=settings.s3.bucket, Key=open_keys[0])  # 200
+
+
+# ---- eager refresh via the notify listener (stage B3) ------------------------
+
+import time
+
+
+def _wait_for(fn, timeout=15.0, interval=0.3):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        v = fn()
+        if v:
+            return v
+        time.sleep(interval)
+    return None
+
+
+def test_listener_refreshes_export_for_existing_creds(client, settings):
+    """A DuckLake-direct write AFTER vending: the elected listener
+    re-exports the known sig at the new snapshot and repoints the view —
+    bob's already-vended session and creds (sig-prefix grant covers future
+    snap dirs) see the new row, masked, without re-vending."""
+    ns = _ns("listen")
+    _make_table(client, ns, "events")
+    _author_file_layer_policy(client, ns, "events")
+    _seed(settings, ns)
+    bob = _vend(client, ns, "bob")
+    assert bob["file_layer"] is True
+
+    con = _vended_duckdb(settings, bob)
+    assert con.execute("SELECT count(*) FROM events").fetchone()[0] == 3
+
+    # post-vend write through the root path → NOTIFY → listener refresh
+    root = _root_duckdb(settings)
+    root.execute(f'INSERT INTO lake."{ns}".events VALUES (4, \'dave@new.org\')')
+    root.close()
+
+    def _sees_new_row():
+        try:
+            rows = dict(con.execute(
+                "SELECT id, email FROM events").fetchall())
+            return rows if 4 in rows else None
+        except Exception:
+            return None
+
+    rows = _wait_for(_sees_new_row)
+    assert rows, "listener did not refresh the masked export in time"
+    assert rows[4] == "da***"            # new row arrives masked
+    con.close()

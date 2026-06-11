@@ -110,7 +110,8 @@ masking_view_manager = MaskingViewManager(catalog, settings)
 # Phase 4: masked Parquet exports for policies flagged file_layer_masking —
 # byte-level enforcement for engines that read Parquet directly.
 masked_export_manager = MaskedExportManager(catalog, settings,
-                                            store=governance_store)
+                                            store=governance_store,
+                                            view_manager=masking_view_manager)
 
 
 def _ensure_file_layer_properties(ns: list[str], table: str, plan) -> None:
