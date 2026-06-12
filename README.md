@@ -97,20 +97,44 @@ materialises one physical DuckLake view per (table, mask-signature) —
   garbage-collected. Per-table opt-out via the
   `duckicelake.masking-disabled` property.
 
+**PG reader roles + RLS** (Phase 3a): `ducklake-credentials` vends a
+**per-principal Postgres LOGIN role** (random per-vend password, `VALID
+UNTIL` = the STS expiry, `READ_ONLY` attach) instead of the owning role,
+with row-level security on the `ducklake_*` catalog tables: explicit
+`select` object-grants flip a table to allowlist (ungranted principals
+can't even see it), and the file-visibility predicate backs Phase 4.
+Real authentication needs prod scram+TLS — one pg_hba line via the group
+role; the dev trust-auth limits are documented honestly.
+
+**File-layer masking** (Phase 4 — byte-level, every engine): set
+`"file-layer-masking": true` on a masking policy and the proxy
+materialises the mask **physically** — per-(table, mask-signature)
+current-state Parquet exports under `data/__masked__/…` (deletes and row
+filters applied by construction, Iceberg field-ids stamped), eagerly
+refreshed on every DuckLake commit. Masked principals then get:
+
+- *DuckLake-direct*: the masking view reads the pre-masked Parquet, creds
+  cover **only** the masked prefix (base bytes physically 403), and RLS
+  hides base file rows — the base table is empty even by name.
+- *Iceberg REST*: LoadTable returns **shadow Iceberg metadata** built over
+  the export + read-only masked-prefix STS — so even the DuckDB `iceberg`
+  extension (no views, no scan planning) transparently scans masked bytes.
+
+Costs storage (one copy per active mask shape); the default remains
+catalog-level only. Built after researching the alternatives — DuckDB has
+no per-column Parquet encryption and no REST scan-planning client, so
+pre-masked copies are the only byte-level mechanism for direct readers.
+
 Everything is **fail-open** (a governance error never breaks a read — it
 serves unmasked and audits the failure) and **root S3 keys are no longer
-embedded in responses by default**, so the cooperative boundary actually
-holds: clients see only vended credentials. The boundary itself is
-documented honestly — a client that names the base table directly still
-reads cleartext; PG RLS and pre-masked physical files are the later,
-airtight tiers ([MISSING.md](MISSING.md)).
+embedded in responses by default**: clients see only vended credentials.
 
 Try it against a running stack:
 
 ```bash
 ./scripts/governance_demo.sh    # author tags/policies/roles via REST + SQL proof
 ./scripts/lakesh_demo.sh        # lakesh: unmasked REST read vs vended masked view
-pixi run pytest -q tests/test_governance.py tests/test_governance_phase3.py
+pixi run pytest -q tests/test_governance.py tests/test_governance_phase3.py tests/test_governance_phase4.py
 ```
 
 The LLM-agent story this is built for: give the agent's token a role
@@ -391,12 +415,13 @@ machine.
 
 ### Tests + CI
 
-- 53 `pytest` tests covering the REST surface, cache LRU, metrics
+- 78 `pytest` tests covering the REST surface, cache LRU, metrics
   endpoint, Puffin writer byte-level structure, the eager-materialisation
   listener, config-file loading, and the governance layer end-to-end —
-  including the load-bearing proof that a roleless principal ATTACHing
-  vended DuckLake credentials reads masked rows while a privileged one
-  reads cleartext.
+  including the byte-level proofs that a masked principal's vended
+  credentials cannot read base Parquet (403) while masked copies, the
+  RLS-governed reader role, and the shadow Iceberg metadata all serve
+  masked rows; a privileged principal reads cleartext throughout.
 - GitHub Actions workflow at [.github/workflows/ci.yml](.github/workflows/ci.yml)
   runs `backends-up` + `pytest` + the full `duckdb-client` demo on
   every push.
@@ -493,6 +518,8 @@ duckicelake/
 │   ├── policies.py               # policy engine: per-principal plan, mask signature,
 │   │                             #   masked-view SQL, metadata stamping
 │   ├── masking_views.py          # ad-hoc DuckLake masking views: materialise/GC/transparent
+│   ├── masked_export.py          # file-layer masking: masked Parquet exports + shadow metadata
+│   ├── pg_rls.py                 # per-principal PG reader roles + RLS on ducklake_*
 │   ├── notify.py                 # eager materialisation listener (LISTEN/NOTIFY + election)
 │   ├── types.py                  # Iceberg ↔ DuckDB ↔ DuckLake type translation
 │   ├── bounds.py                 # Iceberg binary bound encoders
@@ -517,7 +544,8 @@ duckicelake/
     ├── test_cache_and_observability.py
     ├── test_config.py            # config-file loading + precedence + root-key suppression
     ├── test_governance.py        # Phase 1/2: authoring, audit, plan, LoadTable stamping
-    ├── test_governance_phase3.py # masking views, ducklake-credentials, STS scoping, fail-open
+    ├── test_governance_phase3.py # masking views, ducklake-credentials, STS scoping, RLS, fail-open
+    ├── test_governance_phase4.py # file-layer masking: exports, byte proofs, shadow metadata
     ├── test_notify_materialise.py# eager materialisation end-to-end
     └── test_puffin.py            # byte-level Puffin writer tests
 ```
@@ -554,6 +582,11 @@ carry secrets.
 | `DUCKICELAKE_CONFIG_FILE` | *(unset → `./duckicelake.toml`)* | alternate TOML config path |
 | `DUCKICELAKE_SUPPRESS_ROOT_CREDS` | `1` | omit root S3 keys from response configs; `0` is dev-only (bypasses governance masking) |
 | `DUCKICELAKE_TRANSPARENT_MASKING` | `1` | `SET search_path` transparent routing from `ducklake-credentials` |
+| `DUCKICELAKE_RLS` | `1` | per-principal PG reader roles + RLS on `ducklake_*` for vended credentials |
+| `DUCKICELAKE_READER_GROUP_ROLE` | `duckicelake_reader` | NOLOGIN group carrying reader grants + RLS targets |
+| `DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS` | `2` | snap dirs kept per mask-signature (file-layer masking) |
+| `DUCKICELAKE_MASKED_EXPORT_TTL_DAYS` | `7` | idle signatures stop being eagerly refreshed |
+| `DUCKICELAKE_MASKED_EXPORT_FILE_SIZE` | `256MB` | parquet part size for masked exports |
 | `DUCKICELAKE_DISABLE_NOTIFY` | *(unset)* | `1` → disable the eager materialisation listener |
 | `DUCKICELAKE_DEFAULT_FORMAT_VERSION` | `2` | flip to `3` once your writer ecosystem supports it |
 | `DUCKICELAKE_CACHE_MAX` | `1024` | LRU cap for in-process metadata cache |
@@ -592,11 +625,10 @@ surface is effectively complete; remaining gaps are:
 
 - **Architectural** (DuckLake-blocked): true divergent branches,
   per-table `set-location`, real KMS envelope encryption.
-- **Governance escalation tiers**: the implemented masking is
-  cooperative-client by design; PG row-level security behind a dedicated
-  reader role and pre-masked physical files (airtight, 2× storage) are
-  the planned hardening for adversarial clients — see
-  [GOVERNANCE.md](GOVERNANCE.md) and [MISSING.md](MISSING.md).
+- **Governance**: PG RLS (Phase 3a) and file-layer masking (Phase 4) are
+  implemented; remaining gaps are the LLM-agent surface (Phase 5),
+  per-principal aggregated transparent schemas, and export debounce for
+  hot-write tables — see [GOVERNANCE.md](GOVERNANCE.md).
 - **Upstream** (other-project-blocked): Spark v3-format writes (Spark
   3.x), DuckDB iceberg-ext v3 features, DuckDB session TZ shifting
   timestamp stats.

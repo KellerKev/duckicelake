@@ -5,13 +5,16 @@ phasing live in [`duckicelake_governance.md`](duckicelake_governance.md).
 This document tracks what is **actually implemented** on the
 `experimental_governance` branch.
 
-> **Status: Phases 1 + 2 + 3 + 3a.** Phase 1 = authoring surface + audit.
-> Phase 2 = Iceberg REST enforcement at LoadTable (per-principal column
-> masking + row filter signals, audited). Phase 3 = ad-hoc masking views
-> executed by both read paths + the DuckLake-direct credential endpoint.
-> Phase 3a = per-principal PG reader roles + RLS on the `ducklake_*`
-> catalog tables. Phase 4 (file-layer masking — pre-masked Parquet) is in
-> progress; the LLM-agent surface is not yet built.
+> **Status: Phases 1 + 2 + 3 + 3a + 4.** Phase 1 = authoring surface +
+> audit. Phase 2 = Iceberg REST enforcement at LoadTable (per-principal
+> column masking + row filter signals, audited). Phase 3 = ad-hoc masking
+> views executed by both read paths + the DuckLake-direct credential
+> endpoint. Phase 3a = per-principal PG reader roles + RLS on the
+> `ducklake_*` catalog tables. Phase 4 = **file-layer masking**: policies
+> flagged `file-layer-masking` are materialized as masked Parquet, with
+> masked-prefix-only credentials and shadow Iceberg metadata — byte-level
+> enforcement for every engine that reads Parquet directly. The LLM-agent
+> surface (Phase 5) is not yet built.
 
 ## What Phase 1 ships
 
@@ -218,6 +221,73 @@ bypasses it.
   hidden tables' *names* (and masking-view SQL bodies) remain readable to
   readers. Tracked as follow-up hardening.
 
+## What Phase 4 ships — file-layer masking (byte-level, every engine)
+
+| Piece | Where |
+|---|---|
+| Masked Parquet exporter (per table + mask-signature), refresh, GC | [src/duckicelake/masked_export.py](src/duckicelake/masked_export.py) |
+| `file-layer-masking` policy flag | [governance.py](src/duckicelake/governance.py) / [governance_api.py](src/duckicelake/governance_api.py) |
+| Shadow Iceberg metadata + read-only masked STS at LoadTable | [server.py](src/duckicelake/server.py) `_build_load_response` |
+| Masked-prefix credential vending + IAM Deny carve-outs | [server.py](src/duckicelake/server.py) / [sts.py](src/duckicelake/sts.py) |
+| Eager refresh on every DuckLake commit | [notify.py](src/duckicelake/notify.py) |
+| Tests | [tests/test_governance_phase4.py](tests/test_governance_phase4.py) |
+
+**Why it exists (researched before building).** No alternative gives
+byte-level column masking to engines that read Parquet directly: DuckDB has
+no per-column Parquet encryption (`column_keys` unsupported, no roadmap) and
+no Iceberg REST scan-planning client (open issue) — and scan planning could
+only *point* engines at files, which still requires masked files to point
+at. STS/RLS can deny, not transform. Pre-masked copies are the only
+mechanism; the cost is storage.
+
+**How.** Set `"file-layer-masking": true` on a masking policy. For each
+(table, mask-signature) some principal actually requests, the proxy COPYs a
+**current-state export** — mask expressions and row filter applied,
+position/equality deletes resolved by construction, Iceberg field-ids
+stamped — to:
+
+```
+{data_prefix}__masked__/{ns}/{table}/{sig}/snap-{N}-{tok}/part-*.parquet
+```
+
+The sig prefix is the credential boundary. Each DuckLake commit eagerly
+re-exports recently-requested sigs (notify listener) and atomically
+repoints the masking views; clients glob one immutable snap dir and never
+see a half-written state (retention keeps current + previous;
+`DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS`).
+
+**Both read paths get masked bytes:**
+
+- *DuckLake-direct*: the `__mask_{table}__{sig}` view becomes
+  `SELECT * FROM read_parquet('s3://…/{sig}/snap-N-…/*.parquet')`; vended
+  creds cover **only** the masked sig prefix → base bytes are physically
+  403. Namespace-level vends carve file-layer tables' base prefixes out
+  with IAM Deny. The Phase-3a interlock properties are stamped, so RLS also
+  hides base file rows — the base table reads as *empty* even by name.
+- *Iceberg REST*: LoadTable returns **shadow metadata** — a real
+  metadata.json + manifests built over the export (single snapshot, no
+  deletes, no stats) — plus read-only masked-prefix STS. Every Iceberg
+  reader, including the DuckDB `iceberg` extension (no views, no scan
+  planning), transparently scans masked bytes. Bypass-role principals keep
+  base metadata and the normal vend.
+
+**Boundaries and behavior:**
+
+- Masked principals lose time travel (current-state export) — by design;
+  historic snapshots predating a policy are themselves a leak vector.
+- Policies whose expressions depend on the session (`current_user`, …)
+  are refused for export (the exporter's identity must not freeze into
+  bytes) — they fall back to catalog-level masking.
+- Storage: +1 table copy per active mask-signature (×2 transiently during
+  repoint); every commit on a flagged table re-exports each live sig —
+  size parts via `DUCKICELAKE_MASKED_EXPORT_FILE_SIZE`, idle sigs age out
+  after `DUCKICELAKE_MASKED_EXPORT_TTL_DAYS`.
+- Fail-open as always: export or shadow-metadata failure degrades to
+  catalog-level masking (audited `error_file_layer_fallback`); decisions
+  are audited as `masked_file_layer` / `operation=masked_export`.
+- Schema changes and DROP TABLE purge exports; signatures fold the column
+  set, so the next masked read rebuilds at the new shape.
+
 ## REST surface
 
 All under `/v1/{prefix}/governance` (prefix = catalog name, default `lake`).
@@ -229,7 +299,7 @@ construction in Phase 1.
 ```
 POST /v1/{prefix}/governance/tags                 {namespace, name, allowed-values?}
 POST /v1/{prefix}/governance/object-tags          {object-kind, schema, object?, column?, tag-namespace, tag-name, value?}
-POST /v1/{prefix}/governance/masking-policies      {name, signature, body, unmasked-roles?}
+POST /v1/{prefix}/governance/masking-policies      {name, signature, body, unmasked-roles?, file-layer-masking?}
 POST /v1/{prefix}/governance/row-access-policies   {name, signature, body, unmasked-roles?}
 POST /v1/{prefix}/governance/policy-attachments    {policy-kind, policy-name, target-kind, tag-namespace?, tag-name?, schema?, object?, column?, columns?}
 POST /v1/{prefix}/governance/roles                 {name}
@@ -278,11 +348,9 @@ curl "localhost:8181$P/audit"
 > it is **Phase 3** in this numbering (its credential-gating half), built
 > before the PG-RLS half.
 
-- **Phase 4** — file-layer masking: pre-masked physical Parquet per
-  (table, mask-signature) for policies flagged `file-layer-masking`, masked-
-  prefix-only credential vending, and shadow Iceberg metadata so every
-  direct-Parquet reader gets masked bytes. (In progress on this branch.)
 - **Phase 5** — LLM-agent surface (`agent` role, `lakesh mcp --as agent`).
 - A per-principal aggregated transparent schema (one `SET search_path` entry
   covering *all* of a principal's masked tables) — today transparent mode is
   per-table.
+- Listener-side export debounce for hot-write file-layer tables (today:
+  one re-export per commit per live sig).

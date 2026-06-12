@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -55,7 +56,17 @@ log = logging.getLogger("duckicelake.masked_export")
 
 #: Keep this many snap dirs per sig (current + previous): an in-flight
 #: client glob of the just-replaced dir must not 404 mid-query.
-RETAIN_SNAP_DIRS = 2
+RETAIN_SNAP_DIRS = int(os.environ.get(
+    "DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS", "2"))
+
+#: Sigs not requested within this window stop being eagerly refreshed by
+#: the notify listener (lazily re-created on the next request).
+EXPORT_TTL_DAYS = int(os.environ.get(
+    "DUCKICELAKE_MASKED_EXPORT_TTL_DAYS", "7"))
+
+#: Target parquet part size for exports (DuckDB COPY FILE_SIZE_BYTES).
+EXPORT_FILE_SIZE = os.environ.get(
+    "DUCKICELAKE_MASKED_EXPORT_FILE_SIZE", "256MB")
 
 
 @dataclass
@@ -207,7 +218,7 @@ class MaskedExportManager:
                     con.execute(
                         f"COPY ({select}) TO "
                         f"'s3://{s3.bucket}/{prefix.rstrip('/')}' "
-                        f"(FORMAT PARQUET, FILE_SIZE_BYTES '256MB', "
+                        f"(FORMAT PARQUET, FILE_SIZE_BYTES '{EXPORT_FILE_SIZE}', "
                         f"FILENAME_PATTERN 'part-{{i}}', "
                         f"FIELD_IDS {{{field_ids}}})"
                     )
@@ -258,11 +269,13 @@ class MaskedExportManager:
     # ---- eager refresh -----------------------------------------------------
 
     def refresh_known_sigs(self, ns: list[str], table: str,
-                           *, ttl: timedelta = timedelta(days=7)) -> None:
+                           *, ttl: timedelta | None = None) -> None:
         """Re-export every recently-requested sig of the table at its new
         current snapshot (notify-listener hook). A recomputed signature
         mismatch (schema or policy drift) drops the export instead — the
         next request lazily creates the new shape."""
+        if ttl is None:
+            ttl = timedelta(days=EXPORT_TTL_DAYS)
         try:
             with self.catalog.pg_cursor(autocommit=False) as cur:
                 _ensure_export_sidecar(cur)

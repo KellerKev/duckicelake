@@ -22,6 +22,17 @@ transparent_masking = true
 # Refuse to start without configured OAuth clients (production safety belt).
 #require_auth = true
 
+# PG row-level security for vended DuckLake-direct readers (default: true).
+# Per-principal LOGIN roles in the duckicelake_reader group; see GOVERNANCE.md
+# for the production pg_hba recipe (dev trust-auth can't enforce login).
+#rls = true
+#reader_group_role = "duckicelake_reader"
+
+# File-layer masking (governance Phase 4) tuning.
+#masked_retain_snap_dirs = 2       # snap dirs kept per mask-signature
+#masked_export_ttl_days = 7        # idle sigs stop being eagerly refreshed
+#masked_export_file_size = "256MB" # parquet part size for exports
+
 [pg]
 host = "/path/to/repo/.pgsock"   # or a hostname
 port = 55432
