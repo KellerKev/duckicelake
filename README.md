@@ -12,7 +12,7 @@ extension, Trino, Spark) read rows directly from S3 — and write back via
 register-in-place commits that DuckLake atomically records.
 
 > **This branch** (`experimental_governance`) additionally ships a
-> Snowflake-style **governance layer** — tags, RBAC, column masking and
+> tag-based **governance layer** — object tags, RBAC, column masking and
 > row-access policies, enforced on *both* read paths (Iceberg REST and
 > DuckLake-direct) and aimed squarely at the "LLM agents must never see
 > PII" use case. See the Governance section below and
@@ -60,9 +60,9 @@ No "sync job", no manual rewrite step, no second-class write path.
 
 ## 🛡️ Governance: tags, RBAC, masking (experimental)
 
-Snowflake-shaped governance enforced by the catalog, so the same policy
-masks a column for every engine that respects it — authored once, applied
-per principal. The design + phasing live in
+Tag-based governance enforced by the catalog, so the same policy masks a
+column for every engine that respects it — authored once, applied per
+principal. The design + phasing live in
 [duckicelake_governance.md](duckicelake_governance.md); what is actually
 implemented is tracked in [GOVERNANCE.md](GOVERNANCE.md).
 
@@ -172,6 +172,69 @@ without the `unmasked-roles` bypass (or no roles at all), point it at the
 proxy — REST or `ducklake-credentials` — and it reads `al***` where a
 human analyst holding `pii_reader` reads `alice@example.com`, through the
 same API, with every access audited.
+
+### What's verified
+
+Beyond the 80-test `pytest` suite, the governance layer has been exercised
+end-to-end against a live local stack (proxy + MinIO + Postgres). All of
+the following are confirmed working:
+
+- **Byte-level masking on every read engine.** With a file-layer policy
+  active, a masked principal's vended credentials get **403** on the base
+  Parquet keys and **200** on the masked copies; the masked values come
+  back through the raw S3 path, the **DuckDB `iceberg` extension**
+  (`iceberg_scan` over the shadow metadata), and **PyIceberg** — none of
+  them DuckDB-specific, all reading `al***` instead of the real address.
+- **DuckLake-direct masking.** `lakesh` and a plain DuckDB session reading
+  through the vended reader-role DSN see masked rows via the materialized
+  view (transparent for unqualified queries).
+- **The adversarial cases hold.** A write token cannot disable governance
+  (`set/remove-properties` on `duckicelake.*` → 403); `__mask_*` table/view
+  names are rejected (400); a namespace-level credential vend denies the
+  base bytes of a file-layer table **even if it was never exported**.
+- **RLS enforces visibility and stays cheap.** An ungranted principal can't
+  see an allowlisted table at all; a granted one and the owner can; the
+  policy check plans as a once-per-scan hashed sub-plan, not a per-row
+  function call.
+- **Concurrency & lifecycle.** 10 simultaneous credential vends for one
+  principal yield 10 independent roles that all authenticate (no
+  password-rotation race); a post-vend write shows up masked in an already
+  open session within ~1s (eager refresh); schema changes rotate the mask
+  signature and `DROP TABLE … purgeRequested=true` removes the masked
+  copies.
+- **Performance.** Export materialization and masked scans are on par with
+  base scans on a 1M-row table; re-vending reuses the existing export.
+
+## Current state (this branch)
+
+`experimental_governance` is **feature-complete through Phase 4** and not
+yet merged to `main`. Implemented and tested:
+
+| Phase | What | Status |
+|---|---|---|
+| 1 | Tags, masking/row-access policies, roles, grants, audit — authoring over REST | ✅ |
+| 2 | Iceberg-REST LoadTable enforcement (per-principal metadata signals) | ✅ |
+| 3 | Ad-hoc DuckLake masking views + `ducklake-credentials` vending, both read paths | ✅ |
+| 3a | Per-principal PG reader roles + row-level security on the `ducklake_*` catalog | ✅ |
+| 4 | File-layer masking: pre-masked Parquet + shadow Iceberg metadata (byte-level, every engine) | ✅ |
+
+The branch has been through two adversarial code-review passes; the
+security/correctness findings (reserved-property protection, reserved-name
+guards, namespace-vend deny derivation, injection-safe export SQL,
+fail-open everywhere) and the performance follow-ups (set-based RLS
+predicate, per-vend roles, once-per-process sidecar DDL, batched S3
+deletes) are all fixed and regression-tested.
+
+**Known boundaries / not yet done:**
+
+- **Auth in dev is `trust`.** RLS *authentication* is only real under
+  production Postgres `scram-sha-256` + TLS (the predicate logic is fully
+  exercised in dev; see [GOVERNANCE.md](GOVERNANCE.md) for the `pg_hba`
+  recipe). Data inlining must be off for the vended reader path.
+- **Phase 5 (LLM-agent surface)** — a dedicated `agent` role convention and
+  MCP integration — is designed but not built.
+- Smaller follow-ups remain open: a per-principal aggregated transparent
+  schema, and listener-side export debounce for hot-write tables.
 
 ## Demos
 
