@@ -54,10 +54,15 @@ _EXPORT_MANAGERS: dict[int, object] = {}
 def _export_manager(catalog: "DuckLakeCatalog"):
     mgr = _EXPORT_MANAGERS.get(id(catalog))
     if mgr is None:
+        from .governance import GovernanceStore
         from .masked_export import MaskedExportManager
         from .masking_views import MaskingViewManager
+        # store= so listener-driven eager refreshes are audited the same as
+        # request-path exports (operation=masked_export); view_manager= so a
+        # refreshed export repoints the masking views onto the new snap dir.
         mgr = MaskedExportManager(
             catalog, catalog.settings,
+            store=GovernanceStore(catalog),
             view_manager=MaskingViewManager(catalog, catalog.settings),
         )
         _EXPORT_MANAGERS[id(catalog)] = mgr

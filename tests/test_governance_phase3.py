@@ -554,11 +554,14 @@ def test_rls_ensure_idempotent(settings, direct_catalog):
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s",
                     (settings.reader_group_role,))
         assert cur.fetchone()
-        # inlined-data payload tables carry no reader grant
+        # inlined-data payload tables and the name-leaking snapshot_changes
+        # table carry no reader grant
         cur.execute("""
             SELECT count(*) FROM information_schema.role_table_grants
-            WHERE grantee = %s AND table_name LIKE 'ducklake\\_inlined\\_data\\_%%'
-              AND table_name <> 'ducklake_inlined_data_tables'
+            WHERE grantee = %s
+              AND ((table_name LIKE 'ducklake\\_inlined\\_data\\_%%'
+                    AND table_name <> 'ducklake_inlined_data_tables')
+                   OR table_name = 'ducklake_snapshot_changes')
         """, (settings.reader_group_role,))
         assert cur.fetchone()[0] == 0
 

@@ -240,13 +240,14 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
             cur.execute(sql.SQL("GRANT SELECT ON public.{} TO {}").format(
                 sql.Identifier(name), sql.Identifier(group)))
 
-        # Heal any historical over-grant on inlined-data payload tables
-        # (see _unpolicied_tables for why they must never be readable).
+        # Heal any historical over-grant on inlined-data payload tables and
+        # the name-leaking snapshot_changes table (see _unpolicied_tables).
         cur.execute("""
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-              AND table_name LIKE 'ducklake\\_inlined\\_data\\_%'
-              AND table_name <> 'ducklake_inlined_data_tables'
+              AND ((table_name LIKE 'ducklake\\_inlined\\_data\\_%'
+                    AND table_name <> 'ducklake_inlined_data_tables')
+                   OR table_name = 'ducklake_snapshot_changes')
         """)
         for (name,) in cur.fetchall():
             cur.execute(sql.SQL("REVOKE SELECT ON public.{} FROM {}").format(
@@ -290,6 +291,12 @@ def _unpolicied_tables(cur) -> list[str]:
           -- to be off on the write path (the registry ducklake_inlined_data_tables
           -- itself has table_id and is policied normally).
           AND t.table_name NOT LIKE 'ducklake\\_inlined\\_data\\_%'
+          -- ducklake_snapshot_changes embeds qualified table NAMES in its
+          -- changes_made column — granting it would leak the existence of
+          -- allowlist-hidden tables. Readers lose `lake.snapshots()`
+          -- introspection (verified: normal reads are unaffected), which is
+          -- consistent with masked principals having no time travel anyway.
+          AND t.table_name <> 'ducklake_snapshot_changes'
           AND NOT EXISTS (
             SELECT 1 FROM information_schema.columns c
             WHERE c.table_schema = t.table_schema

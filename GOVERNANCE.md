@@ -217,9 +217,14 @@ bypasses it.
 - Re-vending rotates the password; an earlier response's password stops
   working for new connections. `VALID UNTIL` is checked at connect time only
   (same semantics as STS expiry).
-- `ducklake_snapshot_changes` / `ducklake_view` are not row-filtered in v1:
-  hidden tables' *names* (and masking-view SQL bodies) remain readable to
-  readers. Tracked as follow-up hardening.
+- `ducklake_snapshot_changes` is **not granted** to readers — its
+  `changes_made` column embeds qualified table names, which would leak the
+  existence of allowlist-hidden tables. Consequence: vended readers can't
+  call `lake.snapshots()` (time-travel introspection); normal reads are
+  unaffected.
+- `ducklake_view` is not row-filtered in v1: masking-view SQL bodies (and
+  views referencing hidden tables) remain enumerable by readers. Tracked
+  as follow-up hardening.
 
 ## What Phase 4 ships — file-layer masking (byte-level, every engine)
 

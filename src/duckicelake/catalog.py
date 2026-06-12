@@ -628,46 +628,6 @@ class DuckLakeCatalog:
                 c.execute(f"USE {self._cat()}")
         return out
 
-    def purge_table_objects(self, ns: list[str], name: str) -> int:
-        """Delete every S3 object under the table's prefix.
-
-        Handles Parquet data files, position/equality-delete Parquets, the
-        `metadata/*` Avros + `vN.metadata.json` + `version-hint.text`, and
-        any leftover orphans. Used by DROP TABLE when the caller sets
-        `purgeRequested=true`. Must be invoked *before* the actual
-        DuckLake DROP TABLE so any stored-path resolution still works —
-        but we use prefix-based S3 listing, so either order is safe.
-
-        Returns the number of S3 keys deleted.
-        """
-        s3 = self.settings.s3
-        client = self.s3_client
-        prefix = s3.table_prefix(ns[0], name)
-        deleted = 0
-        # list_objects_v2 + delete_objects (max 1000 keys per call).
-        pages = client.get_paginator("list_objects_v2").paginate(
-            Bucket=s3.bucket, Prefix=prefix,
-        )
-        batch: list[dict] = []
-        def _flush() -> int:
-            nonlocal batch
-            if not batch:
-                return 0
-            client.delete_objects(
-                Bucket=s3.bucket,
-                Delete={"Objects": batch, "Quiet": True},
-            )
-            n = len(batch)
-            batch = []
-            return n
-        for page in pages:
-            for obj in page.get("Contents") or []:
-                batch.append({"Key": obj["Key"]})
-                if len(batch) >= 1000:
-                    deleted += _flush()
-        deleted += _flush()
-        return deleted
-
     def _live_data_file_id_by_abs_path(
         self, cur, table_id: int, ns: list[str], name: str
     ) -> dict[str, int]:

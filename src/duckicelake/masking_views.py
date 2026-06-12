@@ -26,7 +26,7 @@ import logging
 
 from .catalog import DuckLakeCatalog
 from .config import Settings
-from .policies import TablePolicyPlan, mask_signature
+from .policies import TablePolicyPlan, _ql, mask_signature
 
 log = logging.getLogger("duckicelake.masking_views")
 
@@ -69,8 +69,8 @@ class MaskingViewManager:
         bytes are not even credentialed for masked principals). Without
         one, the Phase-3 expression SELECT computes the mask client-side."""
         if export is not None:
-            return (f"SELECT * FROM read_parquet("
-                    f"'s3://{self.settings.s3.bucket}/{export.prefix}*.parquet')")
+            glob = _ql(f"s3://{self.settings.s3.bucket}/{export.prefix}*.parquet")
+            return f"SELECT * FROM read_parquet({glob})"
         return plan.view_sql
 
     def ensure_view_for_plan(self, ns: list[str], table: str,

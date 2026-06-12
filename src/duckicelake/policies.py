@@ -61,6 +61,10 @@ class TablePolicyPlan:
     # Phase 4: any applied (non-bypassed) mask policy demands the mask be
     # materialized physically as masked Parquet copies.
     file_layer: bool = False
+    # Union of unmasked_roles across the applied file-layer policies — the
+    # roles RLS should let read base file rows (the interlock bypass).
+    # Captured here during build_plan so callers needn't re-fetch the model.
+    file_layer_bypass: list[str] = field(default_factory=list)
 
     @property
     def masked_columns(self) -> list[str]:
@@ -79,6 +83,31 @@ def _bypasses(roles: list[str], unmasked_roles: list[str] | None) -> bool:
     if not unmasked_roles:
         return False
     return bool(set(roles) & set(unmasked_roles))
+
+
+def _qi(name: str) -> str:
+    """Quote a SQL identifier, escaping any embedded double-quote so a
+    column/table name like `a"b` can't break out of the quoting."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _ql(value: str) -> str:
+    """Quote a SQL string literal, escaping embedded single-quotes."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _masked_projection(columns: list[str], masks: dict[str, str]) -> str:
+    """The shared SELECT projection for both the masking view and the
+    file-layer export: masked columns become their (trusted, admin-authored)
+    mask expression aliased back to the column; others pass through. Column
+    identifiers are escaped; mask expressions are SQL by design."""
+    projected = []
+    for c in columns:
+        if c in masks:
+            projected.append(f'{masks[c]} AS {_qi(c)}')
+        else:
+            projected.append(_qi(c))
+    return ", ".join(projected)
 
 
 def _qualify_expr(body_sql: str, column: str) -> str:
@@ -131,6 +160,9 @@ def build_plan(
             ))
             if body.get("file_layer_masking"):
                 plan.file_layer = True
+                for r in body.get("unmasked_roles") or []:
+                    if r not in plan.file_layer_bypass:
+                        plan.file_layer_bypass.append(r)
             break   # one mask per column is enough; first applicable wins
 
     predicates: list[str] = []
@@ -169,16 +201,10 @@ def build_masked_view_sql(
     WHERE after the mask aliases resolves alias-vs-base-column differently
     per engine. The base table stays unqualified — a DuckLake-direct client
     resolves it against its own attached catalog."""
-    projected = []
-    for c in columns:
-        if c in masks:
-            projected.append(f'{masks[c]} AS "{c}"')
-        else:
-            projected.append(f'"{c}"')
-    source = f'"{schema}"."{table}"'
+    source = f'{_qi(schema)}.{_qi(table)}'
     if row_filter:
-        source = f'(SELECT * FROM {source} WHERE {row_filter}) AS "{table}"'
-    return f'SELECT {", ".join(projected)} FROM {source}'
+        source = f'(SELECT * FROM {source} WHERE {row_filter}) AS {_qi(table)}'
+    return f'SELECT {_masked_projection(columns, masks)} FROM {source}'
 
 
 def mask_signature(plan: TablePolicyPlan, columns: list[str] | None = None) -> str:
@@ -240,19 +266,14 @@ def build_masked_export_select(
     semantics as the masking view, but fully qualified against the proxy's
     attached catalog and optionally pinned to a DuckLake snapshot so the
     export is exactly attributable."""
-    projected = []
     masks = {m.column: m.mask_expr for m in plan.masks}
-    for c in plan.columns:
-        if c in masks:
-            projected.append(f'{masks[c]} AS "{c}"')
-        else:
-            projected.append(f'"{c}"')
-    source = f'"{catalog_name}"."{plan.schema}"."{plan.table}"'
+    source = f'{_qi(catalog_name)}.{_qi(plan.schema)}.{_qi(plan.table)}'
     if snapshot_id is not None:
         source += f" AT (VERSION => {int(snapshot_id)})"
     if plan.row_filter:
-        source = f'(SELECT * FROM {source} WHERE {plan.row_filter}) AS "{plan.table}"'
-    return f'SELECT {", ".join(projected)} FROM {source}'
+        source = (f'(SELECT * FROM {source} WHERE {plan.row_filter}) '
+                  f'AS {_qi(plan.table)}')
+    return f'SELECT {_masked_projection(plan.columns, masks)} FROM {source}'
 
 
 def apply_plan_to_metadata(metadata: dict, plan: TablePolicyPlan) -> dict:
@@ -304,16 +325,10 @@ class PolicyEngine:
             row_bodies=inp["row_bodies"],
         )
 
-    def file_layer_bypass_roles(self, schema: str, table: str,
-                                plan: TablePolicyPlan) -> list[str]:
-        """Union of unmasked_roles across the plan's applied file-layer
-        policies — written into the `duckicelake.file-layer-bypass-roles`
-        table property so the Phase-3a RLS predicate can honor bypasses
-        without re-deriving policy logic in SQL."""
-        inp = self.store.resolution_inputs(schema, table)
-        roles: set[str] = set()
-        for m in plan.masks:
-            body = inp["masking_bodies"].get(m.policy_name) or {}
-            if body.get("file_layer_masking"):
-                roles |= set(body.get("unmasked_roles") or [])
-        return sorted(roles)
+    @staticmethod
+    def file_layer_bypass_roles(plan: TablePolicyPlan) -> list[str]:
+        """The roles RLS should let read base file rows (the interlock
+        bypass), written into `duckicelake.file-layer-bypass-roles`.
+        build_plan already captured this union on the plan, so this is a
+        pure read — no second model fetch on the hot path."""
+        return sorted(set(plan.file_layer_bypass))

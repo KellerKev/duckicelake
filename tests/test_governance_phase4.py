@@ -330,8 +330,9 @@ def test_namespace_vend_denies_file_layer_base(client, settings):
     _author_file_layer_policy(client, ns, "events")
     _seed(settings, ns)
     _seed(settings, ns, "open_t")
-    # a table-scoped vend first, so the export (and sidecar row) exists
-    _vend(client, ns, "bob")
+    # NB: no table-scoped vend first — the deny must hold even when the
+    # file-layer table was never exported (deny is derived from the policy,
+    # not from an existing export row). Regression for the namespace-vend gap.
 
     nsbob = _vend(client, ns, "bob", table=None)
     s3c = _s3_client_from(nsbob["s3"])
@@ -526,3 +527,43 @@ def test_rest_shadow_only_for_masked_principals(client, settings, direct_catalog
         with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
             cur.execute("DELETE FROM public.duckicelake_role_grant "
                         "WHERE role_name='pii_reader' AND principal_sub='anonymous'")
+
+
+# ---- code-review regression fixes -------------------------------------------
+
+def test_reserved_property_keys_rejected_on_commit(client, settings):
+    """A write token must not flip governance state via a normal commit:
+    set/remove-properties on a duckicelake.* key is 403 (the file-layer RLS
+    interlock lives in such a property)."""
+    ns = _ns("rprop")
+    _make_table(client, ns, "events")
+    for updates in (
+        {"action": "set-properties",
+         "updates": {"duckicelake.file-layer-masking": "false"}},
+        {"action": "remove-properties",
+         "removals": ["duckicelake.file-layer-bypass-roles"]},
+    ):
+        r = client.post(f"/v1/lake/namespaces/{ns}/tables/events",
+                        json={"requirements": [], "updates": [updates]})
+        assert r.status_code == 403, r.text
+    # an ordinary user property still works
+    r = client.post(f"/v1/lake/namespaces/{ns}/tables/events",
+                    json={"requirements": [],
+                          "updates": [{"action": "set-properties",
+                                       "updates": {"owner": "team-x"}}]})
+    assert r.status_code == 200, r.text
+
+
+def test_reserved_table_names_rejected(client):
+    ns = _ns("rname")
+    _make_table(client, ns, "events")   # creates ns + a real table
+    # create a __mask_*-named table → 400
+    r = client.post(f"/v1/lake/namespaces/{ns}/tables",
+                    json={"name": "__mask_events__deadbeef", "schema": SCHEMA_JSON})
+    assert r.status_code == 400, r.text
+    # rename a real table INTO a reserved name → 400
+    r = client.post("/v1/lake/tables/rename",
+                    json={"source": {"namespace": [ns], "name": "events"},
+                          "destination": {"namespace": [ns],
+                                          "name": "__mask_x__beef"}})
+    assert r.status_code == 400, r.text

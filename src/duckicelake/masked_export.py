@@ -46,6 +46,8 @@ from .config import Settings
 from .policies import (
     MaskDecision,
     TablePolicyPlan,
+    _ql,
+    _qi,
     build_masked_export_select,
     build_masked_view_sql,
     mask_signature,
@@ -54,19 +56,15 @@ from .policies import (
 
 log = logging.getLogger("duckicelake.masked_export")
 
-#: Keep this many snap dirs per sig (current + previous): an in-flight
-#: client glob of the just-replaced dir must not 404 mid-query.
-RETAIN_SNAP_DIRS = int(os.environ.get(
-    "DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS", "2"))
-
-#: Sigs not requested within this window stop being eagerly refreshed by
-#: the notify listener (lazily re-created on the next request).
-EXPORT_TTL_DAYS = int(os.environ.get(
-    "DUCKICELAKE_MASKED_EXPORT_TTL_DAYS", "7"))
-
-#: Target parquet part size for exports (DuckDB COPY FILE_SIZE_BYTES).
-EXPORT_FILE_SIZE = os.environ.get(
-    "DUCKICELAKE_MASKED_EXPORT_FILE_SIZE", "256MB")
+# Tuning knobs are read per-manager in __init__ (not at import) so file
+# config (.env / duckicelake.toml, applied during load_settings) is honored
+# — a module-level read would snapshot os.environ before apply_file_config
+# runs and silently ignore the TOML values.
+#   DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS — snap dirs kept per sig (current +
+#     previous): an in-flight glob of the just-replaced dir must not 404.
+#   DUCKICELAKE_MASKED_EXPORT_TTL_DAYS — sigs idle this long stop being
+#     eagerly refreshed by the listener (lazily re-created on next request).
+#   DUCKICELAKE_MASKED_EXPORT_FILE_SIZE — DuckDB COPY FILE_SIZE_BYTES.
 
 
 @dataclass
@@ -111,6 +109,12 @@ class MaskedExportManager:
         self.store = store                  # GovernanceStore, for audit (optional)
         self.view_manager = view_manager    # MaskingViewManager: repoint views
         #                                     to the fresh snap dir after export
+        self.retain_snap_dirs = int(os.environ.get(
+            "DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS", "2"))
+        self.export_ttl_days = int(os.environ.get(
+            "DUCKICELAKE_MASKED_EXPORT_TTL_DAYS", "7"))
+        self.export_file_size = os.environ.get(
+            "DUCKICELAKE_MASKED_EXPORT_FILE_SIZE", "256MB")
 
     # ---- discovery -------------------------------------------------------
 
@@ -210,15 +214,16 @@ class MaskedExportManager:
                 # — without explicit ids the shadow metadata's schema can't
                 # bind and every column reads NULL. Ids are 1-based in
                 # projection order, matching the shadow schema built from a
-                # DESCRIBE of these very files.
+                # DESCRIBE of these very files. Column names are escaped
+                # (_qi) so a name with a quote can't break out of FIELD_IDS.
                 field_ids = ", ".join(
-                    f'"{c}": {i}' for i, c in enumerate(plan.columns, start=1)
+                    f'{_qi(c)}: {i}' for i, c in enumerate(plan.columns, start=1)
                 )
+                copy_target = _ql(f"s3://{s3.bucket}/{prefix.rstrip('/')}")
                 with self.catalog.export_cursor() as con:
                     con.execute(
-                        f"COPY ({select}) TO "
-                        f"'s3://{s3.bucket}/{prefix.rstrip('/')}' "
-                        f"(FORMAT PARQUET, FILE_SIZE_BYTES '{EXPORT_FILE_SIZE}', "
+                        f"COPY ({select}) TO {copy_target} "
+                        f"(FORMAT PARQUET, FILE_SIZE_BYTES '{self.export_file_size}', "
                         f"FILENAME_PATTERN 'part-{{i}}', "
                         f"FIELD_IDS {{{field_ids}}})"
                     )
@@ -275,7 +280,7 @@ class MaskedExportManager:
         mismatch (schema or policy drift) drops the export instead — the
         next request lazily creates the new shape."""
         if ttl is None:
-            ttl = timedelta(days=EXPORT_TTL_DAYS)
+            ttl = timedelta(days=self.export_ttl_days)
         try:
             with self.catalog.pg_cursor(autocommit=False) as cur:
                 _ensure_export_sidecar(cur)
@@ -402,7 +407,7 @@ class MaskedExportManager:
                 rest = key[len(sig_prefix):]
                 if "/" in rest:
                     dirs.setdefault(rest.split("/", 1)[0], []).append(key)
-            # keep newest RETAIN_SNAP_DIRS by snapshot number (dir name is
+            # keep newest retain_snap_dirs by snapshot number (dir name is
             # snap-{N}-{tok}); the live dir always survives
             def snap_no(d: str) -> int:
                 try:
@@ -411,13 +416,10 @@ class MaskedExportManager:
                     return -1
             live_dir = keep_prefix[len(sig_prefix):].strip("/")
             ordered = sorted(dirs, key=snap_no, reverse=True)
-            keep = set(ordered[:RETAIN_SNAP_DIRS]) | {live_dir}
-            client = self.catalog.s3_client
-            for d, keys in dirs.items():
-                if d in keep:
-                    continue
-                for k in keys:
-                    client.delete_object(Bucket=self.settings.s3.bucket, Key=k)
+            keep = set(ordered[:self.retain_snap_dirs]) | {live_dir}
+            stale_keys = [k for d, keys in dirs.items() if d not in keep
+                          for k in keys]
+            self._delete_keys(stale_keys)
         except Exception:
             log.exception("retention sweep failed for %s.%s sig %s",
                           schema, table, sig)
@@ -451,14 +453,14 @@ class MaskedExportManager:
             except Exception:
                 pass    # not built yet
 
-            glob = f"s3://{s3.bucket}/{export.prefix}*.parquet"
+            glob = _ql(f"s3://{s3.bucket}/{export.prefix}*.parquet")
             with self.catalog.export_cursor() as con:
                 described = con.execute(
-                    f"DESCRIBE SELECT * FROM read_parquet('{glob}')"
+                    f"DESCRIBE SELECT * FROM read_parquet({glob})"
                 ).fetchall()
                 per_file = con.execute(
                     f"SELECT file_name, num_rows, file_size_bytes "
-                    f"FROM parquet_file_metadata('{glob}')"
+                    f"FROM parquet_file_metadata({glob})"
                 ).fetchall()
 
             from .catalog import ColumnInfo
@@ -557,10 +559,23 @@ class MaskedExportManager:
         return [(k, sz) for k, sz in self._list_keys(snap_prefix)
                 if k.endswith(".parquet")]
 
-    def _delete_prefix(self, prefix: str) -> None:
+    def _delete_keys(self, keys: list[str]) -> None:
+        """Batch-delete via S3 DeleteObjects (≤1000 keys/call) — a masked
+        export of a large table holds thousands of parts; per-key deletes
+        would block the GC/listener path for minutes."""
+        if not keys:
+            return
         client = self.catalog.s3_client
-        for key, _ in self._list_keys(prefix):
-            client.delete_object(Bucket=self.settings.s3.bucket, Key=key)
+        bucket = self.settings.s3.bucket
+        for i in range(0, len(keys), 1000):
+            client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]],
+                        "Quiet": True},
+            )
+
+    def _delete_prefix(self, prefix: str) -> None:
+        self._delete_keys([k for k, _ in self._list_keys(prefix)])
 
     # ---- audit ---------------------------------------------------------------
 

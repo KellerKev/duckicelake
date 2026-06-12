@@ -114,12 +114,44 @@ masked_export_manager = MaskedExportManager(catalog, settings,
                                             view_manager=masking_view_manager)
 
 
+#: Table-property namespace reserved for proxy-stamped governance state
+#: (masking signals, the file-layer RLS interlock, format-version). Client
+#: commits must not write here — a write token could otherwise flip off
+#: `duckicelake.file-layer-masking` and disable RLS file-hiding, or forge
+#: masking signals. Set these out-of-band (governance authoring / ops).
+_RESERVED_PROPERTY_PREFIX = "duckicelake."
+
+
+def _reject_reserved_table_name(name: str) -> None:
+    """Tables/views named like a masking view (`__mask_*`) collide with
+    governance plumbing: they'd be hidden from REST listings and swept by
+    gc_orphans as 'stale masking views'. Reject at every creation/rename
+    entry point."""
+    if name.startswith(MASK_VIEW_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Names starting with '{MASK_VIEW_PREFIX}' are reserved "
+                   "for governance masking views",
+        )
+
+
+def _reject_reserved_property_keys(keys) -> None:
+    bad = sorted(k for k in keys if k.startswith(_RESERVED_PROPERTY_PREFIX))
+    if bad:
+        raise HTTPException(
+            status_code=403,
+            detail=(f"property keys under '{_RESERVED_PROPERTY_PREFIX}' are "
+                    f"reserved for governance and cannot be set via commit: "
+                    f"{', '.join(bad)}"),
+        )
+
+
 def _ensure_file_layer_properties(ns: list[str], table: str, plan) -> None:
     """Write the Phase-3a interlock properties so RLS hides base file rows
     from non-bypass principals. Best-effort — the masked-prefix credential
     scope is the primary enforcement; RLS is defense-in-depth."""
     try:
-        bypass = policy_engine.file_layer_bypass_roles(ns[0], table, plan)
+        bypass = policy_engine.file_layer_bypass_roles(plan)
         catalog.upsert_table_properties(ns, table, set_map={
             "duckicelake.file-layer-masking": "true",
             "duckicelake.file-layer-bypass-roles": ",".join(bypass),
@@ -130,25 +162,20 @@ def _ensure_file_layer_properties(ns: list[str], table: str, plan) -> None:
                       ns[0], table)
 
 
-def _file_layer_deny_prefixes(ns: list[str], sub: str) -> list[str] | None:
+def _file_layer_deny_prefixes(ns: list[str], roles: list[str]) -> list[str] | None:
     """For namespace-level vending: base prefixes of file-layer tables the
-    principal is masked on (Deny beats the namespace Allow). Best-effort —
-    None on any error (RLS still hides the file rows)."""
+    principal is masked on (Deny beats the namespace Allow). Enumerates
+    *every* table in the namespace — not just already-exported ones — so a
+    file-layer table that no principal has materialized yet is still
+    carved out (its base bytes must never be vended raw). `roles` is the
+    caller's already-resolved JWT∪sidecar union. Best-effort — None on any
+    error (RLS still hides the file rows for the reader-role path)."""
     try:
-        with catalog.pg_cursor(autocommit=False) as cur:
-            cur.execute(
-                "SELECT DISTINCT table_name FROM public.duckicelake_masked_export "
-                "WHERE schema_name = %s AND current_prefix IS NOT NULL",
-                (ns[0],),
-            )
-            candidates = [r[0] for r in cur.fetchall()]
-        if not candidates:
-            return None
-        roles = sorted(set(governance_store.roles_for_principal(sub)))
+        tables = [t for (_s, t) in catalog.list_tables(ns)]
         deny: list[str] = []
-        for t in candidates:
-            plan = policy_engine.plan_for(principal=sub, roles=roles,
-                                          schema=ns[0], table=t)
+        for t in tables:
+            plan = policy_engine.plan_for(principal="__deny_probe__",
+                                          roles=roles, schema=ns[0], table=t)
             if plan.file_layer and not plan.is_empty():
                 deny.append(settings.s3.table_prefix(ns[0], t))
         return deny or None
@@ -529,6 +556,7 @@ def create_table(
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
+    _reject_reserved_table_name(req.name)
     if catalog.table_exists(ns, req.name):
         raise HTTPException(
             status_code=409,
@@ -841,9 +869,10 @@ def ducklake_credentials(
     applied: list[str] = []
     row_filtered = False
     export = None
+    roles: list[str] = list(claims.get("roles") or [])
     try:
         roles = sorted(
-            set(claims.get("roles") or [])
+            set(roles)
             | set(governance_store.roles_for_principal(sub))
         )
         if table is not None:
@@ -897,16 +926,18 @@ def ducklake_credentials(
     if table is not None:
         if export is not None:
             # file-layer: ONLY the masked sig prefix — base bytes are
-            # physically unreadable with these credentials
-            read_prefixes = [s3.masked_sig_prefix(
-                ns[0], table, out["mask_signature"])]
+            # physically unreadable with these credentials. Key on the
+            # export's own sig (not out["mask_signature"], which is only
+            # set when the view also materialized) so a view-creation
+            # failure can't scope creds to a `.../None/` prefix.
+            read_prefixes = [s3.masked_sig_prefix(ns[0], table, export.sig)]
         else:
             read_prefixes = [s3.table_prefix(ns[0], table)]
     else:
         read_prefixes = [f"{s3.data_prefix}{ns[0]}/"]
         # the namespace allow covers every table's base prefix — carve out
         # the file-layer-masked tables this principal must not read raw
-        deny_prefixes = _file_layer_deny_prefixes(ns, sub)
+        deny_prefixes = _file_layer_deny_prefixes(ns, roles)
     try:
         creds = vend_credentials(
             s3,
@@ -971,6 +1002,7 @@ def ducklake_credentials(
 @app.post("/v1/{prefix}/tables/rename", status_code=204)
 def rename_table(prefix: str, req: RenameTableRequest):
     _check_prefix(prefix)
+    _reject_reserved_table_name(req.destination.name)
     if not catalog.table_exists(req.source.namespace, req.source.name):
         raise HTTPException(
             status_code=404,
@@ -1059,10 +1091,14 @@ def commit_table(
     for u in req.updates:
         action = u.get("action")
         if action == "set-properties":
-            pending_properties_set.update(u.get("updates") or {})
+            updates = u.get("updates") or {}
+            _reject_reserved_property_keys(updates.keys())
+            pending_properties_set.update(updates)
             continue
         if action == "remove-properties":
-            pending_properties_remove.extend(u.get("removals") or [])
+            removals = u.get("removals") or []
+            _reject_reserved_property_keys(removals)
+            pending_properties_remove.extend(removals)
             continue
         if action == "assign-uuid":
             # We derive table UUIDs deterministically from the qualified
@@ -1632,9 +1668,14 @@ def _build_load_response(
             )
             if not plan.is_empty():
                 metadata = apply_plan_to_metadata(metadata, plan)
-                # Phase 4: file-layer plans get masked Parquet exports and,
-                # below, SHADOW metadata pointing at them — every Iceberg
-                # reader (incl. DuckDB iceberg ext) reads masked bytes.
+                # Phase 4: file-layer plans get masked Parquet exports + SHADOW
+                # metadata pointing at them — every Iceberg reader (incl. the
+                # DuckDB iceberg ext) reads masked bytes. Decide the export
+                # FIRST (export survives only if BOTH the export and its
+                # shadow metadata materialize), then materialize the view once
+                # with that final decision — otherwise a shadow failure would
+                # leave the view repointed at a masked prefix the base-scoped
+                # creds can't read, advertised on base metadata.
                 if plan.file_layer:
                     file_layer_export = (
                         masked_export_manager.ensure_export_for_plan(
@@ -1642,27 +1683,26 @@ def _build_load_response(
                         or masked_export_manager.current_export(
                             ns, table, mask_signature(plan))
                     )
-                # Phase 3: materialize the plan's masking view so cooperative
-                # clients (DuckLake-direct, view-capable REST engines) can
-                # execute the mask; advertise it via a table property.
+                    if file_layer_export is not None:
+                        shadow = masked_export_manager.shadow_metadata(
+                            ns, table, file_layer_export)
+                        if shadow is not None:
+                            _ensure_file_layer_properties(ns, table, plan)
+                            metadata_location, metadata = shadow
+                            metadata = apply_plan_to_metadata(metadata, plan)
+                        else:
+                            # no shadow → degrade to catalog-level masking on
+                            # BASE metadata; don't repoint the view to a
+                            # masked prefix the base creds won't cover
+                            file_layer_export = None
+                # Phase 3: materialize the plan's masking view (read_parquet
+                # body iff file_layer_export survived; else expression SELECT)
+                # so cooperative clients can execute the mask; advertise it.
                 view_name = masking_view_manager.ensure_view_for_plan(
                     ns, table, plan, export=file_layer_export
                 )
                 if view_name:
                     metadata["properties"]["duckicelake.masking-view-name"] = view_name
-                if file_layer_export is not None:
-                    _ensure_file_layer_properties(ns, table, plan)
-                    shadow = masked_export_manager.shadow_metadata(
-                        ns, table, file_layer_export)
-                    if shadow is not None:
-                        metadata_location, metadata = shadow
-                        metadata = apply_plan_to_metadata(metadata, plan)
-                        if view_name:
-                            metadata["properties"]["duckicelake.masking-view-name"] = view_name
-                    else:
-                        # no shadow → REST clients keep catalog-level
-                        # signals over BASE metadata; don't pretend
-                        file_layer_export = None
                 governance_store.audit_load(
                     principal=principal_for_creds, object_=f"{ns[0]}.{table}",
                     masked_cols=plan.masked_columns,

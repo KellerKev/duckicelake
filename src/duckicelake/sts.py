@@ -12,6 +12,7 @@ retries, both skipped here for clarity.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 import boto3
@@ -147,6 +148,18 @@ def _sts_client(s3: S3Settings):
     )
 
 
+def _session_name(session_name: str | None, principal: str | None,
+                  namespace: str, table: str) -> str:
+    """STS RoleSessionName must match [\\w+=,.@-]{2,64}. A principal sub /
+    namespace / table can carry spaces, slashes, colons (OAuth client ids,
+    `?principal=` overrides), which AssumeRole rejects with a ValidationError
+    — turning an otherwise-fine vend into a 500. Sanitize out-of-charset
+    characters to '_' and clamp to 64."""
+    raw = session_name or f"ice-{principal or 'anon'}-{namespace}-{table}"
+    cleaned = re.sub(r"[^\w+=,.@-]", "_", raw)[:64]
+    return cleaned if len(cleaned) >= 2 else f"ice-{cleaned}"
+
+
 def _keys_from_uris(uris: list[str], bucket: str) -> list[str]:
     prefix = f"s3://{bucket}/"
     keys = []
@@ -207,8 +220,8 @@ def vend_credentials(
     sts = _sts_client(s3)
     resp = sts.assume_role(
         RoleArn=DEFAULT_ROLE_ARN,
-        RoleSessionName=(session_name
-                         or f"ice-{principal or 'anon'}-{namespace}-{table}"[:64]),
+        RoleSessionName=_session_name(
+            session_name, principal, namespace, table),
         Policy=json.dumps(policy),
         DurationSeconds=duration_seconds,
     )
