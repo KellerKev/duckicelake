@@ -76,6 +76,95 @@ layered, and you choose the tier per masking policy:
 Everything below is **implemented and tested** (an 80-test suite plus live
 end-to-end runs — see *What's verified*).
 
+### A worked example — policies in, masked SQL out
+
+Take `analytics.customers`:
+
+```text
+ id │ email             │ phone        │ country │ mrr
+────┼───────────────────┼──────────────┼─────────┼──────
+  1 │ alice@example.com │ 415-555-0101 │ EU      │ 2400
+  2 │ bob@personal.io   │ 212-555-0148 │ US      │ 1800
+  3 │ carol@work.net    │ 020-555-8018 │ EU      │ 5200
+```
+
+Author four policies over REST — masks use `val` as the column value, a
+row policy is a boolean keep-predicate, and `unmasked-roles` lists who
+bypasses each one:
+
+```bash
+P=localhost:8181/v1/lake/governance; H='content-type:application/json'
+
+# tag the sensitive columns, then attach a mask to each tag
+curl -sX POST $P/tags        -H $H -d '{"namespace":"pii","name":"email"}'
+curl -sX POST $P/tags        -H $H -d '{"namespace":"pii","name":"phone"}'
+curl -sX POST $P/object-tags -H $H -d '{"object-kind":"column","schema":"analytics","object":"customers","column":"email","tag-namespace":"pii","tag-name":"email"}'
+curl -sX POST $P/object-tags -H $H -d '{"object-kind":"column","schema":"analytics","object":"customers","column":"phone","tag-namespace":"pii","tag-name":"phone"}'
+
+curl -sX POST $P/masking-policies -H $H -d '{"name":"mask_email","signature":"(val VARCHAR)","body":"left(val, 2) || '\''***'\''","unmasked-roles":["pii_reader"]}'
+curl -sX POST $P/masking-policies -H $H -d '{"name":"mask_phone","signature":"(val VARCHAR)","body":"'\''***-***-'\'' || right(val, 4)","unmasked-roles":["pii_reader"]}'
+curl -sX POST $P/policy-attachments -H $H -d '{"policy-kind":"masking","policy-name":"mask_email","target-kind":"tag","tag-namespace":"pii","tag-name":"email"}'
+curl -sX POST $P/policy-attachments -H $H -d '{"policy-kind":"masking","policy-name":"mask_phone","target-kind":"tag","tag-namespace":"pii","tag-name":"phone"}'
+
+# row policy: non-EU rows are hidden unless you hold global_reader
+curl -sX POST $P/row-access-policies -H $H -d '{"name":"eu_only","signature":"(country VARCHAR)","body":"country = '\''EU'\''","unmasked-roles":["global_reader"]}'
+curl -sX POST $P/policy-attachments  -H $H -d '{"policy-kind":"row_access","policy-name":"eu_only","target-kind":"table","schema":"analytics","object":"customers","columns":["country"]}'
+
+# roles + who holds them
+curl -sX POST $P/roles       -H $H -d '{"name":"pii_reader"}'
+curl -sX POST $P/roles       -H $H -d '{"name":"global_reader"}'
+curl -sX POST $P/role-grants -H $H -d '{"role":"pii_reader","principal":"analyst_eu"}'
+curl -sX POST $P/role-grants -H $H -d '{"role":"pii_reader","principal":"admin"}'
+curl -sX POST $P/role-grants -H $H -d '{"role":"global_reader","principal":"admin"}'
+```
+
+Now the same `SELECT * FROM analytics.customers` resolves differently per
+caller. The proxy rewrites each read into a masking view — `GET
+…/governance/effective-policies?table=analytics.customers&principal=…`
+returns the exact SQL, shown here with the rows it yields.
+
+**`agent`** (no roles) — both columns masked, non-EU rows dropped:
+
+```sql
+SELECT "id",
+       left("email", 2) || '***'       AS "email",
+       '***-***-' || right("phone", 4) AS "phone",
+       "country", "mrr"
+FROM (SELECT * FROM "analytics"."customers" WHERE (country = 'EU')) AS "customers"
+```
+```text
+ id │ email   │ phone        │ country │ mrr
+────┼─────────┼──────────────┼─────────┼──────
+  1 │ al***   │ ***-***-0101 │ EU      │ 2400
+  3 │ ca***   │ ***-***-8018 │ EU      │ 5200
+```
+
+**`analyst_eu`** (holds `pii_reader`) — masks bypassed, row filter still
+applies (no `global_reader`):
+
+```sql
+SELECT "id", "email", "phone", "country", "mrr"
+FROM (SELECT * FROM "analytics"."customers" WHERE (country = 'EU')) AS "customers"
+```
+```text
+ id │ email             │ phone        │ country │ mrr
+────┼───────────────────┼──────────────┼─────────┼──────
+  1 │ alice@example.com │ 415-555-0101 │ EU      │ 2400
+  3 │ carol@work.net    │ 020-555-8018 │ EU      │ 5200
+```
+
+**`admin`** (holds both) — no policy applies, so no view is generated; the
+read hits the base table unchanged:
+
+```sql
+SELECT * FROM "analytics"."customers"   -- all 3 rows, cleartext
+```
+
+Same table, same query, one set of policies — the result is shaped by who's
+asking. Switch `mask_email` to `"file-layer-masking": true` and the `agent`
+view above is served from **pre-masked Parquet** instead, so even a client
+reading the files directly only ever sees `al***`.
+
 **The model.** Object tags (`pii.email`, hierarchical cascade
 schema → table → column), masking policies + row-access policies (SQL
 bodies with a declarative `unmasked-roles` bypass), policy attachments
