@@ -60,11 +60,17 @@ No "sync job", no manual rewrite step, no second-class write path.
 
 ## 🛡️ Governance: tags, RBAC, masking (experimental)
 
-Tag-based governance enforced by the catalog, so the same policy masks a
-column for every engine that respects it — authored once, applied per
-principal. The design + phasing live in
-[duckicelake_governance.md](duckicelake_governance.md); what is actually
-implemented is tracked in [GOVERNANCE.md](GOVERNANCE.md).
+Tag-based governance enforced by the catalog — authored once, applied per
+principal, across **both read paths and every engine**. Enforcement is
+layered: cooperative engines get catalog signals + executed masking views,
+and with **file-layer masking** the bytes themselves are pre-masked and
+served via shadow Iceberg metadata + scoped credentials, so an engine that
+reads Parquet directly (the DuckDB `iceberg` extension, PyIceberg, anything
+with the vended creds) physically cannot reach the unmasked data — it no
+longer has to "respect" a policy to be governed. Phases 1–4 (incl. 3a) are
+implemented and tested; the design + phasing live in
+[duckicelake_governance.md](duckicelake_governance.md), the implemented
+state in [GOVERNANCE.md](GOVERNANCE.md).
 
 **The model** (Phase 1): object tags (`pii.email`, hierarchical cascade
 schema → table → column), masking policies + row-access policies (SQL
