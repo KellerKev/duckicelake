@@ -607,6 +607,8 @@ def drop_table(
     if purgeRequested:
         n = catalog.purge_table_objects(ns, table)
         log.info("purge %s.%s: %d S3 objects removed", ns[0], table, n)
+        # file-layer masked exports live under a separate prefix
+        masked_export_manager.purge_table(ns, table)
     return Response(status_code=204)
 
 
@@ -1203,14 +1205,11 @@ def commit_table(
     # manage their own DuckLake transactions; their side effects aren't
     # rolled back by this scope, but DuckLake itself enforces per-call
     # atomicity on the snapshot allocator.
+    schema_changed = False
     with catalog.commit_transaction():
         if new_schema is not None:
             _apply_schema_diff(ns, table, new_schema)
-            # Masking views project the pre-change column set; their
-            # signatures fold the columns in, so they're stale now. Drop
-            # them all (best-effort) — the next masked LoadTable recreates
-            # at the new signature.
-            masking_view_manager.gc_orphans(ns, table, keep=set())
+            schema_changed = True
 
         if pending_partition_spec is not None:
             _apply_partition_spec(ns, table, pending_partition_spec)
@@ -1285,6 +1284,22 @@ def commit_table(
     # does a full materialise and re-primes the cache at the new snapshot id.
     # This keeps post-commit reads fast while guaranteeing correctness.
     catalog.invalidate_metadata_cache(ns, table)
+
+    if schema_changed:
+        # Masking views and masked exports project the pre-change column
+        # set; their signatures fold the columns in, so they're all stale.
+        # Drop them (best-effort) — the next masked read recreates at the
+        # new signature. Deliberately OUTSIDE the commit transaction: the
+        # gc reads catalog tables and issues DuckDB DDL, and doing that
+        # while holding the commit tx's locks deadlocks against the notify
+        # listener (observed live; PG can't detect it because the tx waits
+        # in Python).
+        try:
+            masking_view_manager.gc_orphans(ns, table, keep=set())
+            masked_export_manager.gc_table(ns, table, keep=set())
+        except Exception:
+            log.exception("post-schema-change masking GC failed for %s.%s",
+                          ns[0], table)
 
     # Eager materialise: _build_load_response calls materialize_all, which
     # writes all the snapshot/manifest Avros + the new vN.metadata.json and

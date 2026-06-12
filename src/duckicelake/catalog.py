@@ -1010,18 +1010,28 @@ class DuckLakeCatalog:
             END;
             $$ LANGUAGE plpgsql
         """)
-        # Trigger creation guarded — DROP IF EXISTS so we can re-create
-        # idempotently without leaking duplicate triggers.
+        # Trigger creation guarded by an existence check, NOT a blind
+        # DROP+CREATE: DROP TRIGGER takes ACCESS EXCLUSIVE on
+        # ducklake_snapshot, and this ensure runs on every materialisation
+        # touchpoint. A pending exclusive behind any long-lived reader tx
+        # makes every later snapshot-allocator read queue up — observed as
+        # a three-session deadlock with an in-flight commit_transaction
+        # that calls into DuckDB DDL (PG can't detect it: the tx waits in
+        # Python, not on a PG lock). The trigger body lives in the
+        # CREATE OR REPLACE FUNCTION above, so updates don't need a
+        # trigger re-create anyway.
         cur.execute("""
-            DROP TRIGGER IF EXISTS duckicelake_snapshot_notify
-            ON public.ducklake_snapshot
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'duckicelake_snapshot_notify'
+              AND tgrelid = 'public.ducklake_snapshot'::regclass
         """)
-        cur.execute("""
-            CREATE TRIGGER duckicelake_snapshot_notify
-            AFTER INSERT ON public.ducklake_snapshot
-            FOR EACH ROW
-            EXECUTE FUNCTION public.duckicelake_notify_snapshot()
-        """)
+        if cur.fetchone() is None:
+            cur.execute("""
+                CREATE TRIGGER duckicelake_snapshot_notify
+                AFTER INSERT ON public.ducklake_snapshot
+                FOR EACH ROW
+                EXECUTE FUNCTION public.duckicelake_notify_snapshot()
+            """)
 
     def tables_touched_by_snapshot(
         self, snapshot_id: int,

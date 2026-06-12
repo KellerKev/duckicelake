@@ -390,3 +390,51 @@ def test_listener_refreshes_export_for_existing_creds(client, settings):
     assert rows, "listener did not refresh the masked export in time"
     assert rows[4] == "da***"            # new row arrives masked
     con.close()
+
+
+# ---- lifecycle hooks (stage B4) ----------------------------------------------
+
+def test_schema_change_drops_masked_exports(client, settings, direct_catalog):
+    ns = _ns("alter")
+    _make_table(client, ns, "events")
+    _author_file_layer_policy(client, ns, "events")
+    _seed(settings, ns)
+    bob = _vend(client, ns, "bob")
+    assert bob["file_layer"] is True
+    sig = bob["mask_signature"]
+    mgr = MaskedExportManager(direct_catalog, settings)
+    assert mgr.current_export([ns], "events", sig) is not None
+
+    wider = {
+        "type": "struct", "schema-id": 1,
+        "fields": SCHEMA_JSON["fields"] + [
+            {"id": 3, "name": "country", "required": False, "type": "string"},
+        ],
+    }
+    client.post(
+        f"/v1/lake/namespaces/{ns}/tables/events",
+        json={"requirements": [],
+              "updates": [{"action": "add-schema", "schema": wider},
+                          {"action": "set-current-schema", "schema-id": -1}]},
+    ).raise_for_status()
+
+    assert mgr.current_export([ns], "events", sig) is None
+    # next vend recreates at the new (column-folded) signature
+    bob2 = _vend(client, ns, "bob")
+    assert bob2["file_layer"] is True and bob2["mask_signature"] != sig
+
+
+def test_drop_table_purges_masked_prefix(client, settings, direct_catalog):
+    ns = _ns("drop")
+    _make_table(client, ns, "events")
+    _author_file_layer_policy(client, ns, "events")
+    _seed(settings, ns)
+    _vend(client, ns, "bob")
+    mgr = MaskedExportManager(direct_catalog, settings)
+    masked_root = settings.s3.masked_table_prefix(ns, "events")
+    assert mgr._list_keys(masked_root)
+
+    r = client.delete(f"/v1/lake/namespaces/{ns}/tables/events",
+                      params={"purgeRequested": "true"})
+    assert r.status_code == 204
+    assert mgr._list_keys(masked_root) == []
