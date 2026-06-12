@@ -98,13 +98,19 @@ materialises one physical DuckLake view per (table, mask-signature) —
   `duckicelake.masking-disabled` property.
 
 **PG reader roles + RLS** (Phase 3a): `ducklake-credentials` vends a
-**per-principal Postgres LOGIN role** (random per-vend password, `VALID
-UNTIL` = the STS expiry, `READ_ONLY` attach) instead of the owning role,
-with row-level security on the `ducklake_*` catalog tables: explicit
-`select` object-grants flip a table to allowlist (ungranted principals
-can't even see it), and the file-visibility predicate backs Phase 4.
-Real authentication needs prod scram+TLS — one pg_hba line via the group
-role; the dev trust-auth limits are documented honestly.
+**per-principal, per-vend Postgres LOGIN role** (`duckicelake_p_<sub>_<sha8>_<nonce>`,
+random password, `VALID UNTIL` = the STS expiry, `READ_ONLY` attach)
+instead of the owning role — a fresh role per vend, so concurrent vends
+for one principal never invalidate each other's secret; all map to the
+same principal and are GC'd by expiry. Row-level security on the
+`ducklake_*` catalog tables enforces visibility: explicit `select`
+object-grants flip a table to allowlist (ungranted principals can't even
+see it), and the file-visibility predicate backs Phase 4. The RLS check
+is a set-membership test (`table_id NOT IN (SELECT … hidden …)`) Postgres
+evaluates **once per scan and hashes** — not a per-row function call — so
+it stays cheap on large catalogs. Real authentication needs prod
+scram+TLS — one `pg_hba` line via the group role; the dev trust-auth
+limits are documented honestly in [GOVERNANCE.md](GOVERNANCE.md).
 
 **File-layer masking** (Phase 4 — byte-level, every engine): set
 `"file-layer-masking": true` on a masking policy and the proxy
@@ -128,6 +134,30 @@ pre-masked copies are the only byte-level mechanism for direct readers.
 Everything is **fail-open** (a governance error never breaks a read — it
 serves unmasked and audits the failure) and **root S3 keys are no longer
 embedded in responses by default**: clients see only vended credentials.
+
+**Hardening & boundaries** (audited by a multi-pass review of the branch):
+
+- **Reserved governance state can't be forged or disabled by a client.**
+  `set/remove-properties` on any `duckicelake.*` key is rejected (403) — a
+  write token can't flip off `duckicelake.file-layer-masking` to disable
+  RLS file-hiding. `__mask_*` table/view names are rejected at create and
+  rename so user objects can't collide with masking-view plumbing.
+- **Masked principals never reach base bytes.** Vended creds scope to the
+  masked-signature prefix only; namespace-level vends add explicit IAM
+  *Deny* on every file-layer table's base prefix — derived from the policy,
+  so a table that was authored but never yet exported is still denied.
+- **Injection-safe SQL.** Identifiers and string literals (table/column
+  names, S3 paths) are escaped in the export `COPY` / `read_parquet` /
+  `FIELD_IDS` paths, which run as the owning role with root creds.
+- **Catalog hygiene.** `ducklake_snapshot_changes` and inlined-data payload
+  tables are never granted to the reader role (they'd leak hidden tables'
+  names / bypass RLS); the governance sidecar DDL runs once per process,
+  not per request.
+- **Cooperative vs airtight, stated honestly.** The Phase-3 masking *views*
+  are cooperative (a client with the base table name + base creds can read
+  raw); Phase-4 file-layer masking is the airtight tier for tables that opt
+  in. Dev runs Postgres trust-auth, so RLS *authentication* is only real
+  under prod scram+TLS — see [GOVERNANCE.md](GOVERNANCE.md).
 
 Try it against a running stack:
 
