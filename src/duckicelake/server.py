@@ -1614,6 +1614,7 @@ def _build_load_response(
     # per-principal masking / row-filter signals. No-op when nothing is
     # governed. Wrapped defensively: governance must never break a read.
     principal_for_creds: str | None = None
+    file_layer_export = None
     if principal_claims is not None:
         principal_for_creds = principal_claims.get("sub") or "anonymous"
         try:
@@ -1631,26 +1632,74 @@ def _build_load_response(
             )
             if not plan.is_empty():
                 metadata = apply_plan_to_metadata(metadata, plan)
+                # Phase 4: file-layer plans get masked Parquet exports and,
+                # below, SHADOW metadata pointing at them — every Iceberg
+                # reader (incl. DuckDB iceberg ext) reads masked bytes.
+                if plan.file_layer:
+                    file_layer_export = (
+                        masked_export_manager.ensure_export_for_plan(
+                            ns, table, plan)
+                        or masked_export_manager.current_export(
+                            ns, table, mask_signature(plan))
+                    )
                 # Phase 3: materialize the plan's masking view so cooperative
                 # clients (DuckLake-direct, view-capable REST engines) can
                 # execute the mask; advertise it via a table property.
                 view_name = masking_view_manager.ensure_view_for_plan(
-                    ns, table, plan
+                    ns, table, plan, export=file_layer_export
                 )
                 if view_name:
                     metadata["properties"]["duckicelake.masking-view-name"] = view_name
+                if file_layer_export is not None:
+                    _ensure_file_layer_properties(ns, table, plan)
+                    shadow = masked_export_manager.shadow_metadata(
+                        ns, table, file_layer_export)
+                    if shadow is not None:
+                        metadata_location, metadata = shadow
+                        metadata = apply_plan_to_metadata(metadata, plan)
+                        if view_name:
+                            metadata["properties"]["duckicelake.masking-view-name"] = view_name
+                    else:
+                        # no shadow → REST clients keep catalog-level
+                        # signals over BASE metadata; don't pretend
+                        file_layer_export = None
                 governance_store.audit_load(
                     principal=principal_for_creds, object_=f"{ns[0]}.{table}",
                     masked_cols=plan.masked_columns,
                     applied_policies=plan.applied_policies,
                     row_filtered=plan.row_filter is not None,
+                    decision=("masked_file_layer"
+                              if file_layer_export is not None else None),
+                    detail={"file_layer": file_layer_export is not None},
                 )
         except Exception:
             log.exception("governance enforcement failed for %s.%s — serving unmasked",
                           ns[0], table)
+            file_layer_export = None
 
     config_out: dict[str, str] = _base_s3_config()
-    if _wants_vended_credentials(delegation_header):
+    if _wants_vended_credentials(delegation_header) and file_layer_export is not None:
+        # Masked file-layer principal: READ-ONLY creds on the masked sig
+        # prefix only — never the base table's bytes (and never write).
+        creds = vend_credentials(
+            s3,
+            namespace=ns[0],
+            table=table,
+            read_only=True,
+            read_prefixes=[s3.masked_sig_prefix(
+                ns[0], table, file_layer_export.sig)],
+            principal=principal_for_creds,
+        )
+        config_out.update(
+            {
+                "s3.access-key-id": creds.access_key_id,
+                "s3.secret-access-key": creds.secret_access_key,
+                "s3.session-token": creds.session_token,
+                "s3.remote-signing-enabled": "false",
+                "s3.credentials-expiration": creds.expiration_iso,
+            }
+        )
+    elif _wants_vended_credentials(delegation_header):
         snap = metadata.get("current-snapshot-id") or 0
         # Vended creds must cover *everything* a client may do with this
         # table during the token's lifetime. The Iceberg REST spec doesn't

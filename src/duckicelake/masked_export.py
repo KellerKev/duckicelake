@@ -195,12 +195,21 @@ class MaskedExportManager:
                     plan, catalog_name=self.settings.catalog_name,
                     snapshot_id=snap,
                 )
+                # Iceberg readers map parquet columns by FIELD ID, not name
+                # — without explicit ids the shadow metadata's schema can't
+                # bind and every column reads NULL. Ids are 1-based in
+                # projection order, matching the shadow schema built from a
+                # DESCRIBE of these very files.
+                field_ids = ", ".join(
+                    f'"{c}": {i}' for i, c in enumerate(plan.columns, start=1)
+                )
                 with self.catalog.export_cursor() as con:
                     con.execute(
                         f"COPY ({select}) TO "
                         f"'s3://{s3.bucket}/{prefix.rstrip('/')}' "
                         f"(FORMAT PARQUET, FILE_SIZE_BYTES '256MB', "
-                        f"FILENAME_PATTERN 'part-{{i}}')"
+                        f"FILENAME_PATTERN 'part-{{i}}', "
+                        f"FIELD_IDS {{{field_ids}}})"
                     )
                 files = self.list_export_files(prefix)
                 with self.catalog.pg_cursor() as cur:
@@ -399,6 +408,126 @@ class MaskedExportManager:
         except Exception:
             log.exception("retention sweep failed for %s.%s sig %s",
                           schema, table, sig)
+
+    # ---- shadow Iceberg metadata (REST path) ---------------------------------
+
+    def shadow_metadata(self, ns: list[str], table: str,
+                        export: MaskedExport) -> tuple[str, dict] | None:
+        """Real Iceberg TableMetadata over the masked export, so every
+        Iceberg-REST reader — including the DuckDB iceberg extension, which
+        has no view or scan-planning support — reads masked bytes
+        transparently.
+
+        One snapshot, data manifests only (a current-state export has no
+        delete files by construction), no column stats (readers tolerate;
+        no pruning on the redacted tier). The metadata tree lives INSIDE
+        the export's snap dir, so it rotates and is retained/GC'd with it.
+        Idempotent per snap dir: an existing metadata.json is reused.
+        Returns (metadata_location, metadata) or None on any failure
+        (caller falls back to catalog-level signals)."""
+        try:
+            s3 = self.settings.s3
+            meta_prefix = f"{export.prefix}metadata/"
+            meta_key = f"{meta_prefix}v1.metadata.json"
+            client = self.catalog.s3_client
+            location = f"s3://{s3.bucket}/{export.prefix.rstrip('/')}"
+            meta_loc = f"s3://{s3.bucket}/{meta_key}"
+            try:
+                body = client.get_object(Bucket=s3.bucket, Key=meta_key)
+                return meta_loc, json.loads(body["Body"].read())
+            except Exception:
+                pass    # not built yet
+
+            glob = f"s3://{s3.bucket}/{export.prefix}*.parquet"
+            with self.catalog.export_cursor() as con:
+                described = con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{glob}')"
+                ).fetchall()
+                per_file = con.execute(
+                    f"SELECT file_name, num_rows, file_size_bytes "
+                    f"FROM parquet_file_metadata('{glob}')"
+                ).fetchall()
+
+            from .catalog import ColumnInfo
+            from .iceberg import build_table_metadata
+            from .manifest import (
+                DataFileInfo,
+                build_snapshot,
+                write_data_manifest_bytes,
+                write_manifest_list_bytes,
+            )
+
+            columns = [ColumnInfo(name=r[0], data_type=r[1],
+                                  is_nullable=True, ordinal=i)
+                       for i, r in enumerate(described)]
+            data_files = [
+                DataFileInfo(file_path=fname, file_size_bytes=int(fsize),
+                             record_count=int(nrows))
+                for fname, nrows, fsize in per_file
+            ]
+            total_rows = sum(f.record_count for f in data_files)
+            snap_id = export.snapshot
+
+            md = build_table_metadata(
+                table_uuid=str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"duckicelake-masked.{ns[0]}.{table}.{export.sig}")),
+                location=location,
+                columns=columns,
+                properties={
+                    "duckicelake.masked": "true",
+                    "duckicelake.mask-signature": export.sig,
+                    "duckicelake.base-table": f"{ns[0]}.{table}",
+                },
+            )
+            schema_json = md["schemas"][0]
+
+            manifest_bytes = write_data_manifest_bytes(
+                snapshot_id=snap_id, sequence_number=1,
+                schema_json=schema_json,
+                partition_spec_json={"spec-id": 0, "fields": []},
+                data_files=data_files,
+                format_version=md["format-version"],
+            )
+            manifest_key = f"{meta_prefix}m0-{uuid.uuid4()}.avro"
+            client.put_object(Bucket=s3.bucket, Key=manifest_key,
+                              Body=manifest_bytes)
+
+            mlist_bytes = write_manifest_list_bytes(
+                snapshot_id=snap_id, parent_snapshot_id=None,
+                sequence_number=1,
+                manifest_refs=[(f"s3://{s3.bucket}/{manifest_key}",
+                                len(manifest_bytes), "data")],
+                data_file_count=len(data_files),
+                data_row_count=total_rows,
+                format_version=md["format-version"],
+            )
+            mlist_key = f"{meta_prefix}snap-{snap_id}-{uuid.uuid4()}.avro"
+            client.put_object(Bucket=s3.bucket, Key=mlist_key,
+                              Body=mlist_bytes)
+
+            snap = build_snapshot(
+                snapshot_id=snap_id, parent_snapshot_id=None,
+                sequence_number=1,
+                manifest_list_path=f"s3://{s3.bucket}/{mlist_key}",
+                added_files_count=len(data_files),
+                added_rows_count=total_rows,
+                total_files=len(data_files), total_rows=total_rows,
+            )
+            md["snapshots"] = [snap]
+            md["current-snapshot-id"] = snap_id
+            md["last-sequence-number"] = 1
+            md["refs"] = {"main": {"type": "branch", "snapshot-id": snap_id}}
+            md["snapshot-log"] = [{"snapshot-id": snap_id,
+                                   "timestamp-ms": snap["timestamp-ms"]}]
+
+            client.put_object(Bucket=s3.bucket, Key=meta_key,
+                              Body=json.dumps(md).encode())
+            return meta_loc, md
+        except Exception:
+            log.exception("shadow metadata build failed for %s.%s sig %s",
+                          ns[0], table, export.sig)
+            return None
 
     # ---- S3 helpers ----------------------------------------------------------
 

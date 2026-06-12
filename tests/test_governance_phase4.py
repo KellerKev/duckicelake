@@ -438,3 +438,91 @@ def test_drop_table_purges_masked_prefix(client, settings, direct_catalog):
                       params={"purgeRequested": "true"})
     assert r.status_code == 204
     assert mgr._list_keys(masked_root) == []
+
+
+# ---- REST shadow Iceberg metadata (stage B5) ---------------------------------
+
+def test_rest_shadow_metadata_end_to_end(client, settings):
+    """The REST half of Phase 4: LoadTable for a masked principal returns
+    SHADOW metadata whose manifests point exclusively at masked Parquet,
+    with read-only masked-prefix STS — and the DuckDB iceberg extension
+    (no views, no scan planning) reads masked bytes through it. The test
+    stack runs auth-off, so the REST caller is `anonymous` (no roles →
+    masked)."""
+    ns = _ns("rest")
+    _make_table(client, ns, "events")
+    _author_file_layer_policy(client, ns, "events")
+    _seed(settings, ns)
+
+    r = client.get(f"/v1/lake/namespaces/{ns}/tables/events",
+                   headers={"X-Iceberg-Access-Delegation": "vended-credentials"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    md = body["metadata"]
+    masked_root = f"s3://{settings.s3.bucket}/" \
+                  f"{settings.s3.masked_table_prefix(ns, 'events')}"
+
+    # metadata + manifest chain live under the masked prefix
+    assert body["metadata-location"].startswith(masked_root)
+    assert md["properties"]["duckicelake.masked"] == "true"
+    snap = md["snapshots"][0]
+    assert snap["manifest-list"].startswith(masked_root)
+    assert md["properties"]["duckicelake.masked-columns"] == "email"
+
+    # vended creds: masked bytes 200, base bytes 403, and read-only
+    cfg = body["config"]
+    assert cfg.get("s3.session-token"), "expected vended STS creds"
+    s3c = _s3_client_from({
+        "endpoint": settings.s3.endpoint, "region": settings.s3.region,
+        "access-key-id": cfg["s3.access-key-id"],
+        "secret-access-key": cfg["s3.secret-access-key"],
+        "session-token": cfg["s3.session-token"],
+    })
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        s3c.get_object(Bucket=settings.s3.bucket,
+                       Key=_base_keys(settings, ns)[0])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+    # the load-bearing reader proof: DuckDB iceberg extension over the
+    # shadow metadata with the vended creds sees masked bytes
+    con = duckdb.connect(":memory:")
+    for e in ("iceberg", "httpfs"):
+        con.execute(f"INSTALL {e}"); con.execute(f"LOAD {e}")
+    con.execute(
+        f"""
+        CREATE SECRET vend (TYPE S3, KEY_ID '{cfg["s3.access-key-id"]}',
+            SECRET '{cfg["s3.secret-access-key"]}',
+            SESSION_TOKEN '{cfg["s3.session-token"]}',
+            REGION '{settings.s3.region}', ENDPOINT '{settings.s3.host}',
+            USE_SSL {str(settings.s3.use_ssl).lower()}, URL_STYLE 'path')
+        """
+    )
+    emails = {r0[0] for r0 in con.execute(
+        f"SELECT email FROM iceberg_scan('{body['metadata-location']}')"
+    ).fetchall()}
+    con.close()
+    assert emails == {"al***", "bo***", "ca***"}
+
+
+def test_rest_shadow_only_for_masked_principals(client, settings, direct_catalog):
+    """A bypass principal's REST LoadTable keeps BASE metadata. The test
+    stack is auth-off (anonymous), so grant anonymous the bypass role."""
+    ns = _ns("restbp")
+    _make_table(client, ns, "events")
+    _author_file_layer_policy(client, ns, "events")
+    client.post("/v1/lake/governance/role-grants",
+                json={"role": "pii_reader",
+                      "principal": "anonymous"}).raise_for_status()
+    _seed(settings, ns)
+    try:
+        r = client.get(f"/v1/lake/namespaces/{ns}/tables/events")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "__masked__" not in (body.get("metadata-location") or "")
+        assert "duckicelake.masked" not in body["metadata"]["properties"]
+    finally:
+        # don't leak anonymous's bypass into other tests
+        import psycopg
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM public.duckicelake_role_grant "
+                        "WHERE role_name='pii_reader' AND principal_sub='anonymous'")
