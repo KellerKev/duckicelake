@@ -34,13 +34,34 @@ POLICY_KINDS = {"masking", "row_access"}
 ATTACH_TARGETS = {"tag", "column", "table"}
 
 
+#: Process-level guard so the ~14 sidecar DDL statements (incl. ALTER TABLE
+#: ADD COLUMN, which takes a brief ACCESS EXCLUSIVE lock even as a no-op)
+#: run once per process instead of on every GovernanceStore call — a single
+#: masked LoadTable would otherwise re-run them 3-4× and serialize concurrent
+#: requests on catalog locks. The proxy's schema is never wiped mid-process;
+#: tests that wipe Postgres call `reset_sidecar_cache()` (via conftest) to
+#: keep the flag honest.
+_SIDECARS_ENSURED = False
+
+
+def reset_sidecar_cache() -> None:
+    """Forget that the governance sidecars were ensured — call after wiping
+    the `public` schema so the next ensure re-creates them."""
+    global _SIDECARS_ENSURED
+    _SIDECARS_ENSURED = False
+
+
 def ensure_governance_sidecars(cur) -> None:
     """Create the Phase 1 governance sidecar tables if absent.
 
-    Idempotent — safe to call on every request, matching the catalog's
-    existing `_ensure_sidecar` discipline. All tables carry the
-    `duckicelake_` prefix so their proxy origin is obvious in the PG schema.
+    Idempotent and cheap after the first call per process (guarded by
+    `_SIDECARS_ENSURED`), matching the catalog's `_ensure_sidecar`
+    discipline. All tables carry the `duckicelake_` prefix so their proxy
+    origin is obvious in the PG schema.
     """
+    global _SIDECARS_ENSURED
+    if _SIDECARS_ENSURED:
+        return
     # --- tag definitions -------------------------------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.duckicelake_tag (
@@ -183,6 +204,7 @@ def ensure_governance_sidecars(cur) -> None:
             detail           JSONB
         )
     """)
+    _SIDECARS_ENSURED = True
 
 
 # ---------------------------------------------------------------------------

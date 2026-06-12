@@ -531,13 +531,20 @@ def _vend(client, ns: str, sub: str, table: str = "events") -> dict:
 
 
 def test_rls_principal_role_name_pure():
+    # no-nonce form is deterministic per sub
     a = pg_rls.principal_role_name("bob")
     b = pg_rls.principal_role_name("bob")
     assert a == b and a.startswith("duckicelake_p_bob_") and len(a) <= 63
-    hostile = pg_rls.principal_role_name("Robert'); DROP TABLE x;-- " + "x" * 100)
+    # hostile + long subs stay within PG's 63-byte identifier limit, even
+    # with a nonce suffix
+    hostile = pg_rls.principal_role_name(
+        "Robert'); DROP TABLE x;-- " + "x" * 100, "abc123")
     assert len(hostile) <= 63
-    # same sanitized form, different subs → distinct roles
+    # same sanitized form, different subs → distinct roles (sha8 of raw sub)
     assert pg_rls.principal_role_name("a.b") != pg_rls.principal_role_name("a_b")
+    # a per-vend nonce makes each vend its own role for the same sub
+    assert pg_rls.principal_role_name("bob", "n1") != \
+        pg_rls.principal_role_name("bob", "n2")
 
 
 def test_rls_ensure_idempotent(settings, direct_catalog):
@@ -661,21 +668,28 @@ def test_rls_reader_is_readonly(client, settings):
             cur.execute("INSERT INTO public.ducklake_metadata VALUES ('x','y',1,NULL)")
 
 
-def test_rls_revend_rotates(client, settings):
+def test_rls_revend_mints_independent_roles(client, settings):
+    """Each vend mints its own nonce role + password (concurrent vends for
+    one principal can't invalidate each other's secret); both map to the
+    same principal and both connect."""
     ns = _ns("rot")
     _make_table(client, ns, "events")
     first = _vend(client, ns, "carol")
     second = _vend(client, ns, "carol")
-    assert first["pg_role"] == second["pg_role"]
-    assert first["ducklake_dsn"] != second["ducklake_dsn"]   # new password
+    assert first["pg_role"] != second["pg_role"]            # distinct roles
+    assert first["pg_role"].startswith("duckicelake_p_carol_")
     with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
-        cur.execute("SELECT expires_at FROM public.duckicelake_pg_principal "
-                    "WHERE pg_role = %s", (first["pg_role"],))
-        assert cur.fetchone()[0] >= datetime.now(timezone.utc) + timedelta(minutes=50)
-    # rotated creds still connect (trust auth in dev; verifies bookkeeping)
-    con = _vended_duckdb(settings, second)
-    con.execute("SELECT 1")
-    con.close()
+        cur.execute("SELECT principal_sub FROM public.duckicelake_pg_principal "
+                    "WHERE pg_role IN (%s, %s)",
+                    (first["pg_role"], second["pg_role"]))
+        subs = {r[0] for r in cur.fetchall()}
+        assert subs == {"carol"}                            # both map to carol
+    # BOTH sets of creds still connect — the first wasn't invalidated by the
+    # second (the old shared-role rotation race)
+    for body in (first, second):
+        con = _vended_duckdb(settings, body)
+        con.execute("SELECT 1")
+        con.close()
 
 
 def test_rls_gc_expired_roles(settings, direct_catalog):

@@ -68,15 +68,21 @@ ROLE_PREFIX = "duckicelake_p_"
 _POLICY_NAME = "duckicelake_rls"
 
 
-def principal_role_name(sub: str) -> str:
-    """Deterministic, collision-proof PG role name for a principal sub.
+def principal_role_name(sub: str, nonce: str = "") -> str:
+    """Collision-proof PG LOGIN-role name for a principal sub.
 
-    Hostile subs are sanitized to [a-z0-9_]; the sha8 suffix keeps two subs
-    that sanitize identically from colliding. Always ≤ 63 bytes.
+    Hostile subs are sanitized to [a-z0-9_]; the sha8 of the raw sub keeps
+    two subs that sanitize identically from colliding. A per-vend `nonce`
+    makes each vend its own role: concurrent vends for the same principal
+    no longer race to ALTER one shared password (which invalidated the
+    earlier vend's just-returned secret). All such roles map to the same
+    principal in `duckicelake_pg_principal` and are GC'd by expiry. Always
+    ≤ 63 bytes: 14 (prefix) + 24 + 1 + 8 + 1 + 6.
     """
-    sanitized = re.sub(r"[^a-z0-9_]", "_", sub.lower())[:32]
+    sanitized = re.sub(r"[^a-z0-9_]", "_", sub.lower())[:24]
     digest = hashlib.sha256(sub.encode()).hexdigest()[:8]
-    return f"{ROLE_PREFIX}{sanitized}_{digest}"
+    suffix = f"_{nonce}" if nonce else ""
+    return f"{ROLE_PREFIX}{sanitized}_{digest}{suffix}"
 
 
 def _ensure_principal_sidecar(cur) -> None:
@@ -91,9 +97,18 @@ def _ensure_principal_sidecar(cur) -> None:
 
 
 def _ensure_functions(cur) -> None:
-    """The three SECURITY DEFINER predicate functions, owned by the proxy's
-    (owning) role so readers never need SELECT on the governance sidecars
-    and the lookups bypass RLS (no recursion)."""
+    """SECURITY DEFINER predicate helpers, owned by the proxy's (owning)
+    role so readers never need SELECT on the governance sidecars and the
+    lookups bypass RLS (no recursion).
+
+    Visibility is expressed as a *hidden-set* SRF rather than a per-row
+    boolean: the RLS policy is `table_id NOT IN (SELECT … hidden …)`, an
+    uncorrelated subquery Postgres evaluates ONCE per scan (then hashes),
+    instead of a function invoked per row — the difference between one
+    lookup and ~100k on a large catalog. The hidden set is bounded (only
+    grant-gated / file-masked tables the principal can't see), and a
+    dropped/unknown table_id is never in it → stays visible, matching the
+    old per-row semantics exactly."""
     cur.execute("""
         CREATE OR REPLACE FUNCTION public.duckicelake_session_principal()
         RETURNS text
@@ -104,84 +119,69 @@ def _ensure_functions(cur) -> None:
             WHERE pg_role = session_user
         $$
     """)
+    # Tables flipped to allowlist by an explicit select object-grant that
+    # the session principal does NOT satisfy (holds none of the granting
+    # roles). Ungoverned (no-grant) tables are absent → visible by default.
     cur.execute("""
-        CREATE OR REPLACE FUNCTION public.duckicelake_can_see_table(tid bigint)
-        RETURNS boolean
+        CREATE OR REPLACE FUNCTION public.duckicelake_hidden_table_ids()
+        RETURNS SETOF bigint
         LANGUAGE sql STABLE SECURITY DEFINER
         SET search_path = public, pg_temp
         AS $$
-        WITH ident AS (
-            SELECT s.schema_name, t.table_name
+            SELECT t.table_id
             FROM public.ducklake_table t
             JOIN public.ducklake_schema s USING (schema_id)
-            WHERE t.table_id = tid AND t.end_snapshot IS NULL
-            LIMIT 1
-        ),
-        grants AS (
-            SELECT og.role_name
-            FROM public.duckicelake_object_grant og, ident i
-            WHERE lower(og.privilege) = 'select'
-              AND (
-                (og.object_kind = 'table'
-                 AND og.schema_name = i.schema_name
-                 AND og.object_name = i.table_name)
-                OR (og.object_kind = 'schema'
-                    AND og.schema_name = i.schema_name)
-              )
-        )
-        SELECT CASE
-            -- dropped/unknown table id: historical rows stay visible
-            WHEN NOT EXISTS (SELECT 1 FROM ident) THEN true
-            -- no explicit select-grant anywhere: default-allow
-            WHEN NOT EXISTS (SELECT 1 FROM grants) THEN true
-            ELSE EXISTS (
-                SELECT 1 FROM grants g
-                JOIN public.duckicelake_role_grant rg
-                  ON rg.role_name = g.role_name
-                WHERE rg.principal_sub = public.duckicelake_session_principal()
-            )
-        END
+            WHERE t.end_snapshot IS NULL
+              AND EXISTS (
+                SELECT 1 FROM public.duckicelake_object_grant og
+                WHERE lower(og.privilege) = 'select'
+                  AND ((og.object_kind = 'table'
+                        AND og.schema_name = s.schema_name
+                        AND og.object_name = t.table_name)
+                       OR (og.object_kind = 'schema'
+                           AND og.schema_name = s.schema_name)))
+              AND NOT EXISTS (
+                SELECT 1 FROM public.duckicelake_object_grant og
+                JOIN public.duckicelake_role_grant rg ON rg.role_name = og.role_name
+                WHERE lower(og.privilege) = 'select'
+                  AND rg.principal_sub = public.duckicelake_session_principal()
+                  AND ((og.object_kind = 'table'
+                        AND og.schema_name = s.schema_name
+                        AND og.object_name = t.table_name)
+                       OR (og.object_kind = 'schema'
+                           AND og.schema_name = s.schema_name)))
         $$
     """)
+    # File-row hidden set: the table-hidden set, PLUS file-layer-masked
+    # tables (duckicelake.file-layer-masking=true) whose bypass-role list
+    # the principal doesn't satisfy — the Phase-4 interlock.
     cur.execute("""
-        CREATE OR REPLACE FUNCTION public.duckicelake_can_see_files(tid bigint)
-        RETURNS boolean
+        CREATE OR REPLACE FUNCTION public.duckicelake_hidden_file_table_ids()
+        RETURNS SETOF bigint
         LANGUAGE sql STABLE SECURITY DEFINER
         SET search_path = public, pg_temp
         AS $$
-        WITH ident AS (
-            SELECT s.schema_name, t.table_name
+            SELECT public.duckicelake_hidden_table_ids()
+            UNION
+            SELECT t.table_id
             FROM public.ducklake_table t
             JOIN public.ducklake_schema s USING (schema_id)
-            WHERE t.table_id = tid AND t.end_snapshot IS NULL
-            LIMIT 1
-        ),
-        flag AS (
-            SELECT 1
-            FROM public.duckicelake_table_property p, ident i
-            WHERE p.schema_name = i.schema_name
-              AND p.table_name = i.table_name
-              AND p.key = 'duckicelake.file-layer-masking'
-              AND lower(p.value) = 'true'
-        ),
-        bypass AS (
-            SELECT trim(r.role_name) AS role_name
-            FROM public.duckicelake_table_property p,
-                 ident i,
-                 unnest(string_to_array(p.value, ',')) AS r(role_name)
-            WHERE p.schema_name = i.schema_name
-              AND p.table_name = i.table_name
-              AND p.key = 'duckicelake.file-layer-bypass-roles'
-        )
-        SELECT public.duckicelake_can_see_table(tid) AND (
-            NOT EXISTS (SELECT 1 FROM flag)
-            OR EXISTS (
-                SELECT 1 FROM bypass b
+            JOIN public.duckicelake_table_property p
+              ON p.schema_name = s.schema_name
+             AND p.table_name = t.table_name
+             AND p.key = 'duckicelake.file-layer-masking'
+             AND lower(p.value) = 'true'
+            WHERE t.end_snapshot IS NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM public.duckicelake_table_property bp
+                CROSS JOIN unnest(string_to_array(bp.value, ',')) AS r(role_name)
                 JOIN public.duckicelake_role_grant rg
-                  ON rg.role_name = b.role_name
-                WHERE rg.principal_sub = public.duckicelake_session_principal()
-            )
-        )
+                  ON rg.role_name = trim(r.role_name)
+                WHERE bp.schema_name = s.schema_name
+                  AND bp.table_name = t.table_name
+                  AND bp.key = 'duckicelake.file-layer-bypass-roles'
+                  AND rg.principal_sub = public.duckicelake_session_principal())
         $$
     """)
 
@@ -253,9 +253,14 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
             cur.execute(sql.SQL("REVOKE SELECT ON public.{} FROM {}").format(
                 sql.Identifier(name), sql.Identifier(group)))
 
+        # Set-membership predicate: the SRF subquery is uncorrelated, so
+        # Postgres runs it once per scan and hashes the result — not a
+        # per-row function call.
         for name, predicate in (
-            [(n, "duckicelake_can_see_table(table_id)") for n in table_scoped]
-            + [(n, "duckicelake_can_see_files(table_id)") for n in file_scoped]
+            [(n, "table_id NOT IN (SELECT public.duckicelake_hidden_table_ids())")
+             for n in table_scoped]
+            + [(n, "table_id NOT IN (SELECT public.duckicelake_hidden_file_table_ids())")
+               for n in file_scoped]
         ):
             cur.execute(sql.SQL(
                 "ALTER TABLE public.{} ENABLE ROW LEVEL SECURITY"
@@ -268,6 +273,16 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
                 sql.Identifier(_POLICY_NAME), sql.Identifier(name),
                 sql.Identifier(group), sql.SQL(predicate),
             ))
+
+        # Drop the old per-row scalar predicates on upgrade — the policies
+        # above now reference the set-returning SRFs instead. Best-effort;
+        # files-variant first (it depended on the table-variant).
+        for fn in ("duckicelake_can_see_files(bigint)",
+                   "duckicelake_can_see_table(bigint)"):
+            try:
+                cur.execute(f"DROP FUNCTION IF EXISTS public.{fn}")
+            except Exception:
+                log.debug("could not drop legacy predicate %s", fn)
 
     log.info("RLS ensured: group=%s, %d table-scoped + %d file-scoped policies",
              group, len(table_scoped), len(file_scoped))
@@ -313,14 +328,16 @@ def provision_principal_role(
     sub: str,
     expires_at: datetime,
 ) -> tuple[str, str]:
-    """Create/rotate the principal's LOGIN role; returns (role, password).
+    """Mint a fresh per-vend LOGIN role for the principal; returns
+    (role, password).
 
-    Re-vend rotates the password and advances VALID UNTIL — an earlier
-    response's password stops working for *new* connections (documented;
-    clients connect right after vending). The plaintext is never stored;
-    PG keeps the SCRAM verifier.
+    Each vend gets its own nonce-suffixed role + password + VALID UNTIL, so
+    concurrent vends for the same principal never invalidate each other's
+    just-returned secret (the old shared-role ALTER PASSWORD raced). All of
+    a principal's vend-roles map to the same principal_sub and are GC'd by
+    expiry. The plaintext is never stored; PG keeps the SCRAM verifier.
     """
-    role = principal_role_name(sub)
+    role = principal_role_name(sub, secrets.token_hex(3))
     password = secrets.token_hex(24)
     group = settings.reader_group_role
     with catalog.pg_cursor() as cur:

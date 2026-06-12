@@ -214,9 +214,11 @@ bypasses it.
   police, so readers get no grant on them (verified live: granting them
   bypasses every predicate). Write DuckLake-direct with
   `DATA_INLINING_ROW_LIMIT 0` (the proxy's REST path never inlines).
-- Re-vending rotates the password; an earlier response's password stops
-  working for new connections. `VALID UNTIL` is checked at connect time only
-  (same semantics as STS expiry).
+- Each vend mints its own nonce-suffixed role (`duckicelake_p_<sub>_<sha8>_<nonce>`)
+  with its own password + `VALID UNTIL`, so concurrent vends for one
+  principal never invalidate each other's just-returned secret; all map to
+  the same principal and are GC'd by expiry. `VALID UNTIL` is checked at
+  connect time only (same semantics as STS expiry).
 - `ducklake_snapshot_changes` is **not granted** to readers — its
   `changes_made` column embeds qualified table names, which would leak the
   existence of allowlist-hidden tables. Consequence: vended readers can't

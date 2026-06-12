@@ -73,10 +73,22 @@ def dotenv_file_env(path: Path) -> dict[str, str]:
     return out
 
 
+_FILE_CONFIG_APPLIED = False
+
+
 def apply_file_config(cwd: Path | None = None) -> list[str]:
     """Inject file-sourced config into os.environ via setdefault (real
     env always wins; .env beats the TOML). Returns the injected key names
-    — callers/tests can use it to clean up. Safe to call repeatedly."""
+    — callers/tests can use it to clean up.
+
+    The default (no-arg) invocation runs at most once per process — both
+    the server import and load_settings() call it, and re-running would
+    just re-setdefault the same keys. Passing an explicit `cwd` (tests)
+    always runs, so callers can probe different config directories."""
+    global _FILE_CONFIG_APPLIED
+    explicit = cwd is not None
+    if not explicit and _FILE_CONFIG_APPLIED:
+        return []
     cwd = cwd or Path.cwd()
     injected: list[str] = []
     sources: list[dict[str, str]] = []
@@ -92,6 +104,8 @@ def apply_file_config(cwd: Path | None = None) -> list[str]:
             if key not in os.environ:
                 os.environ[key] = value
                 injected.append(key)
+    if not explicit:
+        _FILE_CONFIG_APPLIED = True
     return injected
 
 
