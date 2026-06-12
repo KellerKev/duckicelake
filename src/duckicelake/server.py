@@ -187,7 +187,7 @@ def _file_layer_deny_prefixes(ns: list[str], roles: list[str]) -> list[str] | No
 # Root-key suppression + transparent masking live on Settings
 # (config.py) so they're configurable via env, .env, or duckicelake.toml.
 # Suppression defaults ON: with root keys in client hands, the governance
-# masking layer is bypassable in one line. See GOVERNANCE.md.
+# masking layer is bypassable in one line.
 
 # `DUCKICELAKE_REQUIRE_AUTH=1` fails startup when no OAuth clients are
 # configured — a safety-belt for production deploys so ops can't
@@ -317,7 +317,7 @@ async def oauth_tokens(
 # ---- governance layer (Phase 1, experimental) -------------------------
 # Snowflake-shaped authoring surface + audit. Additive: mounted as its own
 # router so the core Iceberg REST surface above is untouched. No enforcement
-# yet — see GOVERNANCE.md and src/duckicelake/governance.py.
+# yet — see src/duckicelake/governance.py.
 app.include_router(build_governance_router(catalog, settings, auth_cfg))
 
 
@@ -809,7 +809,9 @@ def ducklake_credentials(
 
     Fail-open like the LoadTable path: a governance error degrades to
     unmasked vending (audited as error_unmasked), never a 500. The masking
-    here is cooperative — see GOVERNANCE.md for the boundary.
+    here is cooperative-client masking: a client that queries the base
+    table directly still reads cleartext (file-layer masking is the
+    airtight tier).
     """
     _check_prefix(prefix)
     ns = _parse_namespace(namespace)

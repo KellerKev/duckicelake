@@ -82,11 +82,11 @@ MinIO key pair **by default** (`suppress_root_creds = true`); clients rely
 on vended STS creds (`X-Iceberg-Access-Delegation` on the REST path, the
 `ducklake-credentials` endpoint for DuckLake-direct). Flipping it off
 (`DUCKICELAKE_SUPPRESS_ROOT_CREDS=0` or `suppress_root_creds = false` in
-`duckicelake.toml`) makes the governance masking layer (GOVERNANCE.md)
-bypassable in one line — dev-only. The vended PG DSN is a per-principal
-RLS-governed reader role (Phase 3a) — but the dev stack's trust-auth means
-PG *authentication* is only real under production scram+TLS; see the pg_hba
-recipe in GOVERNANCE.md.
+`duckicelake.toml`) makes the governance masking layer bypassable in one
+line — dev-only. The vended PG DSN is a per-principal RLS-governed reader
+role — but the dev stack's trust-auth means PG *authentication* is only
+real under production scram+TLS; see the pg_hba recipe in
+[OPERATIONS.md](OPERATIONS.md).
 
 **Backup automation.** [OPERATIONS.md](OPERATIONS.md) describes the shape
 (`pg_dump` of `ducklake_*` + `duckicelake_*` schema, S3 versioning, cross-

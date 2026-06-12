@@ -205,7 +205,7 @@ def vend_credentials(
     `principal` (governance) stamps the STS session name so MinIO audit logs
     attribute vended creds to a principal. The Phase 2 hook for *withholding*
     creds from principals who must be masked (coarse, file-granularity) lands
-    with the pre-masked-file work in Phase 4 — see GOVERNANCE.md.
+    with file-layer masking (pre-masked Parquet copies).
     """
     write_prefix = s3.data_prefix  # DuckLake writes everything under this
     read_keys = _keys_from_uris(data_file_uris or [], s3.bucket)

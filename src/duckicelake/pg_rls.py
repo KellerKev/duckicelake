@@ -38,7 +38,7 @@ set breaks the masking views' binder).
 
 Dev honesty: the pixi stack is trust-auth on a unix socket, so anyone can
 connect as any role — the predicates are fully exercised but authentication
-is only enforceable under prod scram+TLS (see GOVERNANCE.md for the pg_hba
+is only enforceable under prod scram+TLS (see OPERATIONS.md for the pg_hba
 recipe). All entry points are fail-open: an RLS setup error must never
 break vending; callers fall back to the owner DSN and audit the fact.
 """
@@ -301,8 +301,8 @@ def _unpolicied_tables(cur) -> list[str]:
           -- Dynamic inlined-data payload tables (ducklake_inlined_data_<id>_<id>)
           -- get NO reader grant: they carry raw row data with no table_id to
           -- police, so granting them would bypass every predicate (verified
-          -- live — inlined inserts leaked through RLS). Consequence, documented
-          -- in GOVERNANCE.md: the vended reader path requires data inlining
+          -- live — inlined inserts leaked through RLS). Consequence: the
+          -- vended reader path requires data inlining
           -- to be off on the write path (the registry ducklake_inlined_data_tables
           -- itself has table_id and is policied normally).
           AND t.table_name NOT LIKE 'ducklake\\_inlined\\_data\\_%'

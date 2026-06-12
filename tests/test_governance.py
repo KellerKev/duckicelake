@@ -4,8 +4,8 @@ Two layers:
   * `test_resolve_*` — pure unit tests over `resolve_effective_policies`,
     no Postgres / MinIO needed (the logic is a pure function).
   * `test_governance_*` — integration tests through the live proxy, mirroring
-    the Phase 1 verification steps in `duckicelake_governance.md`: author a
-    tag + masking policy + attachment + role-grant via REST, then confirm
+    the authoring flow: author a tag + masking policy + attachment +
+    role-grant via REST, then confirm
     the audit trail recorded it and `effective-policies` derives the set.
 """
 from __future__ import annotations

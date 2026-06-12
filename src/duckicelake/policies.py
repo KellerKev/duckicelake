@@ -4,7 +4,7 @@ Turns the Phase 1 governance model into a per-principal *enforcement plan*
 for a table at LoadTable time, and applies that plan to the Iceberg
 TableMetadata the proxy returns.
 
-Enforcement reality (see GOVERNANCE.md): an Iceberg REST client reads the
+Enforcement reality: an Iceberg REST client reads the
 Parquet bytes itself, so the proxy cannot mask bytes by editing metadata
 alone. Phase 2 therefore emits, per principal:
 

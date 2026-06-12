@@ -155,7 +155,7 @@ class Settings:
     s3: S3Settings
     # Omit the root S3 key pair from REST response configs. Default ON:
     # root keys in client hands make the governance masking layer
-    # bypassable in one line (see GOVERNANCE.md). Demos / dev stacks that
+    # bypassable in one line. Demos / dev stacks that
     # want the old convenience set suppress_root_creds = false in
     # duckicelake.toml or DUCKICELAKE_SUPPRESS_ROOT_CREDS=0.
     suppress_root_creds: bool = True
@@ -166,8 +166,8 @@ class Settings:
     # PG row-level security for DuckLake-direct readers: per-principal
     # LOGIN roles in a duckicelake_reader group, RLS policies on the
     # ducklake_* catalog tables. Opt-out flag; under dev trust-auth the
-    # predicates run but authentication is not enforceable (documented
-    # in GOVERNANCE.md).
+    # predicates run but authentication is not enforceable (only real
+    # under production scram+TLS; see OPERATIONS.md for the pg_hba recipe).
     rls_enabled: bool = True
     # NOLOGIN group role carrying all reader grants + RLS targets.
     reader_group_role: str = "duckicelake_reader"

@@ -1,13 +1,12 @@
-"""Phase 1 governance layer — Snowflake-shaped authoring + audit.
+"""Governance authoring + audit — the tag/policy/role model.
 
-This module implements the *foundation* described in
-`duckicelake_governance.md` Phase 1: a complete authoring surface for tags,
-masking / row-access policies, policy attachments, roles, grants and an
-audit trail. **Nothing here enforces anything yet** — no column is masked,
-no row is filtered, no credential is withheld. Enforcement is Phase 2+
-(`policies.py`, STS tightening). Phase 1 deliberately ships only the model
-+ audit so operators get a compliance-reviewable artefact with zero risk to
-existing read/write behaviour.
+This module is the authoring + storage foundation: a complete surface for
+tags, masking / row-access policies, policy attachments, roles, grants and
+an audit trail. It does not enforce anything by itself — enforcement lives
+in `policies.py` (metadata signals + masking views), `masked_export.py`
+(file-layer masking) and `pg_rls.py` (catalog row-level security). Keeping
+authoring separate means the model can be reviewed independently of how any
+particular engine is made to honor it.
 
 Storage follows the established `duckicelake_*` Postgres sidecar convention
 (see `DuckLakeCatalog._ensure_sidecar`): tables are created on demand, keyed

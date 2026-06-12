@@ -305,7 +305,7 @@ def test_ducklake_credentials_masked_vs_privileged(client, settings):
     vended view — transparently for unqualified queries — while alice
     (pii_reader via sidecar grant) gets no view and reads cleartext. The
     qualified base table stays readable: this is the cooperative-client
-    boundary, documented in GOVERNANCE.md."""
+    boundary (file-layer masking is the airtight tier)."""
     ns = _ns("cred")
     _make_table(client, ns, "events")
     _author_demo_policy(client, ns, "events")

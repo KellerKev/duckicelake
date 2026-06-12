@@ -18,7 +18,8 @@ on its DuckDB `search_path` gets masked rows from unqualified queries.
 
 Everything here is fail-open: a governance error must never break a read,
 so every method that touches the catalog logs and degrades to "no view".
-This is cooperative-client masking — see GOVERNANCE.md for the boundary.
+This is cooperative-client masking: a determined client that queries the
+base table directly is not stopped — file-layer masking is the airtight tier.
 """
 from __future__ import annotations
 

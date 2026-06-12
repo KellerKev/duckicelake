@@ -114,7 +114,7 @@ EOF
   echo "   the base rows in step 4 are unchanged. Clients that run the returned"
   echo "   post_attach_sql (SET search_path) get this masking transparently for"
   echo "   unqualified queries. Cooperative boundary: a client that names the"
-  echo "   base table directly still reads cleartext — see GOVERNANCE.md."
+  echo "   base table directly still reads cleartext (cooperative boundary)."
 fi
 
 rm -f "$CFG"
