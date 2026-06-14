@@ -165,6 +165,88 @@ asking. Switch `mask_email` to `"file-layer-masking": true` and the `agent`
 view above is served from **pre-masked Parquet** instead, so even a client
 reading the files directly only ever sees `al***`.
 
+### How row-access policies work
+
+A masking policy rewrites a *column*; a **row-access policy drops whole
+rows**. Its `body` is a boolean **keep-predicate** over the row — a row
+survives only if the predicate is true. Attach it to a **table** (naming
+the columns it reads) or to a **tag** on the table/schema.
+
+**They stack with `AND`.** Add a second policy and a row must satisfy
+*both*. With `eu_only` (`country = 'EU'`) and `min_mrr` (`mrr >= 2000`)
+attached, the proxy nests them ahead of any masking (predicates joined in
+policy-name order):
+
+```sql
+SELECT "id", left("email", 2) || '***' AS "email", …
+FROM (SELECT * FROM "analytics"."customers"
+      WHERE (country = 'EU') AND (mrr >= 2000)) AS "customers"
+```
+
+**The filter sees RAW values, before masking.** Because the predicate runs
+in the inner subquery, you can filter on a column whose output is masked —
+e.g. a policy `body` of `email LIKE '%@work.net'` keeps Carol's row even
+though her `email` comes back as `ca***`. (This matches how a SQL engine's
+row policies see unmasked data.)
+
+**Bypass is per-policy.** Each policy carries its own `unmasked-roles`, so a
+principal can hold the row filter's bypass yet still be column-masked, or
+vice-versa — `analyst_eu` above is unmasked but still EU-only.
+
+### Working with tags & policies
+
+**Change a policy — just re-POST it.** Names are the key; a repeat POST is an
+upsert. Widen who bypasses `mask_email`, or swap its body, with no delete:
+
+```bash
+curl -sX POST $P/masking-policies -H $H -d '{"name":"mask_email","signature":"(val VARCHAR)","body":"regexp_replace(val, ''[^@]+'', ''***'')","unmasked-roles":["pii_reader","support"]}'
+```
+
+The masking view / pre-masked export carries a signature of the mask shape,
+so it **rotates automatically** — the next read picks up the new body; the
+stale view/export is garbage-collected. Re-POSTing an `object-tag` or a
+`policy-attachment` upserts it the same way.
+
+**Delete — detach first (references block the delete).** A policy that's
+still attached, or a tag that's still in use, returns **409**; remove the
+references, then delete:
+
+```bash
+# detach the mask from its tag, THEN delete the policy
+curl -sX DELETE $P/policy-attachments  -H $H -d '{"policy-kind":"masking","policy-name":"mask_email","target-kind":"tag","tag-namespace":"pii","tag-name":"email"}'
+curl -sX DELETE $P/masking-policies/mask_email          # 409 while still attached
+curl -sX DELETE $P/object-tags         -H $H -d '{"object-kind":"column","schema":"analytics","object":"customers","column":"email","tag-namespace":"pii","tag-name":"email"}'
+curl -sX DELETE $P/tags/pii/email                       # 409 while still assigned/attached
+curl -sX DELETE $P/role-grants         -H $H -d '{"role":"pii_reader","principal":"analyst_eu"}'
+curl -sX DELETE $P/object-grants       -H $H -d '{"object-kind":"table","schema":"analytics","object":"customers","privilege":"select","role":"analysts"}'
+```
+
+Detaching a mask, untagging a column, or revoking a grant flips the affected
+reads back to cleartext on the **next** request, and the proxy drops the now-
+stale masking views / pre-masked exports for those tables automatically.
+
+### How policies compose
+
+- **Can one tag carry multiple policies?** Yes — a tag can hold several
+  attachments (a masking policy *and* a row-access policy, or masks for
+  different columns). But **a column resolves to exactly one masking
+  policy**: attaching a second mask that would reach an already-masked
+  column (directly or via a tag) is rejected with **409**. Row-access
+  policies have no such limit — they stack with `AND`.
+- **Tag cascade accumulates.** Tags at schema → table → column *union* (a
+  column-level tag doesn't erase a broader one); a column is governed by
+  every policy on any tag it carries plus any direct column attachment —
+  subject to the one-mask rule.
+- **Masking + row-access compose in one view.** Row filters run first on raw
+  rows; the surviving rows are projected through the column masks. Bypass is
+  evaluated independently per policy.
+- **A principal's effective policy** = their roles (JWT claim ∪ sidecar
+  grants) resolved against the table's tags/policies → at most one mask per
+  column + the `AND` of all non-bypassed row filters. Inspect it live:
+  `GET …/governance/effective-policies?table=analytics.customers&principal=…`
+  returns both the *derived* set and the *enforced* plan (masked columns,
+  row filter, the generated view SQL).
+
 **The model.** Object tags (`pii.email`, hierarchical cascade
 schema → table → column), masking policies + row-access policies (SQL
 bodies with a declarative `unmasked-roles` bypass), policy attachments
@@ -681,8 +763,9 @@ Teardown: `pixi run backends-down`.
 | POST | `/v1/{prefix}/tables/rename` | same-namespace rename |
 | GET / POST / DELETE | `/v1/{prefix}/namespaces/{ns}/views[/{v}]` | view CRUD (SQL stored in DuckLake); `__mask_*` names reserved + hidden from listings |
 | GET | `/v1/{prefix}/namespaces/{ns}/ducklake-credentials` | DuckLake-direct vending: DSN + scoped STS creds + masked view + transparent routing (`?table=`) |
-| POST | `/v1/{prefix}/governance/{tags, object-tags, masking-policies, row-access-policies, policy-attachments, roles, role-grants, object-grants}` | governance authoring (admin-scoped) |
-| GET | `/v1/{prefix}/governance/effective-policies` | derived policy set for `?table=…&principal=…` |
+| POST | `/v1/{prefix}/governance/{tags, object-tags, masking-policies, row-access-policies, policy-attachments, roles, role-grants, object-grants}` | governance authoring (admin-scoped); re-POST = upsert |
+| DELETE | same paths (policies/tags/roles by name in the path; attachments/object-tags/grants by body) | delete / detach / untag / revoke; 409 while still referenced |
+| GET | `/v1/{prefix}/governance/effective-policies` | derived policy set + enforced plan for `?table=…&principal=…` |
 | GET | `/v1/{prefix}/governance/audit` | governance + enforcement audit trail |
 | POST | `/v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` | DuckLake compaction + file cleanup |
 
