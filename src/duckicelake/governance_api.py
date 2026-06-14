@@ -24,6 +24,7 @@ from .governance import (
     ATTACH_TARGETS,
     OBJECT_KINDS,
     POLICY_KINDS,
+    GovernanceConflict,
     GovernanceStore,
 )
 from .policies import PolicyEngine
@@ -100,10 +101,23 @@ def build_governance_router(
     catalog: DuckLakeCatalog,
     settings: Settings,
     auth_cfg: AuthConfig,
+    on_table_policy_change=None,
 ) -> APIRouter:
+    """`on_table_policy_change(ns: list[str], table: str)` (optional) is
+    invoked for each table whose effective policy set changed via a
+    detach/untag, so the server can resync masking views / exports / props."""
     router = APIRouter(prefix="/v1/{prefix}/governance", tags=["governance"])
     store = GovernanceStore(catalog)
     engine = PolicyEngine(store)
+
+    def _resync(affected: list[tuple[str, str]]) -> None:
+        if not on_table_policy_change:
+            return
+        for sch, tbl in affected:
+            try:
+                on_table_policy_change([sch], tbl)
+            except Exception:
+                pass   # best-effort; next read recreates artifacts anyway
 
     def _check_prefix(prefix: str) -> None:
         if prefix != settings.catalog_name:
@@ -123,12 +137,15 @@ def build_governance_router(
         _check_prefix(prefix)
         if req.object_kind not in OBJECT_KINDS:
             raise HTTPException(400, f"object-kind must be one of {sorted(OBJECT_KINDS)}")
-        store.assign_object_tag(
-            _principal(request), object_kind=req.object_kind,
-            schema_name=req.schema_name, object_name=req.object_name,
-            column_name=req.column_name, tag_ns=req.tag_ns, tag_name=req.tag_name,
-            tag_value=req.tag_value,
-        )
+        try:
+            store.assign_object_tag(
+                _principal(request), object_kind=req.object_kind,
+                schema_name=req.schema_name, object_name=req.object_name,
+                column_name=req.column_name, tag_ns=req.tag_ns, tag_name=req.tag_name,
+                tag_value=req.tag_value,
+            )
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
         return {"status": "assigned"}
 
     @router.post("/masking-policies", status_code=200)
@@ -153,12 +170,15 @@ def build_governance_router(
             raise HTTPException(400, f"policy-kind must be one of {sorted(POLICY_KINDS)}")
         if req.target_kind not in ATTACH_TARGETS:
             raise HTTPException(400, f"target-kind must be one of {sorted(ATTACH_TARGETS)}")
-        store.attach_policy(
-            _principal(request), policy_kind=req.policy_kind, policy_name=req.policy_name,
-            target_kind=req.target_kind, tag_ns=req.tag_ns, tag_name=req.tag_name,
-            schema_name=req.schema_name, object_name=req.object_name,
-            column_name=req.column_name, columns=req.columns,
-        )
+        try:
+            store.attach_policy(
+                _principal(request), policy_kind=req.policy_kind, policy_name=req.policy_name,
+                target_kind=req.target_kind, tag_ns=req.tag_ns, tag_name=req.tag_name,
+                schema_name=req.schema_name, object_name=req.object_name,
+                column_name=req.column_name, columns=req.columns,
+            )
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
         return {"status": "attached"}
 
     @router.post("/roles", status_code=200)
@@ -183,6 +203,88 @@ def build_governance_router(
             object_name=req.object_name, privilege=req.privilege, role_name=req.role_name,
         )
         return {"status": "granted"}
+
+    # ---- delete / detach / revoke (mirror the POST surface) -----------
+
+    @router.delete("/masking-policies/{name}", status_code=200)
+    def delete_masking_policy(prefix: str, name: str, request: Request):
+        _check_prefix(prefix)
+        try:
+            if not store.delete_masking_policy(_principal(request), name):
+                raise HTTPException(404, f"masking policy '{name}' not found")
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
+        return {"status": "deleted", "policy": name}
+
+    @router.delete("/row-access-policies/{name}", status_code=200)
+    def delete_row_access_policy(prefix: str, name: str, request: Request):
+        _check_prefix(prefix)
+        try:
+            if not store.delete_row_access_policy(_principal(request), name):
+                raise HTTPException(404, f"row-access policy '{name}' not found")
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
+        return {"status": "deleted", "policy": name}
+
+    @router.delete("/policy-attachments", status_code=200)
+    def detach_policy(prefix: str, req: AttachPolicyRequest, request: Request):
+        _check_prefix(prefix)
+        affected = store.detach_policy(
+            _principal(request), policy_kind=req.policy_kind,
+            policy_name=req.policy_name, target_kind=req.target_kind,
+            tag_ns=req.tag_ns, tag_name=req.tag_name, schema_name=req.schema_name,
+            object_name=req.object_name, column_name=req.column_name,
+        )
+        _resync(affected)
+        return {"status": "detached", "resynced_tables": affected}
+
+    @router.delete("/tags/{tag_ns}/{tag_name}", status_code=200)
+    def delete_tag(prefix: str, tag_ns: str, tag_name: str, request: Request):
+        _check_prefix(prefix)
+        try:
+            if not store.delete_tag(_principal(request), tag_ns, tag_name):
+                raise HTTPException(404, f"tag {tag_ns}.{tag_name} not found")
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
+        return {"status": "deleted", "tag": f"{tag_ns}.{tag_name}"}
+
+    @router.delete("/object-tags", status_code=200)
+    def remove_object_tag(prefix: str, req: AssignObjectTagRequest, request: Request):
+        _check_prefix(prefix)
+        affected = store.remove_object_tag(
+            _principal(request), object_kind=req.object_kind,
+            schema_name=req.schema_name, object_name=req.object_name,
+            column_name=req.column_name, tag_ns=req.tag_ns, tag_name=req.tag_name,
+        )
+        _resync(affected)
+        return {"status": "removed", "resynced_tables": affected}
+
+    @router.delete("/roles/{name}", status_code=200)
+    def delete_role(prefix: str, name: str, request: Request):
+        _check_prefix(prefix)
+        try:
+            if not store.delete_role(_principal(request), name):
+                raise HTTPException(404, f"role '{name}' not found")
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
+        return {"status": "deleted", "role": name}
+
+    @router.delete("/role-grants", status_code=200)
+    def revoke_role(prefix: str, req: RoleGrantRequest, request: Request):
+        _check_prefix(prefix)
+        store.revoke_role(_principal(request), req.role_name, req.principal_sub)
+        return {"status": "revoked", "role": req.role_name,
+                "principal": req.principal_sub}
+
+    @router.delete("/object-grants", status_code=200)
+    def revoke_object_grant(prefix: str, req: ObjectGrantRequest, request: Request):
+        _check_prefix(prefix)
+        store.revoke_object_grant(
+            _principal(request), object_kind=req.object_kind,
+            schema_name=req.schema_name, object_name=req.object_name,
+            privilege=req.privilege, role_name=req.role_name,
+        )
+        return {"status": "revoked"}
 
     @router.get("/effective-policies", status_code=200)
     def effective_policies(prefix: str, table: str, principal: str | None = None):

@@ -314,11 +314,36 @@ async def oauth_tokens(
     )
 
 
-# ---- governance layer (Phase 1, experimental) -------------------------
-# Snowflake-shaped authoring surface + audit. Additive: mounted as its own
-# router so the core Iceberg REST surface above is untouched. No enforcement
-# yet — see src/duckicelake/governance.py.
-app.include_router(build_governance_router(catalog, settings, auth_cfg))
+# ---- governance layer -------------------------------------------------
+# Authoring surface + audit. Additive: mounted as its own router so the core
+# Iceberg REST surface above is untouched. Enforcement lives on the read
+# paths (policies.py / masking_views.py / masked_export.py / pg_rls.py).
+
+def _resync_table_governance(ns: list[str], table: str) -> None:
+    """Detaching a policy / untagging changes a table's policy set, so its
+    masking views + pre-masked exports are now stale and the file-layer
+    interlock properties may no longer apply. Drop them (best-effort) — the
+    next masked read recreates whatever is still needed and re-stamps the
+    properties; if nothing's masked anymore the table is simply clean."""
+    try:
+        masking_view_manager.gc_orphans(ns, table, keep=set())
+    except Exception:
+        log.exception("resync: view gc failed for %s.%s", ns[0], table)
+    try:
+        masked_export_manager.gc_table(ns, table, keep=set())
+    except Exception:
+        log.exception("resync: export gc failed for %s.%s", ns[0], table)
+    try:
+        catalog.upsert_table_properties(ns, table, remove=[
+            "duckicelake.file-layer-masking",
+            "duckicelake.file-layer-bypass-roles"])
+        catalog.invalidate_metadata_cache(ns, table)
+    except Exception:
+        log.exception("resync: property clear failed for %s.%s", ns[0], table)
+
+
+app.include_router(build_governance_router(
+    catalog, settings, auth_cfg, on_table_policy_change=_resync_table_governance))
 
 
 # ---- error handling ---------------------------------------------------
@@ -380,15 +405,23 @@ SUPPORTED_ENDPOINTS = [
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
     # --- Phase 3 governance: DuckLake-direct credential vending ---
     "GET /v1/{prefix}/namespaces/{namespace}/ducklake-credentials",
-    # --- Phase 1 governance layer (experimental) ---
+    # --- governance authoring layer ---
     "POST /v1/{prefix}/governance/tags",
+    "DELETE /v1/{prefix}/governance/tags/{ns}/{name}",
     "POST /v1/{prefix}/governance/object-tags",
+    "DELETE /v1/{prefix}/governance/object-tags",
     "POST /v1/{prefix}/governance/masking-policies",
+    "DELETE /v1/{prefix}/governance/masking-policies/{name}",
     "POST /v1/{prefix}/governance/row-access-policies",
+    "DELETE /v1/{prefix}/governance/row-access-policies/{name}",
     "POST /v1/{prefix}/governance/policy-attachments",
+    "DELETE /v1/{prefix}/governance/policy-attachments",
     "POST /v1/{prefix}/governance/roles",
+    "DELETE /v1/{prefix}/governance/roles/{name}",
     "POST /v1/{prefix}/governance/role-grants",
+    "DELETE /v1/{prefix}/governance/role-grants",
     "POST /v1/{prefix}/governance/object-grants",
+    "DELETE /v1/{prefix}/governance/object-grants",
     "GET /v1/{prefix}/governance/effective-policies",
     "GET /v1/{prefix}/governance/audit",
 ]

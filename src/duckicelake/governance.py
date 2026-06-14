@@ -25,9 +25,15 @@ from typing import Any
 from .catalog import DuckLakeCatalog
 
 
-# Object kinds a tag / policy can target. Mirrors Snowflake's granularity.
+# Object kinds a tag / policy can target.
 OBJECT_KINDS = {"schema", "table", "view", "column"}
 POLICY_KINDS = {"masking", "row_access"}
+
+
+class GovernanceConflict(Exception):
+    """An authoring op that violates a governance invariant — a second mask
+    on a column, or deleting/altering an object that is still referenced.
+    The API maps it to HTTP 409."""
 # Where a policy attachment points: a tag (transitive), a single column, or
 # a whole table (row-access on a column-list).
 ATTACH_TARGETS = {"tag", "column", "table"}
@@ -320,9 +326,10 @@ def resolve_effective_policies(
         "column_masks": column_masks,
         "row_access_policies": row_policies,
         "note": (
-            "Phase 1 governance: this is the *derived* policy set for the "
-            "principal. No masking or row filtering is enforced yet "
-            "(enforcement is Phase 2+)."
+            "The derived governance policy set for this principal on this "
+            "table. The proxy enforces it on every read — see the "
+            "`enforcement` field for the masked columns, row filter, and "
+            "masking-view SQL actually applied."
         ),
     }
 
@@ -442,6 +449,16 @@ class GovernanceStore:
     def assign_object_tag(self, principal: str, *, object_kind: str,
                           schema_name: str, object_name: str, column_name: str,
                           tag_ns: str, tag_name: str, tag_value: str | None) -> None:
+        # If this tag already carries a masking policy, assigning it must not
+        # give any newly-tagged column a second mask (one-mask-per-column).
+        with self.catalog.pg_cursor(autocommit=False) as cur:
+            ensure_governance_sidecars(cur)
+            tag_masks = self._masking_policies_on_tag(cur, tag_ns, tag_name)
+        if tag_masks:
+            affected = self._expand_tag_rows(
+                [(object_kind, schema_name, object_name, column_name)])
+            for p in tag_masks:
+                self._assert_columns_unmasked(affected, p)
         with self.catalog.pg_cursor() as cur:
             ensure_governance_sidecars(cur)
             cur.execute(
@@ -522,6 +539,19 @@ class GovernanceStore:
                       tag_name: str | None = None, schema_name: str | None = None,
                       object_name: str | None = None, column_name: str | None = None,
                       columns: list[str] | None = None) -> None:
+        # One-mask-per-column invariant: reject a masking attachment that
+        # would give any column a second (different) mask. Checked before
+        # the insert; re-attaching the same policy is fine (excluded).
+        if policy_kind == "masking":
+            if target_kind == "column":
+                affected = [(schema_name, object_name, column_name)]
+            elif target_kind == "tag":
+                with self.catalog.pg_cursor(autocommit=False) as cur:
+                    affected = self._columns_carrying_tag(cur, tag_ns, tag_name)
+            else:
+                affected = []
+            if affected:
+                self._assert_columns_unmasked(affected, policy_name)
         with self.catalog.pg_cursor() as cur:
             ensure_governance_sidecars(cur)
             cur.execute(
@@ -592,6 +622,175 @@ class GovernanceStore:
                        object_=target,
                        detail={"privilege": privilege, "role": role_name})
 
+    # -- delete / detach / revoke ----------------------------------------
+    # Deletes refuse while the object is still referenced (409 via
+    # GovernanceConflict); the caller detaches/untags/revokes first. Methods
+    # whose effect changes a *table's* policy set return the affected
+    # (schema, table) pairs so the server can resync masking artifacts.
+
+    def delete_masking_policy(self, principal: str, name: str) -> int:
+        return self._delete_policy("duckicelake_masking_policy", "masking",
+                                   "delete_masking_policy", principal, name)
+
+    def delete_row_access_policy(self, principal: str, name: str) -> int:
+        return self._delete_policy("duckicelake_row_access_policy", "row_access",
+                                   "delete_row_access_policy", principal, name)
+
+    def _delete_policy(self, table: str, kind: str, op: str,
+                       principal: str, name: str) -> int:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "SELECT count(*) FROM public.duckicelake_policy_attachment "
+                "WHERE policy_kind = %s AND policy_name = %s", (kind, name))
+            attached = cur.fetchone()[0]
+            if attached:
+                raise GovernanceConflict(
+                    f"policy '{name}' is still attached to {attached} target(s) "
+                    f"— detach it before deleting")
+            cur.execute(f"DELETE FROM public.{table} WHERE name = %s", (name,))
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation=op, object_=name)
+            return deleted
+
+    def detach_policy(self, principal: str, *, policy_kind: str, policy_name: str,
+                      target_kind: str, tag_ns: str | None = None,
+                      tag_name: str | None = None, schema_name: str | None = None,
+                      object_name: str | None = None, column_name: str | None = None,
+                      ) -> list[tuple[str, str]]:
+        affected = self._attachment_affected_tables(
+            target_kind, tag_ns, tag_name, schema_name, object_name)
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                """
+                DELETE FROM public.duckicelake_policy_attachment
+                WHERE policy_kind = %s AND policy_name = %s AND target_kind = %s
+                  AND COALESCE(tag_ns,'')      = COALESCE(%s,'')
+                  AND COALESCE(tag_name,'')    = COALESCE(%s,'')
+                  AND COALESCE(schema_name,'') = COALESCE(%s,'')
+                  AND COALESCE(object_name,'') = COALESCE(%s,'')
+                  AND COALESCE(column_name,'') = COALESCE(%s,'')
+                """,
+                (policy_kind, policy_name, target_kind, tag_ns, tag_name,
+                 schema_name, object_name, column_name),
+            )
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation="detach_policy",
+                           object_=policy_name,
+                           detail={"policy_kind": policy_kind,
+                                   "target_kind": target_kind})
+        return affected if deleted else []
+
+    def remove_object_tag(self, principal: str, *, object_kind: str,
+                          schema_name: str, object_name: str, column_name: str,
+                          tag_ns: str, tag_name: str) -> list[tuple[str, str]]:
+        affected = sorted({(s, t) for s, t, _ in self._expand_tag_rows(
+            [(object_kind, schema_name, object_name, column_name)])})
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                """
+                DELETE FROM public.duckicelake_object_tag
+                WHERE object_kind = %s AND schema_name = %s AND object_name = %s
+                  AND column_name = %s AND tag_ns = %s AND tag_name = %s
+                """,
+                (object_kind, schema_name, object_name, column_name,
+                 tag_ns, tag_name),
+            )
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation="remove_object_tag",
+                           object_=".".join(p for p in (schema_name, object_name,
+                                                        column_name) if p),
+                           detail={"tag": f"{tag_ns}.{tag_name}"})
+        return affected if deleted else []
+
+    def delete_tag(self, principal: str, tag_ns: str, tag_name: str) -> int:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute("SELECT count(*) FROM public.duckicelake_object_tag "
+                        "WHERE tag_ns = %s AND tag_name = %s", (tag_ns, tag_name))
+            uses = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM public.duckicelake_policy_attachment "
+                        "WHERE target_kind = 'tag' AND tag_ns = %s AND tag_name = %s",
+                        (tag_ns, tag_name))
+            atts = cur.fetchone()[0]
+            if uses or atts:
+                raise GovernanceConflict(
+                    f"tag {tag_ns}.{tag_name} is still in use "
+                    f"({uses} assignment(s), {atts} attachment(s)) — remove those first")
+            cur.execute("DELETE FROM public.duckicelake_tag "
+                        "WHERE tag_ns = %s AND tag_name = %s", (tag_ns, tag_name))
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation="delete_tag",
+                           object_=f"{tag_ns}.{tag_name}")
+            return deleted
+
+    def delete_role(self, principal: str, role_name: str) -> int:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute("SELECT count(*) FROM public.duckicelake_role_grant "
+                        "WHERE role_name = %s", (role_name,))
+            grants = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM public.duckicelake_object_grant "
+                        "WHERE role_name = %s", (role_name,))
+            ogrants = cur.fetchone()[0]
+            if grants or ogrants:
+                raise GovernanceConflict(
+                    f"role '{role_name}' is still granted "
+                    f"({grants} principal grant(s), {ogrants} object grant(s)) "
+                    f"— revoke those first")
+            cur.execute("DELETE FROM public.duckicelake_role WHERE role_name = %s",
+                        (role_name,))
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation="delete_role",
+                           object_=role_name)
+            return deleted
+
+    def revoke_role(self, principal: str, role_name: str, principal_sub: str) -> int:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute("DELETE FROM public.duckicelake_role_grant "
+                        "WHERE role_name = %s AND principal_sub = %s",
+                        (role_name, principal_sub))
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation="revoke_role",
+                           object_=role_name, detail={"grantee": principal_sub})
+            return deleted
+
+    def revoke_object_grant(self, principal: str, *, object_kind: str,
+                            schema_name: str, object_name: str, privilege: str,
+                            role_name: str) -> int:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "DELETE FROM public.duckicelake_object_grant "
+                "WHERE object_kind = %s AND schema_name = %s AND object_name = %s "
+                "AND privilege = %s AND role_name = %s",
+                (object_kind, schema_name, object_name, privilege, role_name))
+            deleted = cur.rowcount
+            if deleted:
+                self.audit(cur, principal=principal, operation="revoke_object_grant",
+                           object_=".".join(p for p in (schema_name, object_name) if p),
+                           detail={"privilege": privilege, "role": role_name})
+            return deleted
+
+    def _attachment_affected_tables(self, target_kind, tag_ns, tag_name,
+                                    schema_name, object_name) -> list[tuple[str, str]]:
+        if target_kind == "tag":
+            with self.catalog.pg_cursor(autocommit=False) as cur:
+                cols = self._columns_carrying_tag(cur, tag_ns, tag_name)
+            return sorted({(s, t) for s, t, _ in cols})
+        if target_kind in ("column", "table") and schema_name and object_name:
+            return [(schema_name, object_name)]
+        return []
+
     def roles_for_principal(self, principal_sub: str) -> list[str]:
         with self.catalog.pg_cursor(autocommit=False) as cur:
             ensure_governance_sidecars(cur)
@@ -627,6 +826,7 @@ class GovernanceStore:
             FROM public.duckicelake_object_tag
             WHERE schema_name = %s
               AND (object_kind = 'schema' OR object_name = %s)
+            ORDER BY object_kind, object_name, column_name, tag_ns, tag_name
             """,
             (schema, table),
         )
@@ -641,6 +841,8 @@ class GovernanceStore:
             SELECT policy_kind, policy_name, target_kind, tag_ns, tag_name,
                    schema_name, object_name, column_name, columns
             FROM public.duckicelake_policy_attachment
+            ORDER BY policy_kind, policy_name, target_kind,
+                     tag_ns, tag_name, schema_name, object_name, column_name
             """
         )
         cols = ["policy_kind", "policy_name", "target_kind", "tag_ns", "tag_name",
@@ -688,3 +890,76 @@ class GovernanceStore:
             "masking_bodies": masking_bodies,
             "row_bodies": row_bodies,
         }
+
+    # -- one-mask-per-column invariant -----------------------------------
+
+    def _masks_by_column(self, schema: str, table: str) -> dict[str, set[str]]:
+        """Masking-policy names currently reaching each column of a table
+        (via tags or direct attachment), independent of any principal."""
+        inp = self.resolution_inputs(schema, table)
+        derived = resolve_effective_policies(
+            principal="__invariant__", schema=schema, table=table,
+            columns=inp["columns"], roles_for_principal=[],
+            object_tags=inp["object_tags"], attachments=inp["attachments"],
+            masking_bodies=inp["masking_bodies"], row_bodies=inp["row_bodies"],
+        )
+        return {c["column"]: {p["name"] for p in c["masking_policies"]}
+                for c in derived["column_masks"]}
+
+    def _table_columns(self, schema: str, table: str) -> list[str]:
+        try:
+            return [c.name for c in self.catalog.get_columns([schema], table)]
+        except Exception:
+            return []   # table doesn't exist yet → nothing to mask
+
+    def _assert_columns_unmasked(self, affected: list[tuple[str, str, str]],
+                                 policy_name: str) -> None:
+        """409 if any (schema, table, column) already carries a masking
+        policy other than `policy_name` — a column may have only one mask."""
+        from collections import defaultdict
+        by_table: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for sch, tbl, col in affected:
+            by_table[(sch, tbl)].append(col)
+        for (sch, tbl), cols in by_table.items():
+            masks = self._masks_by_column(sch, tbl)
+            for col in cols:
+                others = masks.get(col, set()) - {policy_name}
+                if others:
+                    raise GovernanceConflict(
+                        f"column {sch}.{tbl}.{col} is already masked by policy "
+                        f"'{sorted(others)[0]}'; a column may have only one "
+                        f"masking policy — detach the existing one first"
+                    )
+
+    def _columns_carrying_tag(self, cur, tag_ns: str, tag_name: str
+                              ) -> list[tuple[str, str, str]]:
+        """Every (schema, table, column) the tag currently reaches, expanding
+        schema/table-level assignments to their columns."""
+        cur.execute(
+            "SELECT object_kind, schema_name, object_name, column_name "
+            "FROM public.duckicelake_object_tag "
+            "WHERE tag_ns = %s AND tag_name = %s",
+            (tag_ns, tag_name),
+        )
+        return self._expand_tag_rows(cur.fetchall())
+
+    def _expand_tag_rows(self, rows) -> list[tuple[str, str, str]]:
+        out: list[tuple[str, str, str]] = []
+        for kind, sch, obj, col in rows:
+            if kind == "column":
+                out.append((sch, obj, col))
+            elif kind == "table":
+                out += [(sch, obj, c) for c in self._table_columns(sch, obj)]
+            elif kind == "schema":
+                for (_s, tbl) in self.catalog.list_tables([sch]):
+                    out += [(sch, tbl, c) for c in self._table_columns(sch, tbl)]
+        return out
+
+    def _masking_policies_on_tag(self, cur, tag_ns: str, tag_name: str) -> list[str]:
+        cur.execute(
+            "SELECT policy_name FROM public.duckicelake_policy_attachment "
+            "WHERE policy_kind = 'masking' AND target_kind = 'tag' "
+            "AND tag_ns = %s AND tag_name = %s",
+            (tag_ns, tag_name),
+        )
+        return [r[0] for r in cur.fetchall()]

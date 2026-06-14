@@ -30,10 +30,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 
 from .governance import GovernanceStore, resolve_effective_policies
+
+log = logging.getLogger("duckicelake.policies")
 
 
 _VAL_TOKEN = re.compile(r"\bval\b")
@@ -147,23 +150,40 @@ def build_plan(
                            table=table, columns=list(columns))
 
     for col in derived["column_masks"]:
-        for pol in col["masking_policies"]:
-            body = masking_bodies.get(pol["name"], {})
-            if _bypasses(roles, body.get("unmasked_roles")):
-                continue
-            expr = _qualify_expr(body.get("body", "NULL"), col["column"])
-            plan.masks.append(MaskDecision(
-                column=col["column"],
-                policy_name=pol["name"],
-                mask_expr=expr,
-                doc=f"[masked by policy '{pol['name']}' — principal lacks an unmasked role]",
-            ))
-            if body.get("file_layer_masking"):
-                plan.file_layer = True
-                for r in body.get("unmasked_roles") or []:
-                    if r not in plan.file_layer_bypass:
-                        plan.file_layer_bypass.append(r)
-            break   # one mask per column is enough; first applicable wins
+        # A column resolves to exactly one masking policy — the authoring
+        # layer rejects a second mask on a column (409). This is the read-path
+        # safety net: pick the non-bypassed policy with the lowest name so the
+        # outcome is deterministic even if two ever coexist (legacy data), and
+        # warn loudly. (Read path stays fail-open — never raises.)
+        applicable = sorted(
+            (pol for pol in col["masking_policies"]
+             if not _bypasses(roles, masking_bodies.get(pol["name"], {})
+                              .get("unmasked_roles"))),
+            key=lambda p: p["name"],
+        )
+        if not applicable:
+            continue
+        if len(applicable) > 1:
+            log.warning(
+                "column %s.%s.%s resolves to %d masking policies %s — "
+                "applying %r (lowest name); authoring should have rejected this",
+                schema, table, col["column"], len(applicable),
+                [p["name"] for p in applicable], applicable[0]["name"],
+            )
+        pol = applicable[0]
+        body = masking_bodies.get(pol["name"], {})
+        expr = _qualify_expr(body.get("body", "NULL"), col["column"])
+        plan.masks.append(MaskDecision(
+            column=col["column"],
+            policy_name=pol["name"],
+            mask_expr=expr,
+            doc=f"[masked by policy '{pol['name']}' — principal lacks an unmasked role]",
+        ))
+        if body.get("file_layer_masking"):
+            plan.file_layer = True
+            for r in body.get("unmasked_roles") or []:
+                if r not in plan.file_layer_bypass:
+                    plan.file_layer_bypass.append(r)
 
     predicates: list[str] = []
     for rp in derived["row_access_policies"]:
