@@ -113,6 +113,12 @@ masked_export_manager = MaskedExportManager(catalog, settings,
                                             store=governance_store,
                                             view_manager=masking_view_manager)
 
+#: Set True once lifespan `ensure_rls` succeeds. When `rls_enabled` is on
+#: but this stays False (RLS DDL failed at startup), ducklake-credentials
+#: fails CLOSED — it refuses to vend rather than hand out the owning,
+#: RLS-bypassing DSN.
+_rls_ready = False
+
 
 #: Table-property namespace reserved for proxy-stamped governance state
 #: (masking signals, the file-layer RLS interlock, format-version). Client
@@ -146,6 +152,18 @@ def _reject_reserved_property_keys(keys) -> None:
         )
 
 
+def _audit_credentials_denied(sub: str, ns: list[str], table: str | None,
+                              decision: str) -> None:
+    """Best-effort audit of a fail-closed credential denial."""
+    try:
+        governance_store.audit_load(
+            principal=sub, object_=f"{ns[0]}.{table or '*'}",
+            masked_cols=[], applied_policies=[], row_filtered=False,
+            operation="ducklake_credentials", decision=decision, detail={})
+    except Exception:
+        log.exception("audit of credential denial failed")
+
+
 def _ensure_file_layer_properties(ns: list[str], table: str, plan) -> None:
     """Write the Phase-3a interlock properties so RLS hides base file rows
     from non-bypass principals. Best-effort — the masked-prefix credential
@@ -166,22 +184,19 @@ def _file_layer_deny_prefixes(ns: list[str], roles: list[str]) -> list[str] | No
     """For namespace-level vending: base prefixes of file-layer tables the
     principal is masked on (Deny beats the namespace Allow). Enumerates
     *every* table in the namespace — not just already-exported ones — so a
-    file-layer table that no principal has materialized yet is still
-    carved out (its base bytes must never be vended raw). `roles` is the
-    caller's already-resolved JWT∪sidecar union. Best-effort — None on any
-    error (RLS still hides the file rows for the reader-role path)."""
-    try:
-        tables = [t for (_s, t) in catalog.list_tables(ns)]
-        deny: list[str] = []
-        for t in tables:
-            plan = policy_engine.plan_for(principal="__deny_probe__",
-                                          roles=roles, schema=ns[0], table=t)
-            if plan.file_layer and not plan.is_empty():
-                deny.append(settings.s3.table_prefix(ns[0], t))
-        return deny or None
-    except Exception:
-        log.exception("file-layer deny-prefix scan failed for %s", ns[0])
-        return None
+    file-layer table that no principal has materialized yet is still carved
+    out (its base bytes must never be vended raw). `roles` is the caller's
+    already-resolved JWT∪sidecar union. Returns None when there's simply
+    nothing to deny; **raises** on any error so the caller fails CLOSED
+    (we must never vend a namespace-wide grant we couldn't fully scope)."""
+    tables = [t for (_s, t) in catalog.list_tables(ns)]
+    deny: list[str] = []
+    for t in tables:
+        plan = policy_engine.plan_for(principal="__deny_probe__",
+                                      roles=roles, schema=ns[0], table=t)
+        if plan.file_layer and not plan.is_empty():
+            deny.append(settings.s3.table_prefix(ns[0], t))
+    return deny or None
 
 
 # Root-key suppression + transparent masking live on Settings
@@ -208,14 +223,18 @@ async def lifespan(app: FastAPI):
     catalog.connect()
     log.info("DuckLake catalog connected: %s", settings.ducklake_uri)
     # Phase 3a: reader role + RLS on the ducklake_* catalog tables for
-    # vended DuckLake-direct credentials. Fail-open — an RLS setup error
-    # must never stop the proxy; vending degrades to the owner DSN.
+    # vended DuckLake-direct credentials. An RLS setup error never stops
+    # the proxy, but it does arm the fail-CLOSED gate: if RLS isn't ready,
+    # ducklake-credentials refuses to vend rather than handing out the
+    # owning (RLS-bypassing) DSN.
+    global _rls_ready
     if settings.rls_enabled:
         try:
             ensure_rls(catalog, settings)
+            _rls_ready = True
         except Exception:
             log.exception("RLS setup failed — ducklake-credentials will "
-                          "vend the owner DSN")
+                          "REFUSE to vend (fail-closed) until RLS is armed")
     # Eager DuckLake-to-Iceberg materialisation listener. Elects one
     # worker via PG advisory lock; the others poll the lock so they take
     # over if the elected worker dies. See src/duckicelake/notify.py.
@@ -877,10 +896,19 @@ def ducklake_credentials(
     }
 
     # Phase 3a: vend a per-principal RLS-governed reader role instead of
-    # the owning DSN. Failure degrades to the owner DSN (current behavior)
-    # and is flagged in the audit detail — never blocks vending.
+    # the owning DSN. FAIL CLOSED: when RLS is enabled but isn't armed
+    # (startup DDL failed) or the reader role can't be provisioned, we
+    # refuse — handing out the owning (RLS-bypassing) DSN would expose the
+    # whole catalog. Only when rls_enabled is False (operator opt-out, dev)
+    # do we vend the owner DSN by design.
     reader_dsn_ok = False
     if settings.rls_enabled:
+        if not _rls_ready:
+            _audit_credentials_denied(sub, ns, table, "error_rls_not_armed")
+            raise HTTPException(
+                status_code=503,
+                detail="row-level security is not armed; refusing to vend "
+                       "DuckLake credentials (fail-closed)")
         try:
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=clamped)
             pg_role, pg_password = provision_principal_role(
@@ -896,14 +924,20 @@ def ducklake_credentials(
             reader_dsn_ok = True
             gc_expired_roles(catalog)
         except Exception:
-            log.exception("reader-role provisioning failed for %s — "
-                          "vending owner DSN", sub)
+            log.exception("reader-role provisioning failed for %s — refusing "
+                          "to vend the owner DSN (fail-closed)", sub)
+            _audit_credentials_denied(sub, ns, table, "error_reader_role_failed")
+            raise HTTPException(
+                status_code=503,
+                detail="could not provision an RLS reader role; refusing to "
+                       "vend (fail-closed)")
 
     decision = "ok"
     masked_cols: list[str] = []
     applied: list[str] = []
     row_filtered = False
     export = None
+    file_layer_required = False
     roles: list[str] = list(claims.get("roles") or [])
     try:
         roles = sorted(
@@ -918,6 +952,7 @@ def ducklake_credentials(
                 masked_cols = plan.masked_columns
                 applied = plan.applied_policies
                 row_filtered = plan.row_filter is not None
+                file_layer_required = plan.file_layer
                 if plan.file_layer:
                     # Phase 4: materialize (or reuse) the masked Parquet
                     # export; on failure fall back to a possibly-stale
@@ -956,6 +991,15 @@ def ducklake_credentials(
                       "— vending unmasked", ns[0], table)
         decision = "error_unmasked"
 
+    # FAIL CLOSED: a file-layer-masked principal whose export couldn't be
+    # materialized must not be vended base-prefix creds. Refuse.
+    if file_layer_required and export is None:
+        _audit_credentials_denied(sub, ns, table, "error_file_layer_denied")
+        raise HTTPException(
+            status_code=503,
+            detail=(f"file-layer masking for {ns[0]}.{table} could not be "
+                    f"materialized; refusing to vend base credentials"))
+
     s3 = settings.s3
     deny_prefixes: list[str] | None = None
     if table is not None:
@@ -971,8 +1015,19 @@ def ducklake_credentials(
     else:
         read_prefixes = [f"{s3.data_prefix}{ns[0]}/"]
         # the namespace allow covers every table's base prefix — carve out
-        # the file-layer-masked tables this principal must not read raw
-        deny_prefixes = _file_layer_deny_prefixes(ns, roles)
+        # the file-layer-masked tables this principal must not read raw.
+        # FAIL CLOSED: if we can't compute the carve-outs, refuse the
+        # namespace-wide vend rather than grant unscoped base access.
+        try:
+            deny_prefixes = _file_layer_deny_prefixes(ns, roles)
+        except Exception:
+            log.exception("file-layer deny-prefix scan failed for %s — "
+                          "refusing namespace-wide vend (fail-closed)", ns[0])
+            _audit_credentials_denied(sub, ns, None, "error_deny_scan_failed")
+            raise HTTPException(
+                status_code=503,
+                detail="could not compute file-layer credential carve-outs; "
+                       "refusing namespace-wide vend (fail-closed)")
     try:
         creds = vend_credentials(
             s3,
@@ -1686,6 +1741,7 @@ def _build_load_response(
     # governed. Wrapped defensively: governance must never break a read.
     principal_for_creds: str | None = None
     file_layer_export = None
+    file_layer_required = False
     if principal_claims is not None:
         principal_for_creds = principal_claims.get("sub") or "anonymous"
         try:
@@ -1702,6 +1758,7 @@ def _build_load_response(
                 schema=ns[0], table=table,
             )
             if not plan.is_empty():
+                file_layer_required = plan.file_layer
                 metadata = apply_plan_to_metadata(metadata, plan)
                 # Phase 4: file-layer plans get masked Parquet exports + SHADOW
                 # metadata pointing at them — every Iceberg reader (incl. the
@@ -1751,6 +1808,27 @@ def _build_load_response(
             log.exception("governance enforcement failed for %s.%s — serving unmasked",
                           ns[0], table)
             file_layer_export = None
+
+        # FAIL CLOSED for the airtight tier: a file-layer-masked principal
+        # whose masked export / shadow metadata could not be materialized
+        # must NOT fall through to base metadata + base-prefix creds. Deny
+        # the read rather than leak raw bytes. (The catalog-level cooperative
+        # tier keeps serving advisory signals + base creds — that's only
+        # reached when plan.file_layer is False.)
+        if file_layer_required and file_layer_export is None:
+            try:
+                governance_store.audit_load(
+                    principal=principal_for_creds, object_=f"{ns[0]}.{table}",
+                    masked_cols=[], applied_policies=[], row_filtered=False,
+                    operation="load_table", decision="error_file_layer_denied",
+                    detail={"file_layer": True})
+            except Exception:
+                log.exception("audit of file-layer denial failed")
+            raise HTTPException(
+                status_code=503,
+                detail=(f"file-layer masking for {ns[0]}.{table} could not be "
+                        f"materialized; refusing to serve base data"),
+            )
 
     config_out: dict[str, str] = _base_s3_config()
     if _wants_vended_credentials(delegation_header) and file_layer_export is not None:
