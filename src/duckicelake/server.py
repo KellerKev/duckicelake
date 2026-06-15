@@ -38,7 +38,12 @@ from .masking_views import (
     MaskingViewManager,
 )
 from .governance_api import build_governance_router
-from .pg_rls import ensure_rls, gc_expired_roles, provision_principal_role
+from .pg_rls import (
+    ensure_rls,
+    gc_expired_roles,
+    provision_principal_role,
+    rearm_rls_if_needed,
+)
 from .policies import PolicyEngine, apply_plan_to_metadata, mask_signature
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
@@ -619,6 +624,8 @@ def create_table(
 
     ddl, _last_id = schema_to_columns_ddl(req.schema_)
     catalog.create_table(ns, req.name, ddl)
+    if settings.rls_enabled and _rls_ready:
+        rearm_rls_if_needed(catalog, settings)   # cover any new ducklake_* tables
     return _build_load_response(
         ns, req.name,
         properties=req.properties,
@@ -902,6 +909,10 @@ def ducklake_credentials(
     # whole catalog. Only when rls_enabled is False (operator opt-out, dev)
     # do we vend the owner DSN by design.
     reader_dsn_ok = False
+    if settings.rls_enabled and _rls_ready:
+        # Close the A1 gap: re-arm RLS if a ducklake_* table appeared since
+        # startup and isn't yet granted/policied (cheap no-op otherwise).
+        rearm_rls_if_needed(catalog, settings)
     if settings.rls_enabled:
         if not _rls_ready:
             _audit_credentials_denied(sub, ns, table, "error_rls_not_armed")

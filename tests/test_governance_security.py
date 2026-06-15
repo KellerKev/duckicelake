@@ -85,3 +85,57 @@ def test_catalog_level_still_fails_open(client, settings):
     r = client.get(f"/v1/lake/namespaces/{ns}/tables/events")
     assert r.status_code == 200, r.text
     assert r.json()["metadata"]["properties"]["duckicelake.masked-columns"] == "email"
+
+
+# ---- Stage B: RLS grant lockdown -------------------------------------------
+
+import psycopg
+from psycopg import sql as _sql
+
+from test_governance_phase3 import direct_catalog  # noqa: F401,E402
+from duckicelake import pg_rls  # noqa: E402
+
+
+def test_files_scheduled_for_deletion_not_granted(client, settings, direct_catalog):
+    """L4: the deletion queue exposes base data-file paths of hidden tables;
+    the reader group must not be granted it, and a reader can't SELECT it."""
+    pg_rls.ensure_rls(direct_catalog, settings)
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT count(*) FROM information_schema.role_table_grants
+            WHERE grantee=%s AND table_schema='public'
+              AND table_name='ducklake_files_scheduled_for_deletion'
+        """, (settings.reader_group_role,))
+        assert cur.fetchone()[0] == 0, "deletion queue must not be granted to readers"
+
+    from datetime import datetime, timedelta, timezone
+    role, pw = pg_rls.provision_principal_role(
+        direct_catalog, settings, "leaktest",
+        datetime.now(timezone.utc) + timedelta(hours=1))
+    with psycopg.connect(settings.pg_dsn_for(role, pw), autocommit=True) as c, c.cursor() as cur:
+        try:
+            cur.execute("SELECT * FROM public.ducklake_files_scheduled_for_deletion")
+            assert False, "reader should not be able to read the deletion queue"
+        except psycopg.errors.InsufficientPrivilege:
+            pass
+
+
+def test_rearm_closes_coverage_gap(client, settings, direct_catalog):
+    """A1: a ducklake_* table lacking a reader grant (simulating one created
+    after startup) is re-granted+policied by rearm_rls_if_needed."""
+    pg_rls.ensure_rls(direct_catalog, settings)
+    grp = settings.reader_group_role
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        # simulate a post-startup gap: revoke the grant on a policied table
+        cur.execute(_sql.SQL("REVOKE SELECT ON public.ducklake_table FROM {}")
+                    .format(_sql.Identifier(grp)))
+        cur.execute("""SELECT count(*) FROM information_schema.role_table_grants
+                       WHERE grantee=%s AND table_name='ducklake_table'""", (grp,))
+        assert cur.fetchone()[0] == 0
+    assert pg_rls.rearm_rls_if_needed(direct_catalog, settings) is True
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("""SELECT count(*) FROM information_schema.role_table_grants
+                       WHERE grantee=%s AND table_name='ducklake_table'""", (grp,))
+        assert cur.fetchone()[0] == 1, "rearm should restore the grant"
+    # no gap now → no-op
+    assert pg_rls.rearm_rls_if_needed(direct_catalog, settings) is False

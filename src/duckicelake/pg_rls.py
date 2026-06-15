@@ -240,14 +240,17 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
             cur.execute(sql.SQL("GRANT SELECT ON public.{} TO {}").format(
                 sql.Identifier(name), sql.Identifier(group)))
 
-        # Heal any historical over-grant on inlined-data payload tables and
-        # the name-leaking snapshot_changes table (see _unpolicied_tables).
+        # Heal any historical over-grant on the never-grant tables:
+        # inlined-data payloads (raw rows, no table_id to police), the
+        # name-leaking snapshot_changes, and files_scheduled_for_deletion
+        # (base data-file paths of hidden tables). See _unpolicied_tables.
         cur.execute("""
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
               AND ((table_name LIKE 'ducklake\\_inlined\\_data\\_%'
                     AND table_name <> 'ducklake_inlined_data_tables')
-                   OR table_name = 'ducklake_snapshot_changes')
+                   OR table_name = 'ducklake_snapshot_changes'
+                   OR table_name = 'ducklake_files_scheduled_for_deletion')
         """)
         for (name,) in cur.fetchall():
             cur.execute(sql.SQL("REVOKE SELECT ON public.{} FROM {}").format(
@@ -288,6 +291,44 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
              group, len(table_scoped), len(file_scoped))
 
 
+def rearm_rls_if_needed(catalog: DuckLakeCatalog, settings: Settings) -> bool:
+    """`ensure_rls` runs once at startup and grants/policies per-table, so a
+    `ducklake_*` table created LATER (e.g. a DuckLake version introducing a
+    new system table) would be unpolicied. This cheap guard — one
+    information_schema query — re-arms RLS only when such a coverage gap
+    exists: a `ducklake_*` base table that is neither granted to the reader
+    group nor on the intentional never-grant list. Best-effort; returns True
+    if it re-armed. (New *user* tables don't need this — their rows land in
+    the already-policied ducklake_data_file/_table.)"""
+    group = settings.reader_group_role
+    try:
+        with catalog.pg_cursor(autocommit=False) as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (group,))
+            if cur.fetchone() is None:
+                return False   # RLS never armed; ensure_rls (startup) owns that
+            # %% — this query binds a param, so literal % must be doubled.
+            cur.execute("""
+                SELECT count(*) FROM information_schema.tables t
+                WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+                  AND t.table_name LIKE 'ducklake\\_%%'
+                  AND t.table_name NOT LIKE 'ducklake\\_inlined\\_data\\_%%'
+                  AND t.table_name NOT IN ('ducklake_snapshot_changes',
+                                           'ducklake_files_scheduled_for_deletion')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.role_table_grants g
+                    WHERE g.grantee = %s AND g.table_schema = 'public'
+                      AND g.table_name = t.table_name)
+            """, (group,))
+            gap = cur.fetchone()[0]
+        if gap:
+            log.info("RLS coverage gap (%d ungranted ducklake_* tables) — re-arming", gap)
+            ensure_rls(catalog, settings)
+            return True
+    except Exception:
+        log.exception("rearm_rls_if_needed failed")
+    return False
+
+
 def _unpolicied_tables(cur) -> list[str]:
     """ducklake_* base tables that get SELECT grants but no RLS policy
     (no table_id key — schema/snapshot/metadata plumbing the extension
@@ -312,6 +353,12 @@ def _unpolicied_tables(cur) -> list[str]:
           -- introspection (verified: normal reads are unaffected), which is
           -- consistent with masked principals having no time travel anyway.
           AND t.table_name <> 'ducklake_snapshot_changes'
+          -- ducklake_files_scheduled_for_deletion has data_file_id but no
+          -- table_id, so it can't be RLS-filtered by our table_id predicate.
+          -- It exposes base data-file S3 paths of allowlist-hidden /
+          -- file-layer tables (files pending compaction/expiry). A read-only
+          -- principal never processes the deletion queue, so it gets NO grant.
+          AND t.table_name <> 'ducklake_files_scheduled_for_deletion'
           AND NOT EXISTS (
             SELECT 1 FROM information_schema.columns c
             WHERE c.table_schema = t.table_schema

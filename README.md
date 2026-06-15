@@ -329,10 +329,17 @@ embedded in responses by default**: clients see only vended credentials.
 - **Injection-safe SQL.** Identifiers and string literals (table/column
   names, S3 paths) are escaped in the export `COPY` / `read_parquet` /
   `FIELD_IDS` paths, which run as the owning role with root creds.
-- **Catalog hygiene.** `ducklake_snapshot_changes` and inlined-data payload
-  tables are never granted to the reader role (they'd leak hidden tables'
-  names / bypass RLS); the governance sidecar DDL runs once per process,
-  not per request.
+- **Catalog hygiene.** The reader role is never granted the tables that
+  would bypass or undermine RLS: inlined-data payloads (raw rows, no
+  `table_id` to police), `ducklake_snapshot_changes` (leaks hidden tables'
+  names), and `ducklake_files_scheduled_for_deletion` (base data-file paths
+  of hidden / file-layer tables). RLS coverage re-arms automatically if a
+  new `ducklake_*` system table appears after startup. Governance sidecar
+  DDL runs once per process, not per request. *Known residual disclosure
+  (low):* a reader can still see `ducklake_schema` (namespace names) and
+  `ducklake_view` (view definitions, incl. masking-view SQL) — the DuckLake
+  extension needs both to resolve and execute the masking views; neither
+  exposes row data. RLS-filtering those is tracked follow-up.
 - **Honest about the dev/prod gap.** The catalog-level masking views are
   cooperative (a client with the base table name + base creds reads raw);
   file-layer masking is the airtight tier for tables that opt in. The dev
