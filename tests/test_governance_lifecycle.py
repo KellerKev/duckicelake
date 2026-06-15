@@ -252,3 +252,28 @@ def test_drop_purges_governance(client):
     client.post(f"/v1/lake/namespaces/{ns}/tables",
                 json={"name": "events", "schema": SCHEMA_JSON}).raise_for_status()
     assert _masked_cols(client, ns, "events") == []
+
+
+def test_column_rename_carries_mask(client):
+    """L6 (column-level): an add-schema that renames a masked column — same
+    field-id, new name — carries its tag, so the mask follows the new name
+    instead of silently detaching."""
+    ns = _ns("col_rn")
+    _make_table(client, ns, "events")
+    _author_demo_policy(client, ns, "events")        # mask on email (field-id 2)
+    assert _masked_cols(client, ns, "events") == ["email"]
+
+    renamed = {
+        "type": "struct", "schema-id": 1,
+        "fields": [
+            {"id": 1, "name": "id", "required": True, "type": "long"},
+            {"id": 2, "name": "email_addr", "required": False, "type": "string"},
+        ],
+    }
+    client.post(f"/v1/lake/namespaces/{ns}/tables/events",
+                json={"requirements": [],
+                      "updates": [{"action": "add-schema", "schema": renamed},
+                                  {"action": "set-current-schema", "schema-id": -1}]}
+                ).raise_for_status()
+
+    assert _masked_cols(client, ns, "events") == ["email_addr"]

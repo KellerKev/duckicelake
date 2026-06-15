@@ -827,6 +827,31 @@ class GovernanceStore:
                        object_=f"{src_schema}.{src_table}",
                        detail={"to": f"{dst_schema}.{dst_table}"})
 
+    def rename_column_governance(self, principal: str | None, *, schema: str,
+                                 table: str, old_column: str,
+                                 new_column: str) -> None:
+        """Carry a column's governance rows when an `add-schema` renames the
+        column (same field-id, new name). Tags and column-target attachments
+        key on `column_name`, so without this the rename detaches the mask —
+        a LEAK. Tag-target masks ride the tag, not the name, and are untouched
+        (the column keeps its tag rows, which move here)."""
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "UPDATE public.duckicelake_object_tag SET column_name = %s "
+                "WHERE object_kind = 'column' AND schema_name = %s "
+                "  AND object_name = %s AND column_name = %s",
+                (new_column, schema, table, old_column))
+            cur.execute(
+                "UPDATE public.duckicelake_policy_attachment SET column_name = %s "
+                "WHERE target_kind = 'column' AND schema_name = %s "
+                "  AND object_name = %s AND column_name = %s",
+                (new_column, schema, table, old_column))
+            self.audit(cur, principal=principal,
+                       operation="rename_column_governance",
+                       object_=f"{schema}.{table}.{old_column}",
+                       detail={"to": new_column})
+
     def purge_table_governance(self, principal: str | None, *, schema: str,
                                table: str) -> None:
         """Drop a table's governance rows when the catalog drops the table,

@@ -1638,6 +1638,14 @@ def _apply_schema_diff(ns: list[str], table: str, new_schema: dict[str, Any]) ->
                     status_code=501,
                     detail=f"Type change for column '{f['name']}' not supported: {cur_ice} → {new_ice}",
                 )
+            # Same field-id, new name → a column rename. Apply it, then carry
+            # the column's governance rows (tags / column-target masks) to the
+            # new name; otherwise the mask silently detaches (a LEAK).
+            if cur.column_name != f["name"]:
+                catalog.rename_column(ns, table, cur.column_name, f["name"])
+                governance_store.rename_column_governance(
+                    None, schema=ns[0], table=table,
+                    old_column=cur.column_name, new_column=f["name"])
             continue
         # New column.
         ddl_type = iceberg_type_to_duckdb(f["type"])

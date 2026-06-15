@@ -1714,6 +1714,14 @@ class DuckLakeCatalog:
                 f'ALTER TABLE {self._cat()}."{ns[0]}"."{name}" DROP COLUMN "{col_name}"'
             )
 
+    def rename_column(self, ns: list[str], name: str, old_col: str,
+                      new_col: str) -> None:
+        with self.cursor() as c:
+            c.execute(
+                f'ALTER TABLE {self._cat()}."{ns[0]}"."{name}" '
+                f'RENAME COLUMN "{old_col}" TO "{new_col}"'
+            )
+
     # ---- views ---------------------------------------------------------
 
     def list_views(self, ns: list[str]) -> list[str]:
