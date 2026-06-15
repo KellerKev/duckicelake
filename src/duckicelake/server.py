@@ -691,6 +691,12 @@ def drop_table(
         )
     catalog.drop_table(ns, table)
     catalog.invalidate_metadata_cache(ns, table)
+    # Purge the table's governance rows (tags / attachments / grants) so a
+    # later table reusing the name can't silently inherit a stale mask, and
+    # resync to drop its masking views/exports/props. Always — governance
+    # rows orphan on any drop, not only a purge-requested one.
+    governance_store.purge_table_governance(None, schema=ns[0], table=table)
+    _resync_table_governance(ns, table)
     if purgeRequested:
         n = catalog.purge_table_objects(ns, table)
         log.info("purge %s.%s: %d S3 objects removed", ns[0], table, n)
@@ -1118,6 +1124,15 @@ def rename_table(prefix: str, req: RenameTableRequest):
         req.source.namespace, req.source.name,
         req.destination.namespace, req.destination.name,
     )
+    # Governance rows key on (schema, table[, column]) names — carry them to
+    # the new name so the mask keeps applying (else it silently lapses), then
+    # resync both ends so stale masking views/exports for the old name go and
+    # the new name rematerializes on next read.
+    governance_store.rename_table_governance(
+        None, src_schema=req.source.namespace[0], src_table=req.source.name,
+        dst_schema=req.destination.namespace[0], dst_table=req.destination.name)
+    _resync_table_governance(req.source.namespace, req.source.name)
+    _resync_table_governance(req.destination.namespace, req.destination.name)
     return Response(status_code=204)
 
 

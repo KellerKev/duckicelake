@@ -340,6 +340,14 @@ embedded in responses by default**: clients see only vended credentials.
   `ducklake_view` (view definitions, incl. masking-view SQL) — the DuckLake
   extension needs both to resolve and execute the masking views; neither
   exposes row data. RLS-filtering those is tracked follow-up.
+- **Policies follow the catalog, not stale names.** Governance rows key on
+  `(schema, table, column)`, so a rename or drop would otherwise orphan them
+  — a mask silently lapsing (leak) or a recreated name inheriting a stale
+  mask. `rename_table` carries the table's tags/attachments/grants to the new
+  name; `drop_table` purges them; both resync the masking views/exports. And
+  an attachment the resolver would ignore (masking→`table`,
+  row-access→`column`) is rejected at attach (400) so a no-op can't
+  masquerade as protection.
 - **Honest about the dev/prod gap.** The catalog-level masking views are
   cooperative (a client with the base table name + base creds reads raw);
   file-layer masking is the airtight tier for tables that opt in. The dev

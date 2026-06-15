@@ -38,6 +38,16 @@ class GovernanceConflict(Exception):
 # a whole table (row-access on a column-list).
 ATTACH_TARGETS = {"tag", "column", "table"}
 
+# Which targets each policy kind actually honors at resolution time. A
+# masking policy applies via a tag or a single column; a row-access policy
+# applies to a whole table or via a (table/schema) tag. Any other pairing —
+# masking→table, row_access→column — is silently ignored by the resolver, so
+# an attachment to it is a no-op that looks like protection. Reject at attach.
+VALID_ATTACH_TARGETS = {
+    "masking": {"tag", "column"},
+    "row_access": {"tag", "table"},
+}
+
 
 #: Process-level guard so the ~14 sidecar DDL statements (incl. ALTER TABLE
 #: ADD COLUMN, which takes a brief ACCESS EXCLUSIVE lock even as a no-op)
@@ -780,6 +790,67 @@ class GovernanceStore:
                            object_=".".join(p for p in (schema_name, object_name) if p),
                            detail={"privilege": privilege, "role": role_name})
             return deleted
+
+    # -- catalog-drift carry / purge --------------------------------------
+
+    def rename_table_governance(self, principal: str | None, *, src_schema: str,
+                                src_table: str, dst_schema: str,
+                                dst_table: str) -> None:
+        """Carry a table's governance rows when the catalog renames/moves it.
+        Tags, attachments, and grants key on (schema, table[, column]) names,
+        so without this a rename silently orphans them and the mask stops
+        applying — a LEAK. Tag-target attachments aren't table-specific and
+        are left as-is; only the per-table object rows move. (object_tag /
+        object_grant rows for the table itself and its columns carry
+        object_name = table; schema-level rows carry object_name = '' and are
+        untouched.)"""
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "UPDATE public.duckicelake_object_tag "
+                "SET schema_name = %s, object_name = %s "
+                "WHERE schema_name = %s AND object_name = %s",
+                (dst_schema, dst_table, src_schema, src_table))
+            cur.execute(
+                "UPDATE public.duckicelake_policy_attachment "
+                "SET schema_name = %s, object_name = %s "
+                "WHERE target_kind IN ('table', 'column') "
+                "  AND schema_name = %s AND object_name = %s",
+                (dst_schema, dst_table, src_schema, src_table))
+            cur.execute(
+                "UPDATE public.duckicelake_object_grant "
+                "SET schema_name = %s, object_name = %s "
+                "WHERE schema_name = %s AND object_name = %s",
+                (dst_schema, dst_table, src_schema, src_table))
+            self.audit(cur, principal=principal,
+                       operation="rename_table_governance",
+                       object_=f"{src_schema}.{src_table}",
+                       detail={"to": f"{dst_schema}.{dst_table}"})
+
+    def purge_table_governance(self, principal: str | None, *, schema: str,
+                               table: str) -> None:
+        """Drop a table's governance rows when the catalog drops the table,
+        so a later table reusing the name doesn't silently inherit a stale
+        mask / row-filter / grant. Tag-target attachments (not table-specific)
+        are left intact."""
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "DELETE FROM public.duckicelake_object_tag "
+                "WHERE schema_name = %s AND object_name = %s",
+                (schema, table))
+            cur.execute(
+                "DELETE FROM public.duckicelake_policy_attachment "
+                "WHERE target_kind IN ('table', 'column') "
+                "  AND schema_name = %s AND object_name = %s",
+                (schema, table))
+            cur.execute(
+                "DELETE FROM public.duckicelake_object_grant "
+                "WHERE schema_name = %s AND object_name = %s",
+                (schema, table))
+            self.audit(cur, principal=principal,
+                       operation="purge_table_governance",
+                       object_=f"{schema}.{table}")
 
     def _attachment_affected_tables(self, target_kind, tag_ns, tag_name,
                                     schema_name, object_name) -> list[tuple[str, str]]:

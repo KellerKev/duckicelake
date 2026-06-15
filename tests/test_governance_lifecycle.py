@@ -180,3 +180,75 @@ def test_delete_role_refused_while_granted(client):
     client.request("DELETE", "/v1/lake/governance/role-grants",
                    json={"role": "tmp_role", "principal": "p"}).raise_for_status()
     assert client.delete("/v1/lake/governance/roles/tmp_role").status_code == 200
+
+
+# ---- Stage 3: catalog-drift guards (L6 rename/drop, L8 attach-target) -------
+
+def _masked_cols(client, ns, table, principal="nobody"):
+    eff = client.get("/v1/lake/governance/effective-policies",
+                     params={"table": f"{ns}.{table}", "principal": principal}).json()
+    return eff["enforcement"]["masked_columns"]
+
+
+def test_attach_masking_to_table_rejected(client):
+    """L8: masking→table is silently ignored by the resolver, so it must be
+    rejected at attach (else it looks like protection but isn't)."""
+    ns = _ns("mask_tbl")
+    _make_table(client, ns, "events")
+    name = f"mt_{uuid.uuid4().hex[:6]}"
+    _mk_policy(client, name).raise_for_status()
+    r = client.post("/v1/lake/governance/policy-attachments",
+                    json={"policy-kind": "masking", "policy-name": name,
+                          "target-kind": "table", "schema": ns, "object": "events"})
+    assert r.status_code == 400, r.text
+    assert "cannot target 'table'" in r.text
+
+
+def test_attach_row_access_to_column_rejected(client):
+    """L8: row_access→column is a resolver no-op → reject at attach."""
+    ns = _ns("rac_col")
+    _make_table(client, ns, "events")
+    name = f"rac_{uuid.uuid4().hex[:6]}"
+    client.post("/v1/lake/governance/row-access-policies",
+                json={"name": name, "signature": "(region VARCHAR)",
+                      "body": "true"}).raise_for_status()
+    r = client.post("/v1/lake/governance/policy-attachments",
+                    json={"policy-kind": "row_access", "policy-name": name,
+                          "target-kind": "column", "schema": ns, "object": "events",
+                          "column": "email"})
+    assert r.status_code == 400, r.text
+    assert "cannot target 'column'" in r.text
+
+
+def test_rename_carries_mask(client):
+    """L6: renaming a masked table carries its governance rows, so the mask
+    keeps applying under the new name and lapses under the old one."""
+    ns = _ns("rn_carry")
+    _make_table(client, ns, "events")
+    _author_demo_policy(client, ns, "events")
+    assert _masked_cols(client, ns, "events") == ["email"]
+
+    client.post("/v1/lake/tables/rename",
+                json={"source": {"namespace": [ns], "name": "events"},
+                      "destination": {"namespace": [ns], "name": "events_v2"}}
+                ).raise_for_status()
+
+    # mask follows the table to its new name; old name has nothing left
+    assert _masked_cols(client, ns, "events_v2") == ["email"]
+    assert _masked_cols(client, ns, "events") == []
+
+
+def test_drop_purges_governance(client):
+    """L6: dropping a masked table purges its governance rows, so a later
+    table reusing the name starts clean (no stale mask)."""
+    ns = _ns("drop_purge")
+    _make_table(client, ns, "events")
+    _author_demo_policy(client, ns, "events")
+    assert _masked_cols(client, ns, "events") == ["email"]
+
+    client.delete(f"/v1/lake/namespaces/{ns}/tables/events").raise_for_status()
+    # recreate the same name (namespace already exists) — must not inherit
+    # the dropped table's mask
+    client.post(f"/v1/lake/namespaces/{ns}/tables",
+                json={"name": "events", "schema": SCHEMA_JSON}).raise_for_status()
+    assert _masked_cols(client, ns, "events") == []

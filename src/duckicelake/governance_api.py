@@ -24,6 +24,7 @@ from .governance import (
     ATTACH_TARGETS,
     OBJECT_KINDS,
     POLICY_KINDS,
+    VALID_ATTACH_TARGETS,
     GovernanceConflict,
     GovernanceStore,
 )
@@ -170,6 +171,14 @@ def build_governance_router(
             raise HTTPException(400, f"policy-kind must be one of {sorted(POLICY_KINDS)}")
         if req.target_kind not in ATTACH_TARGETS:
             raise HTTPException(400, f"target-kind must be one of {sorted(ATTACH_TARGETS)}")
+        # Reject pairings the resolver silently ignores (e.g. masking→table,
+        # row_access→column): a no-op attachment must not masquerade as
+        # protection. See VALID_ATTACH_TARGETS.
+        if req.target_kind not in VALID_ATTACH_TARGETS[req.policy_kind]:
+            raise HTTPException(
+                400,
+                f"{req.policy_kind} policies cannot target '{req.target_kind}'; "
+                f"valid targets: {sorted(VALID_ATTACH_TARGETS[req.policy_kind])}")
         try:
             store.attach_policy(
                 _principal(request), policy_kind=req.policy_kind, policy_name=req.policy_name,
