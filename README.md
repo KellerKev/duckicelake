@@ -326,6 +326,14 @@ embedded in responses by default**: clients see only vended credentials.
   masked-signature prefix only; namespace-level vends add explicit IAM
   *Deny* on every file-layer table's base prefix — derived from the policy,
   so a table that was authored but never yet exported is still denied.
+- **File-layer masking is current-state only — and says so.** The masked
+  Parquet export tracks the live snapshot; there is no per-historical-snapshot
+  masked export. A time-travel LoadTable (`?snapshot-id=N` for an older N) on
+  a file-layer table is therefore *denied* (501), never silently served the
+  current snapshot under the requested id. A masked export dir is retained
+  until any STS creds that could still be reading it have expired (a grace
+  window above the credential TTL, not just a count cap), so a slow reader's
+  in-flight scan isn't swept out from under it.
 - **Injection-safe SQL.** Identifiers and string literals (table/column
   names, S3 paths) are escaped in the export `COPY` / `read_parquet` /
   `FIELD_IDS` paths, which run as the owning role with root creds.

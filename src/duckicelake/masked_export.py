@@ -111,6 +111,13 @@ class MaskedExportManager:
         #                                     to the fresh snap dir after export
         self.retain_snap_dirs = int(os.environ.get(
             "DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS", "2"))
+        # Never sweep a snap dir younger than this, regardless of the count
+        # cap: a client that was vended creds + shadow metadata for a dir can
+        # keep reading it until those creds expire. Default comfortably above
+        # the 3600s STS credential TTL so an in-flight reader's dir is never
+        # deleted out from under its glob (A3).
+        self.retain_grace_seconds = int(os.environ.get(
+            "DUCKICELAKE_MASKED_RETAIN_GRACE_SECONDS", "3900"))
         self.export_ttl_days = int(os.environ.get(
             "DUCKICELAKE_MASKED_EXPORT_TTL_DAYS", "7"))
         self.export_file_size = os.environ.get(
@@ -399,14 +406,26 @@ class MaskedExportManager:
     def _retain(self, schema: str, table: str, sig: str,
                 *, keep_prefix: str) -> None:
         """Keep the live snap dir + the previous one; sweep older/orphaned
-        attempt dirs under the sig prefix."""
+        attempt dirs under the sig prefix. A dir younger than
+        `retain_grace_seconds` is kept regardless of the count cap, so a dir
+        that a slow reader was just vended creds for isn't deleted out from
+        under its in-flight glob (A3)."""
         try:
             sig_prefix = self.settings.s3.masked_sig_prefix(schema, table, sig)
             dirs: dict[str, list[str]] = {}
-            for key, _size in self._list_keys(sig_prefix):
-                rest = key[len(sig_prefix):]
-                if "/" in rest:
-                    dirs.setdefault(rest.split("/", 1)[0], []).append(key)
+            newest_mtime: dict[str, datetime] = {}
+            client = self.catalog.s3_client
+            for page in client.get_paginator("list_objects_v2").paginate(
+                    Bucket=self.settings.s3.bucket, Prefix=sig_prefix):
+                for o in page.get("Contents", []):
+                    rest = o["Key"][len(sig_prefix):]
+                    if "/" not in rest:
+                        continue
+                    d = rest.split("/", 1)[0]
+                    dirs.setdefault(d, []).append(o["Key"])
+                    lm = o["LastModified"]
+                    if d not in newest_mtime or lm > newest_mtime[d]:
+                        newest_mtime[d] = lm
             # keep newest retain_snap_dirs by snapshot number (dir name is
             # snap-{N}-{tok}); the live dir always survives
             def snap_no(d: str) -> int:
@@ -416,7 +435,10 @@ class MaskedExportManager:
                     return -1
             live_dir = keep_prefix[len(sig_prefix):].strip("/")
             ordered = sorted(dirs, key=snap_no, reverse=True)
-            keep = set(ordered[:self.retain_snap_dirs]) | {live_dir}
+            now = datetime.now(timezone.utc)
+            grace = timedelta(seconds=self.retain_grace_seconds)
+            recent = {d for d, lm in newest_mtime.items() if now - lm < grace}
+            keep = set(ordered[:self.retain_snap_dirs]) | {live_dir} | recent
             stale_keys = [k for d, keys in dirs.items() if d not in keep
                           for k in keys]
             self._delete_keys(stale_keys)

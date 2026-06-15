@@ -554,6 +554,83 @@ def test_reserved_property_keys_rejected_on_commit(client, settings):
     assert r.status_code == 200, r.text
 
 
+# ---- A2: file-layer time-travel is denied (fail closed) --------------------
+
+def test_file_layer_time_travel_denied(client, settings):
+    """A2: a file-layer masked principal asking for a historical snapshot
+    must be DENIED (501) — the masked export is current-state only, so the
+    alternative is silently serving the current snapshot under the old id."""
+    ns = _ns("tt")
+    _make_table(client, ns, "events")
+    _seed(settings, ns)          # snapshot A
+    _seed(settings, ns)          # snapshot B (current)
+
+    # Read the real snapshot history BEFORE authoring the mask (anonymous +
+    # no policy → base metadata with the full snapshot list).
+    md = client.get(f"/v1/lake/namespaces/{ns}/tables/events").json()["metadata"]
+    current = md["current-snapshot-id"]
+    historical = [s["snapshot-id"] for s in md["snapshots"]
+                  if s["snapshot-id"] != current]
+    assert historical, "need ≥2 snapshots for a time-travel read"
+
+    _author_file_layer_policy(client, ns, "events")
+
+    # masked (anonymous) + historical snapshot → 501, never the current export
+    r = client.get(f"/v1/lake/namespaces/{ns}/tables/events",
+                   params={"snapshot_id": historical[0]},
+                   headers={"X-Iceberg-Access-Delegation": "vended-credentials"})
+    assert r.status_code == 501, r.text
+
+    # the deny is audited distinctly from the generic file-layer denial
+    audit = client.get("/v1/lake/governance/audit").json()["entries"]
+    assert any(e.get("decision") == "error_file_layer_timetravel_denied"
+               and e["object"] == f"{ns}.events" for e in audit)
+
+    # the CURRENT snapshot (not historical) is still served masked, not denied
+    r = client.get(f"/v1/lake/namespaces/{ns}/tables/events",
+                   params={"snapshot_id": current})
+    assert r.status_code == 200, r.text
+
+
+# ---- A3: retention keeps a recently-served dir past the count cap ----------
+
+def test_retention_grace_keeps_recent_dir(settings, direct_catalog):
+    """A3: a snap dir that exceeds the count cap but is younger than the
+    grace window survives, so a slow reader's in-flight glob isn't deleted
+    out from under it. With grace=0 it's swept (count cap alone)."""
+    s3 = settings.s3
+    root = boto3.client(
+        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
+        aws_access_key_id=s3.root_access_key,
+        aws_secret_access_key=s3.root_secret_key)
+    sig = "deadbeef0000"
+    schema, table = "gp4ret", f"t_{uuid.uuid4().hex[:6]}"
+    sig_prefix = s3.masked_sig_prefix(schema, table, sig)
+    old_dir = f"{sig_prefix}snap-1-aaaa/"
+    live_dir = f"{sig_prefix}snap-2-bbbb/"
+    for d in (old_dir, live_dir):
+        root.put_object(Bucket=s3.bucket, Key=f"{d}part-0.parquet", Body=b"x")
+
+    mgr = MaskedExportManager(direct_catalog, settings)
+    mgr.retain_snap_dirs = 1          # count cap would drop snap-1...
+
+    def _exists(prefix: str) -> bool:
+        r = root.list_objects_v2(Bucket=s3.bucket, Prefix=prefix)
+        return r.get("KeyCount", 0) > 0
+
+    mgr.retain_grace_seconds = 3900   # ...but it's brand new → grace keeps it
+    mgr._retain(schema, table, sig, keep_prefix=live_dir)
+    assert _exists(old_dir), "recent dir must survive the count cap"
+    assert _exists(live_dir)
+
+    mgr.retain_grace_seconds = 0      # no grace → count cap sweeps snap-1
+    mgr._retain(schema, table, sig, keep_prefix=live_dir)
+    assert not _exists(old_dir), "with no grace the over-cap dir is swept"
+    assert _exists(live_dir)
+
+    root.delete_object(Bucket=s3.bucket, Key=f"{live_dir}part-0.parquet")
+
+
 def test_reserved_table_names_rejected(client):
     ns = _ns("rname")
     _make_table(client, ns, "events")   # creates ns + a real table

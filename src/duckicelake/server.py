@@ -1758,12 +1758,17 @@ def _build_load_response(
     # Time-travel: if the caller asked for a specific snapshot via
     # ?snapshot-id=N, pin current-snapshot-id to that (it must be one we
     # materialised).
+    requested_historical = False
     if snapshot_id_override is not None:
         if not any(s["snapshot-id"] == snapshot_id_override for s in metadata.get("snapshots", [])):
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown snapshot-id for {ns[0]}.{table}: {snapshot_id_override}",
             )
+        # Did the caller ask for a snapshot other than the live one? File-layer
+        # masking can't honor that (see the deny below) — capture it before we
+        # repoint current-snapshot-id.
+        requested_historical = snapshot_id_override != metadata.get("current-snapshot-id")
         metadata = dict(metadata)
         metadata["current-snapshot-id"] = snapshot_id_override
         metadata["refs"] = {"main": {"type": "branch", "snapshot-id": snapshot_id_override}}
@@ -1802,7 +1807,13 @@ def _build_load_response(
                 # with that final decision — otherwise a shadow failure would
                 # leave the view repointed at a masked prefix the base-scoped
                 # creds can't read, advertised on base metadata.
-                if plan.file_layer:
+                if plan.file_layer and requested_historical:
+                    # File-layer masked exports are current-state only — we
+                    # don't materialize per-historical-snapshot masked Parquet.
+                    # Don't build/serve a current-state export here; the
+                    # time-travel deny fires after the try (fail closed).
+                    file_layer_export = None
+                elif plan.file_layer:
                     file_layer_export = (
                         masked_export_manager.ensure_export_for_plan(
                             ns, table, plan)
@@ -1849,6 +1860,28 @@ def _build_load_response(
         # the read rather than leak raw bytes. (The catalog-level cooperative
         # tier keeps serving advisory signals + base creds — that's only
         # reached when plan.file_layer is False.)
+        if file_layer_required and requested_historical:
+            # Time-travel on a file-layer table: the masked export is
+            # current-state only, so we can't vend a historical snapshot
+            # without either leaking unmasked history or silently serving the
+            # current snapshot under the requested id. Deny (fail closed).
+            try:
+                governance_store.audit_load(
+                    principal=principal_for_creds, object_=f"{ns[0]}.{table}",
+                    masked_cols=[], applied_policies=[], row_filtered=False,
+                    operation="load_table",
+                    decision="error_file_layer_timetravel_denied",
+                    detail={"file_layer": True,
+                            "requested_snapshot": snapshot_id_override})
+            except Exception:
+                log.exception("audit of file-layer time-travel denial failed")
+            raise HTTPException(
+                status_code=501,
+                detail=(f"file-layer masking for {ns[0]}.{table} does not "
+                        f"support time-travel reads; snapshot "
+                        f"{snapshot_id_override} is not the current snapshot"),
+            )
+
         if file_layer_required and file_layer_export is None:
             try:
                 governance_store.audit_load(
