@@ -197,6 +197,12 @@ literal, so it must be **conninfo-safe: no spaces, quotes, or backslashes**
 (the proxy refuses to start otherwise). Keep `log_statement = none` for the
 proxy role as above.
 
+> **Limitation.** Passwords containing spaces, quotes, or backslashes are
+> rejected — they can't survive both the libpq conninfo *and* the DuckDB
+> SQL-literal layers. Managed-Postgres generated passwords are URL-safe, so
+> this is rarely hit, and when it is the proxy fails fast at startup with a
+> clear message rather than a cryptic `ATTACH` error later.
+
 **Caveat — RLS off:** with `DUCKICELAKE_RLS=0`, `ducklake-credentials` vends
 the *owner* DSN to clients (the documented cooperative fallback); that DSN
 now carries the owner password. Keep RLS **on** in production so clients only
