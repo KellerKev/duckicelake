@@ -51,6 +51,13 @@ how many workers race on the same table.
 | `DUCKICELAKE_LOG_LEVEL`             | `INFO` (drop to `DEBUG` per incident) |
 | `DUCKICELAKE_CACHE_MAX`             | `1024` default; raise for >1k tables |
 
+> **`DUCKICELAKE_PG_PASSWORD` limitation.** Passwords containing spaces,
+> quotes, or backslashes are rejected — they can't survive both the libpq
+> conninfo *and* the DuckDB `ATTACH` SQL-literal layers. Managed-Postgres
+> generated passwords are URL-safe, so this is rarely hit, and when it is the
+> proxy fails fast at startup with a clear message rather than a cryptic
+> `ATTACH` error later.
+
 Start with:
 ```
 pixi run serve-hi   # uvicorn --workers 4 --log-level warning
