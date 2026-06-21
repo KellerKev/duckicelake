@@ -10,7 +10,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from .catalog import DuckLakeCatalog
-from .config import load_settings
+from .config import load_settings, redact_password
 
 
 def ensure_bucket(settings) -> None:
@@ -46,7 +46,7 @@ def main() -> int:
         print("'default' namespace already exists.")
 
     print(f"DuckLake catalog '{settings.catalog_name}' ready.")
-    print(f"  Postgres:  {settings.pg_dsn}")
+    print(f"  Postgres:  {redact_password(settings.pg_dsn)}")
     print(f"  Data path: {settings.ducklake_data_path}")
     print(f"  S3:        {settings.s3.endpoint} bucket={settings.s3.bucket}")
     cat.close()

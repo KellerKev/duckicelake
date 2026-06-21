@@ -36,6 +36,7 @@ how many workers race on the same table.
 | `DUCKICELAKE_PG_PORT`               | `5432`                               |
 | `DUCKICELAKE_PG_USER`               | Dedicated role, no superuser         |
 | `DUCKICELAKE_PG_DATABASE`           | Dedicated DB per environment         |
+| `DUCKICELAKE_PG_PASSWORD`           | Owner-role scram password for managed Postgres (RDS/etc.); unset under socket/cert/ident auth. Conninfo-safe only: no spaces/quotes/backslashes. Redacted from logs. |
 | `DUCKICELAKE_CATALOG`               | `lake` (or per-env)                  |
 | `DUCKICELAKE_S3_ENDPOINT`           | `https://s3.<region>.amazonaws.com`  |
 | `DUCKICELAKE_S3_REGION`             | Real region                          |

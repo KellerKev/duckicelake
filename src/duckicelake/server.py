@@ -27,7 +27,7 @@ from .auth import (
     oauth_token_endpoint,
 )
 from .catalog import DuckLakeCatalog
-from .config import load_settings
+from .config import load_settings, redact_password
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
 from .notify import run_listener as run_notify_listener
@@ -100,7 +100,8 @@ if os.environ.get("DUCKICELAKE_REQUIRE_AUTH", "0") == "1" and not auth_cfg.enabl
 async def lifespan(app: FastAPI):
     import asyncio
     catalog.connect()
-    log.info("DuckLake catalog connected: %s", settings.ducklake_uri)
+    log.info("DuckLake catalog connected: %s",
+             redact_password(settings.ducklake_uri))
     # Eager DuckLake-to-Iceberg materialisation listener. Elects one
     # worker via PG advisory lock; the others poll the lock so they take
     # over if the elected worker dies. See src/duckicelake/notify.py.

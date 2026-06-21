@@ -432,6 +432,7 @@ duckicelake/
 | `DUCKICELAKE_PG_PORT` | `55432` | |
 | `DUCKICELAKE_PG_USER` | `ducklake` | |
 | `DUCKICELAKE_PG_DATABASE` | `ducklake` | |
+| `DUCKICELAKE_PG_PASSWORD` | _(unset)_ | Owner-role password for managed Postgres (scram). Dev uses socket trust, so leave unset. Must be conninfo-safe: no spaces/quotes/backslashes. |
 | `DUCKICELAKE_CATALOG` | `lake` | DuckLake catalog name (used as REST `prefix`) |
 | `DUCKICELAKE_S3_ENDPOINT` | `http://127.0.0.1:9000` | |
 | `DUCKICELAKE_S3_REGION` | `us-east-1` | |

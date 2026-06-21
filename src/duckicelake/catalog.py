@@ -1801,11 +1801,9 @@ class DuckLakeCatalog:
     # ---- identity -----------------------------------------------------
 
     def _pg_conninfo(self) -> str:
-        s = self.settings
-        return (
-            f"dbname={s.pg_database} host={s.pg_host} "
-            f"port={s.pg_port} user={s.pg_user}"
-        )
+        # Single source of truth for the owner DSN (incl. any password) lives
+        # on Settings; the pool and notify listener both go through here.
+        return self.settings.pg_dsn
 
     def resolve_table(self, ns: list[str], name: str) -> TableIdResolved | None:
         """Look up DuckLake's table_id + schema_id for a qualified table name."""
