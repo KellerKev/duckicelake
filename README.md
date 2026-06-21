@@ -363,7 +363,12 @@ embedded in responses by default**: clients see only vended credentials.
   file-layer masking is the airtight tier for tables that opt in. The dev
   stack runs Postgres `trust` auth, so RLS *authentication* is only real
   under production `scram-sha-256` + TLS — the `pg_hba` recipe is in
-  [OPERATIONS.md](OPERATIONS.md).
+  [OPERATIONS.md](OPERATIONS.md). The owning role authenticates by socket
+  trust in dev or cert/ident in prod; for managed Postgres that needs a
+  scram password, set `DUCKICELAKE_PG_PASSWORD` (it flows into every owner
+  connection and is redacted from logs). **Disabling RLS
+  (`DUCKICELAKE_RLS=0`) vends the owner DSN — now including that password —
+  to clients, so keep RLS on in production.**
 
 Try it against a running stack:
 
@@ -874,6 +879,7 @@ carry secrets.
 | `DUCKICELAKE_PG_PORT` | `55432` | |
 | `DUCKICELAKE_PG_USER` | `ducklake` | |
 | `DUCKICELAKE_PG_DATABASE` | `ducklake` | |
+| `DUCKICELAKE_PG_PASSWORD` | _(unset)_ | Owner-role password for managed Postgres (scram). Dev uses socket trust, so leave unset. Must be conninfo-safe: no spaces/quotes/backslashes. |
 | `DUCKICELAKE_CATALOG` | `lake` | DuckLake catalog name (used as REST `prefix`) |
 | `DUCKICELAKE_S3_ENDPOINT` | `http://127.0.0.1:9000` | |
 | `DUCKICELAKE_S3_REGION` | `us-east-1` | |

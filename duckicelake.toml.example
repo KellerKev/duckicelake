@@ -38,6 +38,10 @@ host = "/path/to/repo/.pgsock"   # or a hostname
 port = 55432
 user = "ducklake"
 database = "ducklake"
+# password = "…"   # for managed Postgres (RDS/Supabase/Neon/Cloud SQL) using
+#                  # scram. Dev uses socket trust auth, so leave it unset.
+#                  # Must be conninfo-safe: no spaces, quotes, or backslashes.
+#                  # Equivalent env var: DUCKICELAKE_PG_PASSWORD.
 
 [s3]
 endpoint = "http://127.0.0.1:9100"

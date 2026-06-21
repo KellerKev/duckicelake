@@ -29,7 +29,7 @@ from .auth import (
 )
 from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
-from .config import apply_file_config, load_settings
+from .config import apply_file_config, load_settings, redact_password
 from .governance import GovernanceStore
 from .masked_export import MaskedExportManager
 from .masking_views import (
@@ -226,7 +226,8 @@ if os.environ.get("DUCKICELAKE_REQUIRE_AUTH", "0") == "1" and not auth_cfg.enabl
 async def lifespan(app: FastAPI):
     import asyncio
     catalog.connect()
-    log.info("DuckLake catalog connected: %s", settings.ducklake_uri)
+    log.info("DuckLake catalog connected: %s",
+             redact_password(settings.ducklake_uri))
     # Phase 3a: reader role + RLS on the ducklake_* catalog tables for
     # vended DuckLake-direct credentials. An RLS setup error never stops
     # the proxy, but it does arm the fail-CLOSED gate: if RLS isn't ready,

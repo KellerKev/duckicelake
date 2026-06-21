@@ -185,6 +185,23 @@ with the STS creds (`VALID UNTIL`, connect-time check). Mandate
 ROLE … PASSWORD` never lands in server logs. Expired roles are GC'd lazily
 by the proxy; `SELECT * FROM duckicelake_pg_principal` shows the live set.
 
+### Owner-role authentication (password)
+
+The owning role connects by socket `trust` in dev and can use cert/ident in
+prod. For managed Postgres (RDS, Supabase, Neon, Cloud SQL) that requires a
+scram password, set **`DUCKICELAKE_PG_PASSWORD`** (or `[pg] password` in
+`duckicelake.toml`) — it flows into every owner connection via `pg_dsn` and
+is redacted (`password=***`) from the startup log and `bootstrap` output.
+The value is embedded in a libpq conninfo *and* a DuckDB `ATTACH` string
+literal, so it must be **conninfo-safe: no spaces, quotes, or backslashes**
+(the proxy refuses to start otherwise). Keep `log_statement = none` for the
+proxy role as above.
+
+**Caveat — RLS off:** with `DUCKICELAKE_RLS=0`, `ducklake-credentials` vends
+the *owner* DSN to clients (the documented cooperative fallback); that DSN
+now carries the owner password. Keep RLS **on** in production so clients only
+ever receive per-principal reader roles.
+
 ## Known operational risks
 
 1. **DuckLake schema drift**: direct Postgres INSERT/UPDATE of `ducklake_delete_file`, `ducklake_sort_info`, `ducklake_data_file.end_snapshot`. A minor DuckLake version bump that changes these could silently break commits. **Mitigation**: pin DuckLake in `pixi.toml`, subscribe to DuckLake release notes, run the full integration suite before any version bump.
