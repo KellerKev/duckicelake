@@ -62,11 +62,12 @@ of real users. Most are external config, not code changes to this repo.
 
 ### Ops infrastructure (hard blockers)
 
-**HA backends.** Single Postgres, single MinIO. Workers are stateless and
-scale horizontally, but they all talk to one backend. If PG goes down,
-everything 503s. Production needs RDS Multi-AZ / Patroni + real S3 (or
-MinIO with quorum). Out of scope for this repo; flagged in
-[OPERATIONS.md](OPERATIONS.md).
+**HA backends.** Single Postgres, single S3 endpoint (the dev stack's
+MinIO). Workers are stateless and scale horizontally, but they all talk
+to one backend. If PG goes down, everything 503s. Production needs RDS
+Multi-AZ / Patroni for Postgres and an HA, STS-capable S3 backend (or
+MinIO with quorum if self-hosting). Out of scope for this repo; flagged
+in [OPERATIONS.md](OPERATIONS.md).
 
 **TLS + ingress.** Uvicorn serves HTTP. You need nginx/envoy/ALB in front
 for TLS termination, rate limiting, WAF, request-size caps. Standard L7

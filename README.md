@@ -4,8 +4,8 @@
   <img src="assets/duckicelake-logo.svg" alt="duckicelake — ducks around an iceberg in a lake" width="640"/>
 </p>
 
-An **Iceberg REST Catalog** proxy on top of **DuckLake**, with
-MinIO-backed object storage and real STS credential vending. Materialises
+An **Iceberg REST Catalog** proxy on top of **DuckLake**, backed by
+**S3 object storage with real STS credential vending**. Materialises
 DuckLake's snapshot / schema / stats state into Iceberg-spec manifests on
 demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`
 extension, Trino, Spark) read rows directly from S3 — and write back via
@@ -46,6 +46,14 @@ No "sync job", no manual rewrite step, no second-class write path.
 
 ### Requirements
 
+> **Object storage is S3.** Any S3-compatible backend works for data
+> I/O; the credential-vending and governance layers additionally need a
+> backend that implements **STS `AssumeRole` with session policies** —
+> that's what scopes a vended credential to one table's (or one masked
+> export's) prefix. The pixi dev stack bundles **MinIO** purely so you can
+> spin the whole thing up locally in one command; for production, point
+> `DUCKICELAKE_S3_*` at your real STS-capable S3 backend.
+>
 > **PostgreSQL is required as the DuckLake metastore.**
 > The proxy talks to DuckLake's catalog tables through a psycopg pool
 > (this is true regardless of the eager hook). The hybrid write model
@@ -519,7 +527,7 @@ point it at the proxy. Source + docs at
        │     │     │
        │     │     │  STS AssumeRole (per-table session policy)
        │     │     ▼
-       │     │   MinIO STS  ──▶ vended creds (s3.access-key-id, …)
+       │     │   S3 STS     ──▶ vended creds (s3.access-key-id, …)
        │     │
        │     │  SQL via DuckDB+ducklake (write conn + read pool)
        │     ▼
@@ -528,7 +536,7 @@ point it at the proxy. Source + docs at
        │     └── duckicelake_*    — properties, tags, branches, partition-spec sidecar,
        │                            nan_value_count cache, format-version override
        │
-       │  S3 / MinIO direct (object I/O)
+       │  S3 direct (object I/O)
        ▼
    data/<ns>/<tbl>/                       ── Parquet data files (DuckLake)
    data/<ns>/<tbl>/                       ── Parquet position-delete files (v2)
@@ -691,8 +699,9 @@ DuckDB's `iceberg` ext currently surfaces `variant` / `geometry` as
 
 ### STS credential vending
 
-`X-Iceberg-Access-Delegation: vended-credentials` triggers real MinIO
-`AssumeRole` with a session policy scoped to the table's data-file
+`X-Iceberg-Access-Delegation: vended-credentials` triggers a real STS
+`AssumeRole` against the object store, with a session policy scoped to the
+table's data-file
 keys + its `metadata/*` prefix. Returns
 `s3.access-key-id` / `s3.secret-access-key` / `s3.session-token` /
 `s3.credentials-expiration` in the LoadTable `config` map.
@@ -1002,7 +1011,7 @@ duckicelake/
 │   ├── pyiceberg_v3.py           # client-side shim: v3 types + v3 manifest writers
 │   ├── materialize.py            # full snapshot-chain materialiser (lazy + cached)
 │   ├── read_manifest.py          # parses client-supplied manifest chains on commit
-│   ├── sts.py                    # MinIO STS AssumeRole + session policies (file/prefix scoped)
+│   ├── sts.py                    # S3 STS AssumeRole + session policies (file/prefix scoped)
 │   ├── observability.py          # Prometheus metrics + JSON logging
 │   ├── models.py                 # Pydantic REST request/response models
 │   ├── server.py                 # FastAPI app: endpoints + middleware + handlers
