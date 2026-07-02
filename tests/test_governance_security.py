@@ -215,3 +215,61 @@ def test_default_vend_self_heals(monkeypatch):
     assert srv._rls_ready is True
     assert srv._arm_default_rls() is True         # now takes the rearm path
     assert calls["n"] == 2                        # ensure_rls not re-run once armed
+
+
+# ---- Stage 2 (merge-stabilization): B3 fail-closed on planning errors ------
+
+from test_governance_phase3 import _author_demo_policy  # noqa: E402,F401
+from test_governance_phase4 import (  # noqa: E402,F401
+    _author_file_layer_policy,
+    _seed as _p4_seed,
+    _vend as _p4_vend,
+)
+
+
+def test_planning_error_fails_closed_for_file_layer(client, settings):
+    """B3: when governance PLANNING itself throws (e.g. a PG hiccup in the
+    roles fetch), the except path used to leave file_layer_required=False and
+    serve base metadata + base creds for a file-layer table. The reserved
+    property stamp must make it fail CLOSED; the cooperative tier keeps its
+    documented fail-open."""
+    import uuid as _uuid
+    ns_fl = f"gsec_b3fl_{_uuid.uuid4().hex[:6]}"
+    ns_coop = f"gsec_b3co_{_uuid.uuid4().hex[:6]}"
+
+    # file-layer table, successfully vended once → property stamp written
+    _make_table(client, ns_fl, "events")
+    _author_file_layer_policy(client, ns_fl, "events")
+    _p4_seed(settings, ns_fl)
+    assert _p4_vend(client, ns_fl, "bob")["file_layer"] is True
+
+    # cooperative table (catalog-level mask, no file-layer)
+    _make_table(client, ns_coop, "events")
+    _author_demo_policy(client, ns_coop, "events")
+
+    # Break PLANNING (not the stamp): roles_for_principal reads
+    # duckicelake_role_grant; renaming it makes every plan attempt raise
+    # UndefinedTable before the plan can classify the table.
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("ALTER TABLE public.duckicelake_role_grant "
+                    "RENAME TO duckicelake_role_grant_b3bak")
+    try:
+        # file-layer table: LoadTable AND credentials vend must DENY
+        r = client.get(f"/v1/lake/namespaces/{ns_fl}/tables/events",
+                       headers={"X-Iceberg-Access-Delegation": "vended-credentials"})
+        assert r.status_code == 503, f"file-layer LoadTable must fail closed: {r.status_code}"
+        r = client.get(f"/v1/lake/namespaces/{ns_fl}/ducklake-credentials",
+                       params={"table": "events", "principal": "bob"})
+        assert r.status_code == 503, f"file-layer vend must fail closed: {r.status_code}"
+
+        # cooperative table: same breakage stays FAIL-OPEN (documented tier)
+        r = client.get(f"/v1/lake/namespaces/{ns_coop}/tables/events")
+        assert r.status_code == 200, f"cooperative tier must stay fail-open: {r.status_code}"
+    finally:
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+            cur.execute("ALTER TABLE public.duckicelake_role_grant_b3bak "
+                        "RENAME TO duckicelake_role_grant")
+
+    # healed: the file-layer read works again (masked, not denied)
+    r = client.get(f"/v1/lake/namespaces/{ns_fl}/tables/events")
+    assert r.status_code == 200, r.text

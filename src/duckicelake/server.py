@@ -185,6 +185,27 @@ def _ensure_file_layer_properties(ctx: "CatalogContext", ns: list[str], table: s
                       ns[0], table)
 
 
+def _stamped_file_layer(catalog_obj, ns: list[str], table: str | None) -> bool:
+    """Is the table stamped `duckicelake.file-layer-masking`?
+
+    Consulted when governance PLANNING itself throws (roles fetch / plan_for
+    on a PG hiccup): the fail-open except would otherwise leave
+    `file_layer_required` False and skip the airtight-tier deny — serving
+    base bytes for a file-layer table. Errs on the safe side: if even the
+    property read fails, treat the table as file-layer (deny). The stamp is
+    reserved (clients cannot set/clear `duckicelake.*` keys) and maintained
+    by `_ensure_file_layer_properties`."""
+    if table is None:
+        return False
+    try:
+        props = catalog_obj.get_table_properties(ns, table)
+        return props.get("duckicelake.file-layer-masking") == "true"
+    except Exception:
+        log.exception("cannot read file-layer stamp for %s.%s — "
+                      "assuming file-layer (fail closed)", ns[0], table)
+        return True
+
+
 def _file_layer_deny_prefixes(ctx: "CatalogContext", ns: list[str], roles: list[str]) -> list[str] | None:
     """For namespace-level vending: base prefixes of file-layer tables the
     principal is masked on (Deny beats the namespace Allow). Enumerates
@@ -1141,9 +1162,13 @@ def ducklake_credentials(
                     # — fail-open, flag it in the audit trail
                     decision = "error_unmasked"
     except Exception:
-        log.exception("ducklake-credentials governance failed for %s.%s "
-                      "— vending unmasked", ns[0], table)
+        log.exception("ducklake-credentials governance failed for %s.%s — "
+                      "fail-open only for the cooperative tier", ns[0], table)
         decision = "error_unmasked"
+        # B3: planning failed pre-classification — consult the reserved
+        # property stamp so a file-layer table still hits the deny below.
+        file_layer_required = (
+            file_layer_required or _stamped_file_layer(catalog, ns, table))
 
     # FAIL CLOSED: a file-layer-masked principal whose export couldn't be
     # materialized must not be vended base-prefix creds. Refuse.
@@ -2014,9 +2039,15 @@ def _build_load_response(
                     detail={"file_layer": file_layer_export is not None},
                 )
         except Exception:
-            log.exception("governance enforcement failed for %s.%s — serving unmasked",
-                          ns[0], table)
+            log.exception("governance enforcement failed for %s.%s — "
+                          "fail-open only for the cooperative tier", ns[0], table)
             file_layer_export = None
+            # B3: planning itself failed BEFORE the plan could classify the
+            # table, so file_layer_required may be a stale False. Consult the
+            # reserved property stamp — a file-layer table must fail CLOSED
+            # even when we couldn't compute its plan.
+            file_layer_required = (
+                file_layer_required or _stamped_file_layer(catalog, ns, table))
 
         # FAIL CLOSED for the airtight tier: a file-layer-masked principal
         # whose masked export / shadow metadata could not be materialized
