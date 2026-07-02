@@ -248,7 +248,7 @@ async def oauth_token_endpoint(
     if entry is None or not hmac.compare_digest(entry["secret"], client_secret):
         raise HTTPException(status_code=401, detail="invalid client credentials")
     # If the client requested a scope, intersect with what's allowed.
-    # For this prototype we just bind the full client scope — refining via
+    # v1 binds the full client scope — refining via
     # intersection would be a follow-up.
     effective_scope = entry.get("scope") or "*:*:*"
     effective_roles = entry.get("roles") or ""

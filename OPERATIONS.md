@@ -208,6 +208,43 @@ the *owner* DSN to clients (the documented cooperative fallback); that DSN
 now carries the owner password. Keep RLS **on** in production so clients only
 ever receive per-principal reader roles.
 
+### Owner-role prerequisites (RLS pre-flight)
+
+`ensure_rls` runs `ALTER TABLE … ENABLE ROW LEVEL SECURITY` on the
+`ducklake_*` catalog tables, which requires the proxy's role to **own**
+them. On a brownfield deployment where DuckLake was first attached under a
+different role, startup fails the pre-flight with an actionable error
+naming the tables — fix with `ALTER TABLE <schema>.<table> OWNER TO
+<proxy-role>` (superuser proxies skip the check). Until fixed,
+`ducklake-credentials` fails closed (503) on that catalog; every vend
+retries the arming, so no restart is needed after the fix.
+
+### Multi-catalog operations
+
+- **Provisioning** (`POST /v1/catalogs`) is a control-plane call: with auth
+  enabled it requires an **admin-scope token** (scope `*` / `*:*:*`).
+  The orchestration layer owns the naming contract
+  (`dl_<account>__<catalog>` schemas, `<account>/<catalog>/` prefixes).
+- **Tenancy**: give each tenant's OAuth client an `account` (4th `|`-field
+  in `DUCKICELAKE_OAUTH_CLIENTS`, or `"account"` in the clients file). A
+  catalog provisioned with `account_id` is reachable only by matching
+  tokens (or admin scope); cross-account prefixes 404 indistinguishably
+  from unknown ones.
+- **Capacity**: `DUCKICELAKE_MAX_ACTIVE_CATALOGS` (default 32) LRU-caps the
+  attached catalog contexts per worker; each holds a DuckDB attach + PG
+  pool. Size PG `max_connections` accordingly (workers × catalogs × pool).
+- **Startup DDL is advisory-lock-serialized** across workers (ensure_rls,
+  governance sidecars, the notify trigger) — `tuple concurrently updated`
+  at boot means you're running a pre-lock build.
+
+### Audit retention
+
+`DUCKICELAKE_AUDIT_RETENTION_DAYS` (default `0` = keep forever) lazily
+purges `duckicelake_governance_audit` rows older than the window — at most
+once an hour per worker, piggybacked on the audit write; no scheduler
+needed. Export the table before enabling retention if you need long-term
+compliance archives.
+
 ## Known operational risks
 
 1. **DuckLake schema drift**: direct Postgres INSERT/UPDATE of `ducklake_delete_file`, `ducklake_sort_info`, `ducklake_data_file.end_snapshot`. A minor DuckLake version bump that changes these could silently break commits. **Mitigation**: pin DuckLake in `pixi.toml`, subscribe to DuckLake release notes, run the full integration suite before any version bump.

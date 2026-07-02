@@ -11,11 +11,12 @@ demand, so standard Iceberg clients (PyIceberg, DuckDB's `iceberg`
 extension, Trino, Spark) read rows directly from S3 — and write back via
 register-in-place commits that DuckLake atomically records.
 
-> **This branch** (`experimental_governance`) additionally ships a
-> tag-based **governance layer** — object tags, RBAC, column masking and
-> row-access policies, enforced on *both* read paths (Iceberg REST and
-> DuckLake-direct) and aimed squarely at the "LLM agents must never see
-> PII" use case. See the Governance section below.
+> duckicelake also ships a tag-based **governance layer** — object tags,
+> RBAC, column masking and row-access policies, enforced on *both* read
+> paths (Iceberg REST and DuckLake-direct) and aimed squarely at the "LLM
+> agents must never see PII" use case — and a **multi-catalog registry**
+> that serves many isolated per-tenant catalogs from one proxy. See the
+> Governance and Multi-catalog sections below.
 
 ## ⭐ Hybrid write model — write via either path, read from anywhere
 
@@ -57,7 +58,7 @@ No "sync job", no manual rewrite step, no second-class write path.
 > the ~1s warm-S3 guarantee. Switching backends is not currently
 > wired through the proxy's config.
 
-## 🛡️ Governance: tags, RBAC, masking (experimental)
+## 🛡️ Governance: tags, RBAC, masking
 
 Tag-based governance enforced by the catalog — authored once, applied per
 principal, across **both read paths and every engine**. Enforcement is
@@ -416,11 +417,10 @@ the following are confirmed working:
 - **Performance.** Export materialization and masked scans are on par with
   base scans on a 1M-row table; re-vending reuses the existing export.
 
-## Current state (this branch)
+## Current state
 
-`experimental_governance` is not yet merged to `main`. Everything in the
-governance section above is **implemented and tested** — to be concrete,
-shipped today:
+Everything in the governance section above is **implemented and tested** —
+to be concrete, shipped today:
 
 | Capability | Status |
 |---|---|
@@ -429,13 +429,16 @@ shipped today:
 | Executed DuckLake masking views + `ducklake-credentials` vending, both read paths | ✅ |
 | Per-principal Postgres reader roles + row-level security on the `ducklake_*` catalog | ✅ |
 | File-layer masking — pre-masked Parquet + shadow Iceberg metadata (byte-level, every engine) | ✅ |
+| Multi-catalog registry — isolated per-tenant catalogs (PG schema + S3 prefix), account-scoped access | ✅ |
+| Multi-worker safe — advisory-locked startup DDL, self-healing RLS arming, per-catalog contexts | ✅ |
 
-The branch has been through two adversarial code-review passes; the
+The code has been through multiple adversarial review + audit passes; the
 security/correctness findings (reserved-property protection, reserved-name
-guards, namespace-vend deny derivation, injection-safe export SQL,
-fail-open everywhere) and the performance follow-ups (set-based RLS
-predicate, per-vend roles, once-per-process sidecar DDL, batched S3
-deletes) are all fixed and regression-tested.
+guards, namespace-vend deny derivation, injection-safe export SQL, the
+airtight tier failing CLOSED on internal errors, catalog-drift policy
+carry) and the performance follow-ups (set-based RLS predicate, per-vend
+roles, table-scoped attachment fetch, batched S3 deletes) are all fixed and
+regression-tested.
 
 **Known boundaries / not yet done:**
 
@@ -776,11 +779,140 @@ pixi run test            # pytest integration suite
 
 Teardown: `pixi run backends-down`.
 
+## Sample data & querying
+
+Load the optional demo dataset (idempotent — re-running never duplicates):
+
+```bash
+pixi run seed            # analytics.customers (8 rows) + analytics.orders (15 rows, 2 snapshots)
+pixi run seed-governed   # ...and author the demo mask: pii.email on customers.email,
+                         # bypassed by role pii_reader (granted to principal 'alice')
+```
+
+Then query it from any of the three common clients (all examples verified
+against the dev stack):
+
+**pyiceberg**
+
+```python
+from pyiceberg.catalog.rest import RestCatalog
+
+cat = RestCatalog(
+    "lake", uri="http://127.0.0.1:8181", warehouse="lake",
+    **{
+        "s3.endpoint": "http://127.0.0.1:9000",
+        "s3.access-key-id": "minioadmin",
+        "s3.secret-access-key": "minioadmin",
+        "s3.region": "us-east-1",
+        "s3.path-style-access": "true",
+    },
+)
+t = cat.load_table("analytics.customers")
+print(t.scan().to_arrow().to_pandas())
+
+# time-travel: orders has ≥2 snapshots — scan the first one with data
+o = cat.load_table("analytics.orders")
+first = next(s.snapshot_id for s in o.metadata.snapshots
+             if int(s.summary.get("added-records", 0)) > 0)
+print(o.scan(snapshot_id=first).to_arrow().num_rows)   # 8, current is 15
+```
+
+(If auth is enabled, add `"credential": "client_id:client_secret"`.)
+
+**DuckDB iceberg extension**
+
+```sql
+INSTALL httpfs; LOAD httpfs; INSTALL iceberg; LOAD iceberg;
+CREATE OR REPLACE SECRET ice_s3 (
+    TYPE S3, KEY_ID 'minioadmin', SECRET 'minioadmin',
+    REGION 'us-east-1', ENDPOINT '127.0.0.1:9000',
+    USE_SSL false, URL_STYLE 'path');
+ATTACH 'lake' AS ice (
+    TYPE ICEBERG, ENDPOINT 'http://127.0.0.1:8181',
+    AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none');
+
+SELECT c.country, sum(o.amount) AS revenue
+FROM ice.analytics.customers c
+JOIN ice.analytics.orders o ON o.customer_id = c.id
+WHERE o.status = 'paid'
+GROUP BY c.country ORDER BY revenue DESC;
+
+-- time-travel by snapshot id
+SELECT count(*) FROM ice.analytics.orders AT (VERSION => <snapshot-id>);
+```
+
+(`ACCESS_DELEGATION_MODE 'none'` matters — see the
+[iceberg-extension notes](#duckdb-iceberg-extension-configuration-notes).)
+
+**lakesh** (the companion SQL shell)
+
+```bash
+lakesh config init       # writes ~/.config/lakesh/config.toml
+```
+
+```toml
+default = "local"
+[profiles.local]
+uri       = "http://127.0.0.1:8181"
+warehouse = "lake"
+[profiles.local.s3]
+endpoint   = "http://127.0.0.1:9000"
+region     = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+path_style = true
+```
+
+```bash
+lakesh doctor                                             # connectivity check
+lakesh exec -q 'SELECT count(*) FROM analytics.customers' # one-shot query
+lakesh                                                    # REPL: \l, \d analytics, SELECT …
+```
+
+With `pixi run seed-governed`, contrast the governed views:
+`GET /v1/lake/governance/effective-policies?table=analytics.customers&principal=bob`
+shows `email` masked, while `principal=alice` (holds `pii_reader`) reads it
+clear — the full walkthrough is `./scripts/governance_demo.sh`.
+
+## Multi-catalog: isolated per-tenant catalogs
+
+One proxy can serve many **isolated DuckLake catalogs** from a shared
+Postgres database and S3 bucket — one Postgres metadata schema + one S3
+data prefix per catalog, selected by the Iceberg REST `{prefix}` path
+segment. The default catalog (`DUCKICELAKE_CATALOG`, prefix `lake`) needs
+no registration; existing single-catalog deployments are unchanged.
+
+```bash
+# control-plane: register a tenant catalog (admin-scope token when auth is on)
+curl -X POST localhost:8181/v1/catalogs -H 'content-type: application/json' -d '{
+  "catalog_id": "acme", "metadata_schema": "dl_acme__main",
+  "data_prefix": "acme/main/", "account_id": "acme-corp"}'
+
+# data-plane: same Iceberg REST surface, per-tenant prefix
+curl localhost:8181/v1/acme/namespaces
+```
+
+- **Isolation**: the tenant's `ducklake_*` metadata lives in its own PG
+  schema (`METADATA_SCHEMA` on the DuckLake attach), its Parquet under its
+  own prefix; per-catalog RLS reader groups mean a vended tenant reader
+  can't even see another tenant's metadata rows.
+- **Account scoping**: with auth enabled, a catalog provisioned with an
+  `account_id` is only reachable by tokens carrying the matching `account`
+  claim (4th field in `DUCKICELAKE_OAUTH_CLIENTS`:
+  `id:secret|scope|roles|account`) or an admin-scope token; a cross-account
+  prefix answers the same 404 as an unknown one.
+- **Writes too**: table create/commit/drop, views, and
+  `ducklake-credentials` vending all route through the resolved catalog;
+  reader RLS is armed lazily on a tenant's first vend, fail-closed.
+
+Design details: [docs/multi_catalog_isolation.md](docs/multi_catalog_isolation.md).
+
 ## Endpoint summary
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/v1/config` | catalog prefix + endpoint allowlist |
+| GET | `/v1/config` | catalog prefix + endpoint allowlist; `?warehouse=<catalog_id>` answers per-catalog |
+| POST | `/v1/catalogs` | provision an isolated per-tenant catalog (admin-scope token when auth is on) |
 | GET | `/healthz`, `/readyz`, `/metrics` | ops endpoints (auth-exempt) |
 | POST | `/v1/oauth/tokens` | OAuth2 client-credentials token endpoint |
 | GET / POST / DELETE | `/v1/{prefix}/namespaces[/{ns}]` | schema CRUD |
@@ -900,8 +1032,10 @@ carry secrets.
 | `DUCKICELAKE_CACHE_MAX` | `1024` | LRU cap for in-process metadata cache |
 | `DUCKICELAKE_LOG_FORMAT` | `json` | `json` for prod, `text` for dev |
 | `DUCKICELAKE_LOG_LEVEL` | `INFO` | |
+| `DUCKICELAKE_AUDIT_RETENTION_DAYS` | `0` *(keep forever)* | lazily purge governance-audit rows older than this |
+| `DUCKICELAKE_MAX_ACTIVE_CATALOGS` | `32` | LRU cap on attached per-tenant catalog contexts |
 | `DUCKICELAKE_REQUIRE_AUTH` | *(unset)* | `1` → fail boot if no OAuth clients configured |
-| `DUCKICELAKE_OAUTH_CLIENTS` | *(empty → auth disabled)* | `id1:secret1\|scope1,id2:secret2\|scope2` |
+| `DUCKICELAKE_OAUTH_CLIENTS` | *(empty → auth disabled)* | `id:secret\|scope\|roles\|account` (roles → governance; account → multi-catalog tenancy) |
 | `DUCKICELAKE_OAUTH_CLIENTS_FILE` | *(empty)* | JSON file alternative |
 | `DUCKICELAKE_OAUTH_JWT_SECRET` | *required when clients are configured* | HMAC key |
 | `DUCKICELAKE_OAUTH_TTL_SECONDS` | `3600` | |
@@ -985,7 +1119,7 @@ filtered storage access); the rest are engine-trust.
   catalog-level tier keeps its documented fail-open behavior; the boundary
   between the two is explicit, not accidental.
 
-**Where it is clearly behind** — this is an experimental single-process proxy:
+**Where it is clearly behind** — this is a young project against mature platforms:
 
 - **Identity** — dev stack runs Postgres `trust` auth; no SSO/OIDC
   federation, SCIM, or token-scoped RBAC.

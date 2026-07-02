@@ -134,10 +134,11 @@ PromQL queries for an SLO dashboard (p95 LoadTable latency, commit
 error rate, cache hit-rate, pool saturation) but the Grafana JSON isn't
 in the repo. An operator builds them on first deploy.
 
-**No audit log.** `log.info("...")` fires on commits, but nothing is
-structured as "principal X did commit action Y on table Z at time T"
-for SOX / GDPR purposes. Adding an audit sidecar table + handler behind
-`commit_table` is maybe a day of work.
+**Commit audit is partial.** Governance authoring and every governed READ
+land in the structured `duckicelake_governance_audit` sidecar (with
+`DUCKICELAKE_AUDIT_RETENTION_DAYS` retention), but plain `commit_table`
+data commits still only `log.info(...)` — wiring commits into the same
+sidecar is maybe half a day of work.
 
 ### Testing gaps
 
@@ -180,9 +181,11 @@ multi-platform support.
   S3-unavailable scenarios. Write + rehearse the restore runbook.
 
 After that, you're at "ready for real users" for small-to-medium
-internal deployments. Enterprise-regulated workloads (full KMS envelope,
-Spark-write branches, SOC 2 audit automation, multi-tenant isolation)
-need upstream work we can't do here.
+internal deployments. Multi-tenant isolation is implemented (per-catalog
+PG schemas + S3 prefixes + account-scoped routing — see the README's
+Multi-catalog section); enterprise-regulated workloads (full KMS
+envelope, Spark-write branches, SOC 2 audit automation) still need
+upstream work we can't do here.
 
 ## Everything else
 
