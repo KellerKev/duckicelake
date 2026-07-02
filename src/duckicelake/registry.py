@@ -48,8 +48,14 @@ class CatalogContext:
     bound to it. Mirrors the manager wiring server.py used for the single
     global catalog, but one set per isolated catalog."""
 
-    def __init__(self, settings: Settings, ref: CatalogRef) -> None:
+    def __init__(self, settings: Settings, ref: CatalogRef,
+                 account_id: str | None = None) -> None:
         self.ref = ref
+        # Owning tenant (registry row's account_id). None = unowned: the
+        # default catalog or a shared catalog — reachable by any
+        # authenticated caller. Set → resolve_catalog requires a matching
+        # `account` claim (or an admin-scope token); mismatch is a 404.
+        self.account_id = account_id
         self.catalog = DuckLakeCatalog(settings, ref)
         self.store = GovernanceStore(self.catalog)
         self.policy_engine = PolicyEngine(self.store)
@@ -99,19 +105,26 @@ class CatalogRegistry:
             ensure_catalog_registry_table(cur)
 
     def resolve_ref(self, catalog_id: str) -> CatalogRef | None:
-        # The default catalog resolves from settings — no registry row needed.
+        resolved = self._resolve_row(catalog_id)
+        return resolved[0] if resolved else None
+
+    def _resolve_row(self, catalog_id: str) -> tuple[CatalogRef, str | None] | None:
+        """(ref, account_id) for a catalog id, or None if unregistered. The
+        default catalog resolves from settings — no registry row, no account
+        (it is settings-owned and reachable by every authenticated caller)."""
         if catalog_id == self.settings.catalog_name:
-            return self.settings.default_catalog_ref()
+            return self.settings.default_catalog_ref(), None
         with self._pg() as c, c.cursor() as cur:
             ensure_catalog_registry_table(cur)
             row = cur.execute(
-                "SELECT metadata_schema, data_prefix "
+                "SELECT metadata_schema, data_prefix, account_id "
                 "FROM public.duckicelake_catalog WHERE catalog_id = %s",
                 [catalog_id],
             ).fetchone()
         if row is None:
             return None
-        return CatalogRef(catalog_id, data_prefix=row[1], metadata_schema=row[0])
+        ref = CatalogRef(catalog_id, data_prefix=row[1], metadata_schema=row[0])
+        return ref, row[2]
 
     # ---- lifecycle -----------------------------------------------------
     def register_default(self) -> CatalogContext:
@@ -134,10 +147,11 @@ class CatalogRegistry:
             if ctx is not None:
                 self._ctxs.move_to_end(catalog_id)
         if ctx is None:
-            ref = self.resolve_ref(catalog_id)
-            if ref is None:
+            resolved = self._resolve_row(catalog_id)
+            if resolved is None:
                 raise UnknownCatalog(catalog_id)
-            ctx = CatalogContext(self.settings, ref)
+            ref, account_id = resolved
+            ctx = CatalogContext(self.settings, ref, account_id=account_id)
             with self._lock:
                 # Another thread may have built it meanwhile.
                 existing = self._ctxs.get(catalog_id)

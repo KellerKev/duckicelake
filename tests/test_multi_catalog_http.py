@@ -161,3 +161,118 @@ def test_table_create_load_routed_to_catalog(provisioned, client):
     # Drop+purge so the fixture can drop the namespace cleanly.
     client.delete(
         f"/v1/{tenant_prefix}/namespaces/{NS_TENANT}/tables/t1?purgeRequested=true")
+
+
+# ---- Stage 3 (merge-stabilization): account authz + gated provisioning -----
+#
+# The session proxy runs auth-DISABLED (dev default), so the enforcement
+# paths are exercised in-process: import the server module, swap in an
+# enabled AuthConfig, and call the dependency/gate directly with real JWTs.
+
+import types
+import uuid as _uuid
+
+from duckicelake.auth import AuthConfig, issue_token
+
+
+def _enabled_cfg() -> AuthConfig:
+    return AuthConfig(
+        jwt_secret=b"test-secret-32-bytes-xxxxxxxxxxx",
+        clients={"svc": {"secret": "s", "scope": "*:*:*", "roles": "",
+                         "account": ""}},
+        ttl_seconds=300,
+        issuer="duckicelake",
+    )
+
+
+def _req_with_token(cfg, *, scope, account="", sub="tester"):
+    tok = issue_token(cfg, sub, scope=scope,
+                      roles="", account=account)["access_token"]
+    return types.SimpleNamespace(headers={"authorization": f"Bearer {tok}"})
+
+
+def test_account_scoped_catalog_access(monkeypatch, settings):
+    """Cross-account access to a provisioned catalog is a 404 (not 403 — the
+    prefix must not leak existence); the owning account and admin-scope
+    tokens pass; the default catalog stays reachable to everyone."""
+    import duckicelake.server as srv
+    from fastapi import HTTPException
+
+    cid = f"authz_{_uuid.uuid4().hex[:6]}"
+    srv.registry.provision(cid, f"dl_{cid}__main", f"{cid}/main/", "acme")
+    cfg = _enabled_cfg()
+    monkeypatch.setattr(srv, "auth_cfg", cfg)
+    try:
+        # owning account → resolved
+        ctx = srv.resolve_catalog(
+            cid, _req_with_token(cfg, scope="ns:*:rw", account="acme"))
+        assert ctx.catalog_id == cid and ctx.account_id == "acme"
+
+        # wrong account → 404 (indistinguishable from unknown prefix)
+        try:
+            srv.resolve_catalog(
+                cid, _req_with_token(cfg, scope="ns:*:rw", account="globex"))
+            assert False, "cross-account access must 404"
+        except HTTPException as e:
+            assert e.status_code == 404
+
+        # no account claim at all → 404
+        try:
+            srv.resolve_catalog(cid, _req_with_token(cfg, scope="ns:*:rw"))
+            assert False, "account-less token must not reach an owned catalog"
+        except HTTPException as e:
+            assert e.status_code == 404
+
+        # admin-scope token (control plane) reaches any catalog
+        ctx = srv.resolve_catalog(cid, _req_with_token(cfg, scope="*:*:*"))
+        assert ctx.catalog_id == cid
+
+        # the default catalog has no owner → any authenticated caller
+        ctx = srv.resolve_catalog(
+            settings.catalog_name,
+            _req_with_token(cfg, scope="ns:*:rw", account="globex"))
+        assert ctx.catalog_id == settings.catalog_name
+    finally:
+        # drop the provisioned schema so reruns start clean
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
+            c.execute(f'DROP SCHEMA IF EXISTS "dl_{cid}__main" CASCADE')
+            c.execute("DELETE FROM public.duckicelake_catalog WHERE catalog_id = %s",
+                      [cid])
+
+
+def test_provisioning_requires_admin_scope(monkeypatch):
+    """POST /v1/catalogs is a control-plane op: with auth enabled, a
+    non-admin token gets 403; an admin-scope token passes the gate."""
+    import duckicelake.server as srv
+    from fastapi import HTTPException
+
+    cfg = _enabled_cfg()
+    monkeypatch.setattr(srv, "auth_cfg", cfg)
+
+    try:
+        srv._require_admin(_req_with_token(cfg, scope="ns:*:rw", account="acme"))
+        assert False, "non-admin token must not provision catalogs"
+    except HTTPException as e:
+        assert e.status_code == 403
+
+    srv._require_admin(_req_with_token(cfg, scope="*:*:*"))  # no raise
+
+
+def test_provisioning_open_when_auth_disabled(client, settings):
+    """Dev default (auth off): provisioning stays reachable — matches every
+    other endpoint's dev semantics. (The live session proxy runs auth-off.)"""
+    cid = f"devprov_{_uuid.uuid4().hex[:6]}"
+    try:
+        r = client.post("/v1/catalogs", json={
+            "catalog_id": cid, "metadata_schema": f"dl_{cid}__main",
+            "data_prefix": f"{cid}/main/", "account_id": "acme",
+            "create_default_namespace": False})
+        assert r.status_code == 201, r.text
+        # and with auth off, the account_id does not block access (dev semantics)
+        r = client.get(f"/v1/{cid}/namespaces")
+        assert r.status_code == 200, r.text
+    finally:
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
+            c.execute(f'DROP SCHEMA IF EXISTS "dl_{cid}__main" CASCADE')
+            c.execute("DELETE FROM public.duckicelake_catalog WHERE catalog_id = %s",
+                      [cid])

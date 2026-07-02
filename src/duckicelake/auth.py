@@ -41,10 +41,13 @@ DEFAULT_TTL_SECONDS = 3600
 class AuthConfig:
     jwt_secret: bytes
     # client_id -> {"secret": str, "scope": str (space-separated caps),
-    #               "roles": str (space-separated role names)}
+    #               "roles": str (space-separated role names),
+    #               "account": str (multi-catalog tenant id, "" = none)}
     # `roles` feeds the governance `roles` JWT claim (Phase 1 governance
     # layer). Empty string = no roles. The policy engine (Phase 2) reads
     # these to decide masking; in Phase 1 they're authored + carried only.
+    # `account` feeds the `account` claim — resolve_catalog matches it
+    # against a provisioned catalog's account_id (cross-account = 404).
     clients: dict[str, dict[str, str]]
     ttl_seconds: int
     issuer: str                 # "iss" claim — proxy identity
@@ -68,22 +71,25 @@ WRITE_ACTIONS = {"POST", "PUT", "DELETE", "PATCH"}
 
 
 def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
-    """Parse `id1:secret1|scope|roles,id2:secret2|scope,...` — empty entries
-    ignored.
+    """Parse `id1:secret1|scope|roles|account,id2:secret2|scope,...` — empty
+    entries ignored.
 
-    `scope` and `roles` are optional, in that order, `|`-delimited so
-    secrets can still contain `:`. Defaults: scope `*:*:*` (superuser, for
-    dev), roles empty. `roles` is a space-separated list of governance role
-    names surfaced in the JWT `roles` claim.
+    `scope`, `roles`, and `account` are optional, in that order,
+    `|`-delimited so secrets can still contain `:`. Defaults: scope `*:*:*`
+    (superuser, for dev), roles empty, account empty. `roles` is a
+    space-separated list of governance role names surfaced in the JWT
+    `roles` claim; `account` is the multi-catalog tenant id surfaced as the
+    `account` claim (matched against a catalog's account_id).
     """
     out: dict[str, dict[str, str]] = {}
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair:
             continue
-        # Split off optional scope + roles first.
+        # Split off optional scope + roles + account first.
         scope = "*:*:*"
         roles = ""
+        account = ""
         if "|" in pair:
             fields = pair.split("|")
             pair = fields[0]
@@ -91,6 +97,8 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
                 scope = fields[1].strip()
             if len(fields) >= 3:
                 roles = fields[2].strip()
+            if len(fields) >= 4:
+                account = fields[3].strip()
         if ":" not in pair:
             raise ValueError(
                 f"DUCKICELAKE_OAUTH_CLIENTS entry missing ':' in {pair!r}"
@@ -98,7 +106,8 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
         cid, csecret = pair.split(":", 1)
         if not cid or not csecret:
             raise ValueError(f"empty id or secret in {pair!r}")
-        out[cid] = {"secret": csecret, "scope": scope, "roles": roles}
+        out[cid] = {"secret": csecret, "scope": scope, "roles": roles,
+                    "account": account}
     return out
 
 
@@ -117,7 +126,7 @@ def _parse_clients_file(path: str) -> dict[str, dict[str, str]]:
         if not isinstance(k, str):
             raise ValueError(f"{path}: non-string id {k!r}")
         if isinstance(v, str):
-            out[k] = {"secret": v, "scope": "*:*:*", "roles": ""}
+            out[k] = {"secret": v, "scope": "*:*:*", "roles": "", "account": ""}
         elif isinstance(v, dict) and "secret" in v:
             raw_roles = v.get("roles", "")
             roles = " ".join(raw_roles) if isinstance(raw_roles, list) else str(raw_roles)
@@ -125,9 +134,10 @@ def _parse_clients_file(path: str) -> dict[str, dict[str, str]]:
                 "secret": str(v["secret"]),
                 "scope": str(v.get("scope", "*:*:*")),
                 "roles": roles.strip(),
+                "account": str(v.get("account", "")).strip(),
             }
         else:
-            raise ValueError(f"{path}: entry {k!r} must be str or {{secret, scope, roles}}")
+            raise ValueError(f"{path}: entry {k!r} must be str or {{secret, scope, roles, account}}")
     return out
 
 
@@ -172,6 +182,7 @@ def issue_token(
     client_id: str,
     scope: str | None = None,
     roles: str | None = None,
+    account: str | None = None,
 ) -> dict:
     now = int(time.time())
     payload: dict[str, object] = {
@@ -186,6 +197,10 @@ def issue_token(
     # engine can index it directly; absent when the client holds no roles.
     if roles:
         payload["roles"] = roles.split()
+    # Multi-catalog tenant claim: resolve_catalog matches it against a
+    # provisioned catalog's account_id (cross-account access = 404).
+    if account:
+        payload["account"] = account
     token = jwt.encode(payload, cfg.jwt_secret, algorithm=JWT_ALGORITHM)
     return {
         "access_token": token,
@@ -237,8 +252,10 @@ async def oauth_token_endpoint(
     # intersection would be a follow-up.
     effective_scope = entry.get("scope") or "*:*:*"
     effective_roles = entry.get("roles") or ""
+    effective_account = entry.get("account") or ""
     return issue_token(
         cfg, client_id=client_id, scope=effective_scope, roles=effective_roles,
+        account=effective_account,
     )
 
 
@@ -297,6 +314,13 @@ def _parse_scope(scope: str) -> list[tuple[str, str]]:
             ns, cap = parts
             out.append((ns, cap))
     return out
+
+
+def is_admin_scope(scope: str) -> bool:
+    """True for a superuser/service token (`*`, `*:*` or `*:*:*`) — required
+    for control-plane operations (catalog provisioning) and grants access to
+    any account's catalog."""
+    return ("*", "*") in _parse_scope(scope)
 
 
 def scope_allows(scope: str, namespace: str | None, method: str) -> bool:

@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from .auth import (
     AuthConfig,
+    is_admin_scope,
     load_auth_config,
     make_bearer_dependency,
     oauth_token_endpoint,
@@ -538,7 +539,20 @@ def get_config(warehouse: str | None = None) -> ConfigResponse:
 # data_prefix. Called by the orchestration layer when an account/catalog is
 # created. The (metadata_schema, data_prefix) names are derived + validated
 # upstream by the orchestration layer's naming contract; here they are trusted.
-# TODO(auth): gate behind an admin/service scope before production.
+# Control-plane op: gated behind an admin-scope token (_require_admin).
+
+def _require_admin(request: Request) -> None:
+    """Provisioning is a control-plane operation — require a superuser-scope
+    token (`*` / `*:*:*`) when auth is enabled. Dev (auth off) passes, same
+    as every other endpoint."""
+    if not auth_cfg.enabled:
+        return
+    claims = claims_from_request(auth_cfg, request)
+    if not is_admin_scope(claims.get("scope", "")):
+        raise HTTPException(
+            status_code=403,
+            detail="catalog provisioning requires an admin-scoped token")
+
 
 class ProvisionCatalogRequest(BaseModel):
     catalog_id: str = Field(..., description="Iceberg REST {prefix} for this catalog")
@@ -555,7 +569,8 @@ class CatalogInfo(BaseModel):
 
 
 @app.post("/v1/catalogs", response_model=CatalogInfo, status_code=201)
-def provision_catalog(req: ProvisionCatalogRequest) -> CatalogInfo:
+def provision_catalog(req: ProvisionCatalogRequest, request: Request) -> CatalogInfo:
+    _require_admin(request)
     ctx = registry.provision(
         req.catalog_id, req.metadata_schema, req.data_prefix, req.account_id
     )
@@ -578,15 +593,29 @@ def _check_prefix(prefix: str) -> None:
         )
 
 
-def resolve_catalog(prefix: str) -> CatalogContext:
+def resolve_catalog(prefix: str, request: Request) -> CatalogContext:
     """FastAPI dependency: resolve the Iceberg REST {prefix} to its isolated
     catalog context (the default catalog or a provisioned per-account one).
-    404 if the prefix has no registered catalog. Handlers that depend on this
-    rebind their local `catalog`/managers to the resolved context."""
+    404 if the prefix has no registered catalog OR the caller's account may
+    not reach it — same status so an outsider can't probe which catalog ids
+    exist. Handlers that depend on this rebind their local `catalog`/managers
+    to the resolved context."""
     try:
-        return registry.get(prefix)
+        ctx = registry.get(prefix)
     except UnknownCatalog:
         raise HTTPException(status_code=404, detail=f"Unknown catalog prefix '{prefix}'")
+    # Account → catalog authorization (the REST-layer hard tenant boundary;
+    # per-catalog PG reader roles + disjoint S3 prefixes back it below).
+    # Enforced only when auth is on. Unowned catalogs (account_id NULL —
+    # incl. the default) stay reachable to every authenticated caller;
+    # admin-scope tokens reach everything.
+    if auth_cfg.enabled and ctx.account_id is not None:
+        claims = claims_from_request(auth_cfg, request)
+        if (claims.get("account") != ctx.account_id
+                and not is_admin_scope(claims.get("scope", ""))):
+            raise HTTPException(
+                status_code=404, detail=f"Unknown catalog prefix '{prefix}'")
+    return ctx
 
 
 @app.get("/v1/{prefix}/namespaces", response_model=ListNamespacesResponse)
