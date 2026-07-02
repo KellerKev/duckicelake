@@ -1,6 +1,6 @@
 """FastAPI router for the Phase 1 governance authoring surface.
 
-Snowflake-CLI-shaped endpoints under `/v1/{prefix}/governance/*`. Kept in
+Warehouse-style governance endpoints under `/v1/{prefix}/governance/*`. Kept in
 its own module + mounted via `include_router` so the core Iceberg REST
 server (server.py) stays essentially untouched — the governance layer is an
 additive, independently-removable experiment.

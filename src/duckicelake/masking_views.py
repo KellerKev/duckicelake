@@ -2,8 +2,8 @@
 
 One physical DuckLake view per (table, mask-signature), named
 `__mask_{table}__{sig}` in the base table's namespace. Principals whose
-effective plans share a mask shape share the view (Snowflake-Horizon-style
-ad-hoc masking). The view persists in `ducklake_view`, so both read paths
+effective plans share a mask shape share the view (ad-hoc masking — one
+view per mask shape, not per principal). The view persists in `ducklake_view`, so both read paths
 can execute it:
 
   * DuckLake-direct DuckDB sessions run it natively (the stored SQL keeps

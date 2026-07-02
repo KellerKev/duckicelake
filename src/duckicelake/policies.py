@@ -17,10 +17,11 @@ alone. Phase 2 therefore emits, per principal:
     byte-level vector for those engines; Phase 4 covers pre-masked files).
 
 The bypass decision is declarative: a principal holding any role in a
-policy's `unmasked_roles` sees unmasked data. This stands in for Snowflake's
-`CURRENT_ROLE()` check in the policy body — we don't execute the body
-per-principal, we evaluate the role set and use the body purely as the
-masked-value / filter expression for the view SQL.
+policy's `unmasked_roles` sees unmasked data. This stands in for the
+common warehouse pattern of a `CURRENT_ROLE()` check inside the policy
+body — we don't execute the body per-principal, we evaluate the role set
+and use the body purely as the masked-value / filter expression for the
+view SQL.
 
 The `build_plan` / `apply_plan_to_metadata` / `build_masked_view_sql`
 functions are pure and unit-tested without Postgres.
@@ -116,8 +117,9 @@ def _masked_projection(columns: list[str], masks: dict[str, str]) -> str:
 def _qualify_expr(body_sql: str, column: str) -> str:
     """Render a policy body as a concrete column expression.
 
-    The standalone token `val` (Snowflake's masking-policy argument
-    convention) is replaced with the quoted column. Bodies with no `val`
+    The standalone token `val` (the masking-policy argument convention:
+    it stands for the column value) is replaced with the quoted column
+    reference. Bodies with no `val`
     (e.g. `'***'`, `NULL`) are constant masks and pass through unchanged.
     """
     return _VAL_TOKEN.sub(f'"{column}"', body_sql)
@@ -217,7 +219,7 @@ def build_masked_view_sql(
     """The view-fallback SELECT: masked columns replaced by their expression,
     the row filter applied in a nested subquery. The nesting matters now that
     views are executed, not advisory: a filter referencing a masked column
-    must see the *raw* value (Snowflake row-policy semantics), and a flat
+    must see the *raw* value (standard row-access-policy semantics), and a flat
     WHERE after the mask aliases resolves alias-vs-base-column differently
     per engine. The base table stays unqualified — a DuckLake-direct client
     resolves it against its own attached catalog."""

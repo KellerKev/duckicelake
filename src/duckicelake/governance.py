@@ -135,9 +135,10 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
-    # Phase 2 enforcement column: roles that *bypass* the policy. In
-    # Snowflake the policy body inspects CURRENT_ROLE(); rather than execute
-    # SQL per-principal we make the bypass set explicit + declarative. A
+    # Phase 2 enforcement column: roles that *bypass* the policy. The
+    # common warehouse pattern is a CURRENT_ROLE() check inside the policy
+    # body; rather than execute SQL per-principal we make the bypass set
+    # explicit + declarative. A
     # principal holding any role in `unmasked_roles` sees unmasked data /
     # unfiltered rows. `body_sql` stays the masked-value / filter expression
     # used to synthesise the view-fallback SQL. NULL/empty = nobody bypasses.
@@ -262,7 +263,7 @@ def resolve_effective_policies(
     `principal`. Phase 1: descriptive only — we report the derived set, we
     do not evaluate the role clauses or mask anything.
 
-    Tag cascade mirrors Snowflake: a tag on a schema cascades to its tables
+    Tag cascade: a tag on a schema cascades to its tables
     and columns; a tag on a table cascades to its columns; a column tag is
     the most specific. More specific assignments are additive here (we list
     every matching policy) — Phase 2 decides precedence when it enforces.
