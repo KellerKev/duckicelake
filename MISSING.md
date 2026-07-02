@@ -77,6 +77,17 @@ env vars. Production needs Vault / AWS Secrets Manager / IRSA / Azure KV
 feeding them, plus a documented rotation runbook (dual-accept → drain
 old workers → remove old secret).
 
+**Root-key distribution is the prod no-go.** Response configs omit the root
+MinIO key pair **by default** (`suppress_root_creds = true`); clients rely
+on vended STS creds (`X-Iceberg-Access-Delegation` on the REST path, the
+`ducklake-credentials` endpoint for DuckLake-direct). Flipping it off
+(`DUCKICELAKE_SUPPRESS_ROOT_CREDS=0` or `suppress_root_creds = false` in
+`duckicelake.toml`) makes the governance masking layer bypassable in one
+line — dev-only. The vended PG DSN is a per-principal RLS-governed reader
+role — but the dev stack's trust-auth means PG *authentication* is only
+real under production scram+TLS; see the pg_hba recipe in
+[OPERATIONS.md](OPERATIONS.md).
+
 **Backup automation.** [OPERATIONS.md](OPERATIONS.md) describes the shape
 (`pg_dump` of `ducklake_*` + `duckicelake_*` schema, S3 versioning, cross-
 region replication, lifecycle rules). You still have to schedule it,
@@ -123,10 +134,11 @@ PromQL queries for an SLO dashboard (p95 LoadTable latency, commit
 error rate, cache hit-rate, pool saturation) but the Grafana JSON isn't
 in the repo. An operator builds them on first deploy.
 
-**No audit log.** `log.info("...")` fires on commits, but nothing is
-structured as "principal X did commit action Y on table Z at time T"
-for SOX / GDPR purposes. Adding an audit sidecar table + handler behind
-`commit_table` is maybe a day of work.
+**Commit audit is partial.** Governance authoring and every governed READ
+land in the structured `duckicelake_governance_audit` sidecar (with
+`DUCKICELAKE_AUDIT_RETENTION_DAYS` retention), but plain `commit_table`
+data commits still only `log.info(...)` — wiring commits into the same
+sidecar is maybe half a day of work.
 
 ### Testing gaps
 
@@ -169,9 +181,11 @@ multi-platform support.
   S3-unavailable scenarios. Write + rehearse the restore runbook.
 
 After that, you're at "ready for real users" for small-to-medium
-internal deployments. Enterprise-regulated workloads (full KMS envelope,
-Spark-write branches, SOC 2 audit automation, multi-tenant isolation)
-need upstream work we can't do here.
+internal deployments. Multi-tenant isolation is implemented (per-catalog
+PG schemas + S3 prefixes + account-scoped routing — see the README's
+Multi-catalog section); enterprise-regulated workloads (full KMS
+envelope, Spark-write branches, SOC 2 audit automation) still need
+upstream work we can't do here.
 
 ## Everything else
 

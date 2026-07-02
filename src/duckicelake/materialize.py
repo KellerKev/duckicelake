@@ -820,7 +820,7 @@ def materialise_table(
     columns = catalog.get_columns(ns, table)
     table_uuid = catalog.table_uuid(ns, table)
     s3 = catalog.settings.s3
-    table_prefix = s3.table_prefix(ns[0], table)
+    table_prefix = s3.table_prefix(ns[0], table, catalog.ref.data_prefix)
     loc = f"s3://{s3.bucket}/{table_prefix}".rstrip("/")
     metadata_prefix = f"{table_prefix}metadata/"
 

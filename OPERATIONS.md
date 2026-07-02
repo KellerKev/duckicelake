@@ -51,13 +51,6 @@ how many workers race on the same table.
 | `DUCKICELAKE_LOG_LEVEL`             | `INFO` (drop to `DEBUG` per incident) |
 | `DUCKICELAKE_CACHE_MAX`             | `1024` default; raise for >1k tables |
 
-> **`DUCKICELAKE_PG_PASSWORD` limitation.** Passwords containing spaces,
-> quotes, or backslashes are rejected — they can't survive both the libpq
-> conninfo *and* the DuckDB `ATTACH` SQL-literal layers. Managed-Postgres
-> generated passwords are URL-safe, so this is rarely hit, and when it is the
-> proxy fails fast at startup with a clear message rather than a cryptic
-> `ATTACH` error later.
-
 Start with:
 ```
 pixi run serve-hi   # uvicorn --workers 4 --log-level warning
@@ -171,6 +164,87 @@ Production defaults:
   ```
   echo $TOKEN | cut -d. -f2 | base64 -d | jq
   ```
+
+### Governance reader roles (Phase 3a)
+
+`ducklake-credentials` vends per-principal PG roles
+(`duckicelake_p_<sub>_<sha8>`, group `duckicelake_reader`) with RLS on the
+`ducklake_*` catalog tables. The dev stack's trust-auth cannot enforce
+authentication — production must run Postgres with
+`password_encryption = scram-sha-256` + TLS and pg_hba in this order:
+
+```
+hostssl ducklake ducklake             <proxy-host>/32  scram-sha-256  # owner: proxy only
+host    ducklake ducklake             0.0.0.0/0        reject
+hostssl ducklake +duckicelake_reader  <client-cidr>    scram-sha-256  # all vended principals
+```
+
+The proxy's role: non-superuser owner of the `ducklake_*` tables with
+`CREATEROLE`. Vended passwords are per-request, never persisted, and expire
+with the STS creds (`VALID UNTIL`, connect-time check). Mandate
+`log_statement = none` (or `ddl`-exclusion) for the proxy role so `ALTER
+ROLE … PASSWORD` never lands in server logs. Expired roles are GC'd lazily
+by the proxy; `SELECT * FROM duckicelake_pg_principal` shows the live set.
+
+### Owner-role authentication (password)
+
+The owning role connects by socket `trust` in dev and can use cert/ident in
+prod. For managed Postgres (RDS, Supabase, Neon, Cloud SQL) that requires a
+scram password, set **`DUCKICELAKE_PG_PASSWORD`** (or `[pg] password` in
+`duckicelake.toml`) — it flows into every owner connection via `pg_dsn` and
+is redacted (`password=***`) from the startup log and `bootstrap` output.
+The value is embedded in a libpq conninfo *and* a DuckDB `ATTACH` string
+literal, so it must be **conninfo-safe: no spaces, quotes, or backslashes**
+(the proxy refuses to start otherwise). Keep `log_statement = none` for the
+proxy role as above.
+
+> **Limitation.** Passwords containing spaces, quotes, or backslashes are
+> rejected — they can't survive both the libpq conninfo *and* the DuckDB
+> SQL-literal layers. Managed-Postgres generated passwords are URL-safe, so
+> this is rarely hit, and when it is the proxy fails fast at startup with a
+> clear message rather than a cryptic `ATTACH` error later.
+
+**Caveat — RLS off:** with `DUCKICELAKE_RLS=0`, `ducklake-credentials` vends
+the *owner* DSN to clients (the documented cooperative fallback); that DSN
+now carries the owner password. Keep RLS **on** in production so clients only
+ever receive per-principal reader roles.
+
+### Owner-role prerequisites (RLS pre-flight)
+
+`ensure_rls` runs `ALTER TABLE … ENABLE ROW LEVEL SECURITY` on the
+`ducklake_*` catalog tables, which requires the proxy's role to **own**
+them. On a brownfield deployment where DuckLake was first attached under a
+different role, startup fails the pre-flight with an actionable error
+naming the tables — fix with `ALTER TABLE <schema>.<table> OWNER TO
+<proxy-role>` (superuser proxies skip the check). Until fixed,
+`ducklake-credentials` fails closed (503) on that catalog; every vend
+retries the arming, so no restart is needed after the fix.
+
+### Multi-catalog operations
+
+- **Provisioning** (`POST /v1/catalogs`) is a control-plane call: with auth
+  enabled it requires an **admin-scope token** (scope `*` / `*:*:*`).
+  The orchestration layer owns the naming contract
+  (`dl_<account>__<catalog>` schemas, `<account>/<catalog>/` prefixes).
+- **Tenancy**: give each tenant's OAuth client an `account` (4th `|`-field
+  in `DUCKICELAKE_OAUTH_CLIENTS`, or `"account"` in the clients file). A
+  catalog provisioned with `account_id` is reachable only by matching
+  tokens (or admin scope); cross-account prefixes 404 indistinguishably
+  from unknown ones.
+- **Capacity**: `DUCKICELAKE_MAX_ACTIVE_CATALOGS` (default 32) LRU-caps the
+  attached catalog contexts per worker; each holds a DuckDB attach + PG
+  pool. Size PG `max_connections` accordingly (workers × catalogs × pool).
+- **Startup DDL is advisory-lock-serialized** across workers (ensure_rls,
+  governance sidecars, the notify trigger) — `tuple concurrently updated`
+  at boot means you're running a pre-lock build.
+
+### Audit retention
+
+`DUCKICELAKE_AUDIT_RETENTION_DAYS` (default `0` = keep forever) lazily
+purges `duckicelake_governance_audit` rows older than the window — at most
+once an hour per worker, piggybacked on the audit write; no scheduler
+needed. Export the table before enabling retention if you need long-term
+compliance archives.
 
 ## Known operational risks
 

@@ -20,3 +20,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Local config file (may carry secrets) — commit only the example
+duckicelake.toml

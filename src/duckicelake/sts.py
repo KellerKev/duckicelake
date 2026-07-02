@@ -12,6 +12,7 @@ retries, both skipped here for clarity.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 import boto3
@@ -39,14 +40,21 @@ def _scoped_policy(
     write_prefix: str,
     read_only: bool,
     read_keys: list[str] | None = None,
+    read_prefixes: list[str] | None = None,
+    deny_prefixes: list[str] | None = None,
 ) -> dict:
     """Build an STS session policy.
 
     Scoping strategy:
-    - `read_only=True`: `s3:GetObject` scoped to the explicit list of
-      existing data/delete file keys, plus the table's metadata prefix.
-      This is the tightest possible read policy — a compromised token
-      can't enumerate or fetch sibling tables' files.
+    - `read_only=True` + `read_keys`: `s3:GetObject` scoped to the explicit
+      list of existing data/delete file keys. Tightest possible read policy
+      — a compromised token can't enumerate or fetch sibling tables' files.
+      Right for snapshot-pinned readers (REST LoadTable); wrong for live
+      DuckLake-direct sessions, which discover files from PG on every query
+      and would 403 on any file committed after vending.
+    - `read_only=True` + `read_prefixes`: `s3:GetObject` on `{prefix}*` —
+      covers a table's current *and future* files. The DuckLake-direct
+      shape (ducklake-credentials endpoint).
     - `read_only=False` (write): `s3:GetObject` widened to the DuckLake
       data prefix. An Iceberg writer HEADs its own newly-uploaded files
       before committing, and those files aren't in any pre-computed list
@@ -55,6 +63,10 @@ def _scoped_policy(
 
     `ListBucket` is always prefix-scoped so neither token can enumerate
     siblings outside the DuckLake data path.
+
+    `deny_prefixes` adds explicit Deny statements (Deny beats Allow in IAM
+    evaluation; MinIO honors it) — used by governance file-layer masking to
+    carve base-table bytes out of broader allows (namespace-level vending).
     """
     read_keys = read_keys or []
     statements: list[dict] = [
@@ -79,6 +91,17 @@ def _scoped_policy(
                     "Resource": [f"arn:aws:s3:::{bucket}/{k}" for k in read_keys],
                 }
             )
+        if read_prefixes:
+            statements.append(
+                {
+                    "Sid": "ReadOwnPrefixes",
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [
+                        f"arn:aws:s3:::{bucket}/{p}*" for p in read_prefixes
+                    ],
+                }
+            )
     else:
         # MinIO's IAM action namespace is narrower than AWS's. Per-step
         # multipart-upload actions (`s3:CreateMultipartUpload`,
@@ -99,6 +122,18 @@ def _scoped_policy(
             }
         )
 
+    if deny_prefixes:
+        statements.append(
+            {
+                "Sid": "DenyGovernedBasePrefixes",
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": [
+                    f"arn:aws:s3:::{bucket}/{p}*" for p in deny_prefixes
+                ],
+            }
+        )
+
     return {"Version": "2012-10-17", "Statement": statements}
 
 
@@ -111,6 +146,18 @@ def _sts_client(s3: S3Settings):
         aws_secret_access_key=s3.root_secret_key,
         config=Config(signature_version="s3v4"),
     )
+
+
+def _session_name(session_name: str | None, principal: str | None,
+                  namespace: str, table: str) -> str:
+    """STS RoleSessionName must match [\\w+=,.@-]{2,64}. A principal sub /
+    namespace / table can carry spaces, slashes, colons (OAuth client ids,
+    `?principal=` overrides), which AssumeRole rejects with a ValidationError
+    — turning an otherwise-fine vend into a 500. Sanitize out-of-charset
+    characters to '_' and clamp to 64."""
+    raw = session_name or f"ice-{principal or 'anon'}-{namespace}-{table}"
+    cleaned = re.sub(r"[^\w+=,.@-]", "_", raw)[:64]
+    return cleaned if len(cleaned) >= 2 else f"ice-{cleaned}"
 
 
 def _keys_from_uris(uris: list[str], bucket: str) -> list[str]:
@@ -135,8 +182,12 @@ def vend_credentials(
     table: str,
     read_only: bool = False,
     data_file_uris: list[str] | None = None,
+    read_prefixes: list[str] | None = None,
+    deny_prefixes: list[str] | None = None,
     duration_seconds: int = 3600,
     session_name: str | None = None,
+    principal: str | None = None,
+    data_prefix: str | None = None,
 ) -> VendedCredentials:
     """Mint temporary credentials for a single table.
 
@@ -147,19 +198,33 @@ def vend_credentials(
     from DuckLake's `ducklake_data_file` catalog table). When provided,
     reads are restricted to exactly those object keys. For writes we still
     have to allow the DuckLake data-path prefix (we can't predict filenames).
+
+    `read_prefixes` (read-only) grants GetObject on whole key prefixes —
+    for long-lived DuckLake-direct sessions that must keep reading files
+    committed after vending (see `_scoped_policy`).
+
+    `principal` (governance) stamps the STS session name so MinIO audit logs
+    attribute vended creds to a principal. The Phase 2 hook for *withholding*
+    creds from principals who must be masked (coarse, file-granularity) lands
+    with file-layer masking (pre-masked Parquet copies).
     """
-    write_prefix = s3.data_prefix  # DuckLake's flat layout
+    # Per-account catalog scopes writes to its own data prefix; default keeps
+    # the single-catalog data prefix.
+    write_prefix = data_prefix or s3.data_prefix  # DuckLake writes under this
     read_keys = _keys_from_uris(data_file_uris or [], s3.bucket)
     policy = _scoped_policy(
         s3.bucket,
         write_prefix=write_prefix,
         read_only=read_only,
         read_keys=read_keys,
+        read_prefixes=read_prefixes,
+        deny_prefixes=deny_prefixes,
     )
     sts = _sts_client(s3)
     resp = sts.assume_role(
         RoleArn=DEFAULT_ROLE_ARN,
-        RoleSessionName=session_name or f"iceberg-{namespace}-{table}"[:64],
+        RoleSessionName=_session_name(
+            session_name, principal, namespace, table),
         Policy=json.dumps(policy),
         DurationSeconds=duration_seconds,
     )

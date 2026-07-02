@@ -2,7 +2,7 @@
 name = "duckicelake"
 version = "0.1.0"
 description = "Iceberg v3 REST Catalog proxy on top of DuckLake"
-authors = ["kevin@fineupp.com"]
+authors = ["kellerkev@gmail.com"]
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
 
@@ -24,6 +24,10 @@ backends-down = { depends-on = ["pg-stop"], cmd = "scripts/minio.sh stop" }
 
 # Catalog bootstrap (creates ducklake catalog in postgres + s3 bucket layout)
 ducklake-init = "python -m duckicelake.bootstrap"
+
+# Optional sample data (analytics.customers + analytics.orders). Idempotent.
+seed          = "python -m duckicelake.seed"
+seed-governed = "python -m duckicelake.seed --with-governance"
 
 # Run the Iceberg REST proxy
 serve     = "uvicorn duckicelake.server:app --host 0.0.0.0 --port 8181 --reload"

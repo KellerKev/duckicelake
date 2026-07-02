@@ -45,6 +45,29 @@ _LISTEN_CHANNEL = "duckicelake_snapshot"
 _LOCK_RETRY_SECONDS = 5.0
 _CATCHUP_LOOKBACK_MINUTES = 60
 
+# Lazily-built per-process MaskedExportManager (Phase 4 eager refresh).
+# Constructed from the catalog's settings; keyed on the catalog instance
+# so tests with their own catalogs don't share state.
+_EXPORT_MANAGERS: dict[int, object] = {}
+
+
+def _export_manager(catalog: "DuckLakeCatalog"):
+    mgr = _EXPORT_MANAGERS.get(id(catalog))
+    if mgr is None:
+        from .governance import GovernanceStore
+        from .masked_export import MaskedExportManager
+        from .masking_views import MaskingViewManager
+        # store= so listener-driven eager refreshes are audited the same as
+        # request-path exports (operation=masked_export); view_manager= so a
+        # refreshed export repoints the masking views onto the new snap dir.
+        mgr = MaskedExportManager(
+            catalog, catalog.settings,
+            store=GovernanceStore(catalog),
+            view_manager=MaskingViewManager(catalog, catalog.settings),
+        )
+        _EXPORT_MANAGERS[id(catalog)] = mgr
+    return mgr
+
 
 def _disabled() -> bool:
     """Operators can opt out of the eager listener entirely (e.g.
@@ -99,6 +122,20 @@ async def _materialise_snapshot(
                 schema, table, snapshot_id,
             )
             last_err = e
+        # Phase 4: refresh the table's masked Parquet exports (file-layer
+        # masking) at the new snapshot. Own guard — an export failure must
+        # never mark the materialisation failed; the request path lazily
+        # heals (or serves the previous export, still masked).
+        try:
+            await asyncio.to_thread(
+                _export_manager(catalog).refresh_known_sigs,
+                [schema], table,
+            )
+        except Exception:
+            log.exception(
+                "masked-export refresh of %s.%s failed for snapshot=%s",
+                schema, table, snapshot_id,
+            )
 
     status = "failed" if last_err is not None else "done"
     await asyncio.to_thread(
@@ -193,8 +230,9 @@ async def run_listener(catalog: "DuckLakeCatalog") -> None:
         return
 
     # Install trigger first so even non-elected workers don't crash if
-    # they're the first to boot. CREATE OR REPLACE + DROP IF EXISTS make
-    # this safe to call from multiple workers concurrently.
+    # they're the first to boot. Concurrent workers are serialized by the
+    # advisory lock inside _ensure_materialisation_sidecar — bare
+    # CREATE OR REPLACE FUNCTION here raced (`tuple concurrently updated`).
     try:
         await _ensure_trigger_installed(catalog)
     except Exception:

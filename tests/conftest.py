@@ -42,6 +42,10 @@ def _wipe_postgres(dsn: str) -> None:
         with c.cursor() as cur:
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
             cur.execute("CREATE SCHEMA public")
+    # the wipe drops the governance sidecars — forget the process-level
+    # "already ensured" flag so the next call re-creates them
+    from duckicelake.governance import reset_sidecar_cache
+    reset_sidecar_cache()
 
 
 def _purge_bucket(s3) -> None:

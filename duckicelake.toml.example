@@ -1,0 +1,64 @@
+# duckicelake configuration file.
+#
+# Copy to ./duckicelake.toml (or point DUCKICELAKE_CONFIG_FILE at it).
+# Every key maps onto the corresponding DUCKICELAKE_* environment variable:
+# top-level `key` -> DUCKICELAKE_KEY, `[section] key` -> DUCKICELAKE_SECTION_KEY.
+# Precedence: real environment variables > .env > this file.
+# Booleans map to the "1"/"0" convention the env flags use.
+
+catalog = "lake"
+
+# Omit the root S3 key pair from REST response configs (default: true).
+# Leave true in any deployment relying on governance masking — root keys in
+# client hands bypass it in one line. Dev stacks that want the old
+# convenience (PyIceberg without vended credentials) set this to false.
+suppress_root_creds = true
+
+# Return SET search_path post_attach_sql from the ducklake-credentials
+# endpoint so cooperative DuckLake-direct clients get masking transparently
+# for unqualified queries (default: true).
+transparent_masking = true
+
+# Refuse to start without configured OAuth clients (production safety belt).
+#require_auth = true
+
+# PG row-level security for vended DuckLake-direct readers (default: true).
+# Per-principal LOGIN roles in the duckicelake_reader group; see GOVERNANCE.md
+# for the production pg_hba recipe (dev trust-auth can't enforce login).
+#rls = true
+#reader_group_role = "duckicelake_reader"
+
+# File-layer masking (governance Phase 4) tuning.
+#masked_retain_snap_dirs = 2       # snap dirs kept per mask-signature
+#masked_export_ttl_days = 7        # idle sigs stop being eagerly refreshed
+#masked_export_file_size = "256MB" # parquet part size for exports
+
+[pg]
+host = "/path/to/repo/.pgsock"   # or a hostname
+port = 55432
+user = "ducklake"
+database = "ducklake"
+# password = "…"   # for managed Postgres (RDS/Supabase/Neon/Cloud SQL) using
+#                  # scram. Dev uses socket trust auth, so leave it unset.
+#                  # Must be conninfo-safe: no spaces, quotes, or backslashes.
+#                  # Equivalent env var: DUCKICELAKE_PG_PASSWORD.
+
+[s3]
+endpoint = "http://127.0.0.1:9100"
+region = "us-east-1"
+bucket = "lakehouse"
+root_key = "minioadmin"
+root_secret = "minioadmin"
+path_style = true
+prefix = "data/"
+
+#[oauth]
+#clients = "agent:s3cr3t|ns:analytics:r|agent"
+#clients_file = "/etc/duckicelake/clients.json"
+#jwt_secret = "change-me"
+#ttl_seconds = 3600
+#issuer = "duckicelake"
+
+#[log]
+#format = "json"    # or "text"
+#level = "INFO"
