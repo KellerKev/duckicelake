@@ -53,7 +53,7 @@ from datetime import datetime, timedelta, timezone
 from psycopg import errors as pg_errors
 from psycopg import sql
 
-from .catalog import DuckLakeCatalog
+from .catalog import DuckLakeCatalog, pg_advisory_lock
 from .config import Settings
 from .governance import ensure_governance_sidecars
 
@@ -246,89 +246,105 @@ def _classify_tables(cur, meta_schema: str) -> tuple[list[str], list[str]]:
 def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
     """Idempotent: group role, grants, sidecar, predicate functions, and
     one RLS policy per classified ducklake_* table. Safe to call on every
-    startup; follows the _ensure_materialisation_sidecar DDL discipline."""
+    startup; follows the _ensure_materialisation_sidecar DDL discipline.
+
+    Serialized ACROSS WORKERS by a blocking advisory lock: concurrent
+    CREATE OR REPLACE FUNCTION / GRANT on the same shared objects raises
+    `tuple concurrently updated` (observed under uvicorn --workers 4).
+    Losers wait, then find the idempotent DDL already applied. The key folds
+    the metadata schema so distinct catalogs don't serialize each other."""
     meta = _meta_schema(catalog)
     group = _group_for(settings, meta)
     hidden_table_fn, hidden_file_fn = _fn_names(meta)
     with catalog.pg_cursor() as cur:
-        # Sidecars the predicate functions reference must exist before any
-        # reader query can invoke them (always in public, cross-catalog).
-        ensure_governance_sidecars(cur)
-        catalog._ensure_sidecar(cur)
-        _ensure_principal_sidecar(cur)
-
-        try:
-            cur.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(
-                sql.Identifier(group)))
-        except pg_errors.DuplicateObject:
-            pass
-        # Reader needs USAGE on its own metadata schema (the ducklake_* tables)
-        # and on public (the SECURITY DEFINER predicate functions live there).
-        for sch in {meta, "public"}:
-            cur.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
-                sql.Identifier(sch), sql.Identifier(group)))
-
-        _ensure_functions(cur, meta)
-
-        table_scoped, file_scoped = _classify_tables(cur, meta)
-
-        # Readers may SELECT every ducklake_* catalog table IN THIS SCHEMA
-        # (rows filtered by RLS below). Per-catalog group → a tenant reader can
-        # never reach another catalog's metadata schema. No grants on
-        # duckicelake_* sidecars — the SECURITY DEFINER functions read those.
-        for name in table_scoped + file_scoped + _unpolicied_tables(cur, meta):
-            cur.execute(sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
-                sql.Identifier(meta), sql.Identifier(name), sql.Identifier(group)))
-
-        # Heal any historical over-grant on the never-grant tables:
-        # inlined-data payloads (raw rows, no table_id to police), the
-        # name-leaking snapshot_changes, and files_scheduled_for_deletion
-        # (base data-file paths of hidden tables). See _unpolicied_tables.
-        cur.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE'
-              AND ((table_name LIKE 'ducklake\\_inlined\\_data\\_%%'
-                    AND table_name <> 'ducklake_inlined_data_tables')
-                   OR table_name = 'ducklake_snapshot_changes'
-                   OR table_name = 'ducklake_files_scheduled_for_deletion')
-        """, (meta,))
-        for (name,) in cur.fetchall():
-            cur.execute(sql.SQL("REVOKE SELECT ON {}.{} FROM {}").format(
-                sql.Identifier(meta), sql.Identifier(name), sql.Identifier(group)))
-
-        # Set-membership predicate: the SRF subquery is uncorrelated, so
-        # Postgres runs it once per scan and hashes the result — not a
-        # per-row function call.
-        for name, predicate in (
-            [(n, f"table_id NOT IN (SELECT public.{hidden_table_fn}())")
-             for n in table_scoped]
-            + [(n, f"table_id NOT IN (SELECT public.{hidden_file_fn}())")
-               for n in file_scoped]
-        ):
-            cur.execute(sql.SQL(
-                "ALTER TABLE {}.{} ENABLE ROW LEVEL SECURITY"
-            ).format(sql.Identifier(meta), sql.Identifier(name)))
-            cur.execute(sql.SQL("DROP POLICY IF EXISTS {} ON {}.{}").format(
-                sql.Identifier(_POLICY_NAME), sql.Identifier(meta), sql.Identifier(name)))
-            cur.execute(sql.SQL(
-                "CREATE POLICY {} ON {}.{} FOR SELECT TO {} USING ({})"
-            ).format(
-                sql.Identifier(_POLICY_NAME), sql.Identifier(meta),
-                sql.Identifier(name), sql.Identifier(group), sql.SQL(predicate),
-            ))
-
-        # Drop the old per-row scalar predicates on upgrade — the policies
-        # above now reference the set-returning SRFs instead. Best-effort;
-        # files-variant first (it depended on the table-variant).
-        for fn in ("duckicelake_can_see_files(bigint)",
-                   "duckicelake_can_see_table(bigint)"):
-            try:
-                cur.execute(f"DROP FUNCTION IF EXISTS public.{fn}")
-            except Exception:
-                log.debug("could not drop legacy predicate %s", fn)
-
+        with pg_advisory_lock(cur, f"duckicelake:ensure_rls:{meta}"):
+            table_scoped, file_scoped = _ensure_rls_locked(
+                catalog, cur, meta, group, hidden_table_fn, hidden_file_fn)
     log.info("RLS ensured: group=%s, %d table-scoped + %d file-scoped policies",
              group, len(table_scoped), len(file_scoped))
+
+
+def _ensure_rls_locked(catalog: DuckLakeCatalog, cur, meta: str, group: str,
+                       hidden_table_fn: str, hidden_file_fn: str,
+                       ) -> tuple[list[str], list[str]]:
+    """The DDL body of ensure_rls — caller holds the advisory lock."""
+    # Sidecars the predicate functions reference must exist before any
+    # reader query can invoke them (always in public, cross-catalog).
+    ensure_governance_sidecars(cur)
+    catalog._ensure_sidecar(cur)
+    _ensure_principal_sidecar(cur)
+
+    try:
+        cur.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(
+            sql.Identifier(group)))
+    except pg_errors.DuplicateObject:
+        pass
+    # Reader needs USAGE on its own metadata schema (the ducklake_* tables)
+    # and on public (the SECURITY DEFINER predicate functions live there).
+    for sch in {meta, "public"}:
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+            sql.Identifier(sch), sql.Identifier(group)))
+
+    _ensure_functions(cur, meta)
+
+    table_scoped, file_scoped = _classify_tables(cur, meta)
+
+    # Readers may SELECT every ducklake_* catalog table IN THIS SCHEMA
+    # (rows filtered by RLS below). Per-catalog group → a tenant reader can
+    # never reach another catalog's metadata schema. No grants on
+    # duckicelake_* sidecars — the SECURITY DEFINER functions read those.
+    for name in table_scoped + file_scoped + _unpolicied_tables(cur, meta):
+        cur.execute(sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
+            sql.Identifier(meta), sql.Identifier(name), sql.Identifier(group)))
+
+    # Heal any historical over-grant on the never-grant tables:
+    # inlined-data payloads (raw rows, no table_id to police), the
+    # name-leaking snapshot_changes, and files_scheduled_for_deletion
+    # (base data-file paths of hidden tables). See _unpolicied_tables.
+    cur.execute("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = %s AND table_type = 'BASE TABLE'
+          AND ((table_name LIKE 'ducklake\\_inlined\\_data\\_%%'
+                AND table_name <> 'ducklake_inlined_data_tables')
+               OR table_name = 'ducklake_snapshot_changes'
+               OR table_name = 'ducklake_files_scheduled_for_deletion')
+    """, (meta,))
+    for (name,) in cur.fetchall():
+        cur.execute(sql.SQL("REVOKE SELECT ON {}.{} FROM {}").format(
+            sql.Identifier(meta), sql.Identifier(name), sql.Identifier(group)))
+
+    # Set-membership predicate: the SRF subquery is uncorrelated, so
+    # Postgres runs it once per scan and hashes the result — not a
+    # per-row function call.
+    for name, predicate in (
+        [(n, f"table_id NOT IN (SELECT public.{hidden_table_fn}())")
+         for n in table_scoped]
+        + [(n, f"table_id NOT IN (SELECT public.{hidden_file_fn}())")
+           for n in file_scoped]
+    ):
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}.{} ENABLE ROW LEVEL SECURITY"
+        ).format(sql.Identifier(meta), sql.Identifier(name)))
+        cur.execute(sql.SQL("DROP POLICY IF EXISTS {} ON {}.{}").format(
+            sql.Identifier(_POLICY_NAME), sql.Identifier(meta), sql.Identifier(name)))
+        cur.execute(sql.SQL(
+            "CREATE POLICY {} ON {}.{} FOR SELECT TO {} USING ({})"
+        ).format(
+            sql.Identifier(_POLICY_NAME), sql.Identifier(meta),
+            sql.Identifier(name), sql.Identifier(group), sql.SQL(predicate),
+        ))
+
+    # Drop the old per-row scalar predicates on upgrade — the policies
+    # above now reference the set-returning SRFs instead. Best-effort;
+    # files-variant first (it depended on the table-variant).
+    for fn in ("duckicelake_can_see_files(bigint)",
+               "duckicelake_can_see_table(bigint)"):
+        try:
+            cur.execute(f"DROP FUNCTION IF EXISTS public.{fn}")
+        except Exception:
+            log.debug("could not drop legacy predicate %s", fn)
+
+    return table_scoped, file_scoped
 
 
 def rearm_rls_if_needed(catalog: DuckLakeCatalog, settings: Settings) -> bool:

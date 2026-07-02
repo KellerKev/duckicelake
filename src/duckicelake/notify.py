@@ -230,8 +230,9 @@ async def run_listener(catalog: "DuckLakeCatalog") -> None:
         return
 
     # Install trigger first so even non-elected workers don't crash if
-    # they're the first to boot. CREATE OR REPLACE + DROP IF EXISTS make
-    # this safe to call from multiple workers concurrently.
+    # they're the first to boot. Concurrent workers are serialized by the
+    # advisory lock inside _ensure_materialisation_sidecar — bare
+    # CREATE OR REPLACE FUNCTION here raced (`tuple concurrently updated`).
     try:
         await _ensure_trigger_installed(catalog)
     except Exception:

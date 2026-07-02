@@ -11,6 +11,7 @@ per-request short-lived connections.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import os
 import queue
 import threading
@@ -36,6 +37,35 @@ from .config import CatalogRef, Settings
 _ACTIVE_PG_CUR: contextvars.ContextVar = contextvars.ContextVar(
     "duckicelake_active_pg_cursor", default=None
 )
+
+
+@contextmanager
+def pg_advisory_lock(cur, name: str):
+    """Serialize an ensure/DDL routine across proxy workers.
+
+    Multi-worker startup runs the same idempotent DDL (CREATE OR REPLACE
+    FUNCTION, GRANT, CREATE POLICY) concurrently on shared catalog objects,
+    which Postgres rejects with `tuple concurrently updated`. A BLOCKING
+    session-level advisory lock (cluster-global) makes losers wait instead of
+    fail; the DDL is idempotent so they then find it already applied. The key
+    is derived from `name` the same way masked_export._lock_key derives its
+    export keys."""
+    key = int.from_bytes(
+        hashlib.sha256(name.encode()).digest()[:8], "big", signed=True)
+    cur.execute("SELECT pg_advisory_lock(%s)", (key,))
+    try:
+        yield
+    finally:
+        # The lock is session-level and survives a failed transaction — but a
+        # pooled session that returns still HOLDING it would block every later
+        # ensure on this key forever. If the guarded DDL aborted a
+        # non-autocommit transaction, unlock raises InFailedSqlTransaction;
+        # roll back (the caller's tx is already dead) and unlock again.
+        try:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        except psycopg.errors.InFailedSqlTransaction:
+            cur.connection.rollback()
+            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
 
 
 def _join_path(base: str, piece: str, relative: bool) -> str:
@@ -957,6 +987,14 @@ class DuckLakeCatalog:
     # DuckLake commit.
 
     def _ensure_materialisation_sidecar(self, cur) -> None:
+        # Serialized across workers: every worker's notify listener runs this
+        # at startup, and CREATE OR REPLACE FUNCTION on the same pg_proc row
+        # is not concurrency-safe (raises `tuple concurrently updated`).
+        # The trigger existence-check below is racy for the same reason.
+        with pg_advisory_lock(cur, "duckicelake:materialisation_sidecar"):
+            self._ensure_materialisation_sidecar_ddl(cur)
+
+    def _ensure_materialisation_sidecar_ddl(self, cur) -> None:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.duckicelake_materialisation_log (
                 ducklake_snapshot_id  BIGINT PRIMARY KEY,

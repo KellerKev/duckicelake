@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .catalog import DuckLakeCatalog
+from .catalog import DuckLakeCatalog, pg_advisory_lock
 
 
 # Object kinds a tag / policy can target.
@@ -72,11 +72,19 @@ def ensure_governance_sidecars(cur) -> None:
     Idempotent and cheap after the first call per process (guarded by
     `_SIDECARS_ENSURED`), matching the catalog's `_ensure_sidecar`
     discipline. All tables carry the `duckicelake_` prefix so their proxy
-    origin is obvious in the PG schema.
-    """
+    origin is obvious in the PG schema. The first call per process is
+    serialized ACROSS workers by a blocking advisory lock — the per-process
+    flag can't stop N workers racing the same CREATE/ALTER DDL at startup
+    (`tuple concurrently updated`)."""
     global _SIDECARS_ENSURED
     if _SIDECARS_ENSURED:
         return
+    with pg_advisory_lock(cur, "duckicelake:governance_sidecars"):
+        _ensure_governance_sidecars_ddl(cur)
+    _SIDECARS_ENSURED = True
+
+
+def _ensure_governance_sidecars_ddl(cur) -> None:
     # --- tag definitions -------------------------------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.duckicelake_tag (
@@ -219,7 +227,6 @@ def ensure_governance_sidecars(cur) -> None:
             detail           JSONB
         )
     """)
-    _SIDECARS_ENSURED = True
 
 
 # ---------------------------------------------------------------------------

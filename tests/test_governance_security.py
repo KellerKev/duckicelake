@@ -139,3 +139,79 @@ def test_rearm_closes_coverage_gap(client, settings, direct_catalog):
         assert cur.fetchone()[0] == 1, "rearm should restore the grant"
     # no gap now → no-op
     assert pg_rls.rearm_rls_if_needed(direct_catalog, settings) is False
+
+
+# ---- Stage 1 (merge-stabilization): multi-worker startup DDL race ----------
+
+from concurrent.futures import ThreadPoolExecutor
+
+from duckicelake.catalog import DuckLakeCatalog, pg_advisory_lock
+from duckicelake import governance as _gov
+
+
+def test_concurrent_ensure_rls_no_ddl_race(settings):
+    """B2: four sessions running ensure_rls simultaneously used to raise
+    `tuple concurrently updated` (unserialized CREATE OR REPLACE FUNCTION /
+    GRANT on shared objects — observed live under uvicorn --workers 4). The
+    blocking advisory lock must serialize them: no exception, two rounds."""
+    cats = [DuckLakeCatalog(settings) for _ in range(4)]
+    try:
+        for c in cats:
+            c.connect()
+        _gov.reset_sidecar_cache()   # force the sidecar-DDL path once too
+        for _round in range(2):
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = [ex.submit(pg_rls.ensure_rls, c, settings)
+                           for c in cats]
+                for f in futures:
+                    f.result()       # raises if any worker hit the DDL race
+    finally:
+        for c in cats:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+def test_advisory_lock_released_after_failed_tx(settings, direct_catalog):
+    """The lock helper must not leak a held session lock when the guarded DDL
+    aborts a non-autocommit transaction (a leaked lock on a pooled connection
+    would block every later ensure on that key forever)."""
+    with direct_catalog.pg_cursor(autocommit=False) as cur:
+        try:
+            with pg_advisory_lock(cur, "duckicelake:test:leak"):
+                cur.execute("SELECT no_such_function_xyz()")
+        except Exception:
+            pass
+    # a second session can acquire it immediately → it was released
+    import hashlib as _h
+    key = int.from_bytes(
+        _h.sha256(b"duckicelake:test:leak").digest()[:8], "big", signed=True)
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+        assert cur.fetchone()[0] is True, "lock leaked by failed-tx path"
+        cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+
+
+def test_default_vend_self_heals(monkeypatch):
+    """B1: a worker whose startup ensure_rls failed must not 503 vends until
+    restart — the vend path retries, arms, and flips _rls_ready."""
+    import duckicelake.server as srv
+
+    calls = {"n": 0}
+
+    def flaky_ensure_rls(cat, st):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated lost startup race")
+
+    monkeypatch.setattr(srv, "ensure_rls", flaky_ensure_rls)
+    monkeypatch.setattr(srv, "rearm_rls_if_needed", lambda c, s: False)
+    monkeypatch.setattr(srv, "_rls_ready", False)
+
+    assert srv._arm_default_rls() is False        # startup-shaped failure
+    assert srv._rls_ready is False                # still fail-closed
+    assert srv._arm_default_rls() is True         # retry self-heals
+    assert srv._rls_ready is True
+    assert srv._arm_default_rls() is True         # now takes the rearm path
+    assert calls["n"] == 2                        # ensure_rls not re-run once armed

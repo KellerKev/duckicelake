@@ -942,6 +942,27 @@ def _build_view_response(ns: list[str], view: str, ctx: CatalogContext) -> dict[
 
 # ---- DuckLake-direct credentials (governance Phase 3) ------------------
 
+def _arm_default_rls() -> bool:
+    """True when the DEFAULT catalog's RLS is armed on this worker.
+
+    Startup arms it once in lifespan; a worker that lost the (now
+    advisory-lock-serialized) startup DDL race or hit a transient PG error
+    must NOT 503 vends until restart — retry `ensure_rls` here (idempotent,
+    cheap when already applied) and flip `_rls_ready` on success. This makes
+    the default path self-heal the same way non-default catalogs do."""
+    global _rls_ready
+    if _rls_ready:
+        rearm_rls_if_needed(catalog, settings)
+        return True
+    try:
+        ensure_rls(catalog, settings)
+        _rls_ready = True
+        return True
+    except Exception:
+        log.exception("default-catalog RLS re-arm failed — still fail-closed")
+        return False
+
+
 @app.get("/v1/{prefix}/namespaces/{namespace}/ducklake-credentials")
 def ducklake_credentials(
     prefix: str,
@@ -1023,14 +1044,13 @@ def ducklake_credentials(
     is_default = ctx.catalog_id == settings.catalog_name
     if settings.rls_enabled:
         # Arm RLS for THIS catalog. The default catalog is armed at startup
-        # (gated by _rls_ready); a per-account catalog is armed lazily on its
-        # first vend (ensure_rls is idempotent). FAIL CLOSED if arming fails —
-        # vending the owning DSN would bypass RLS and expose the catalog.
+        # and self-heals here if that failed (_arm_default_rls); a per-account
+        # catalog is armed lazily on its first vend (ensure_rls is
+        # idempotent). FAIL CLOSED if arming fails — vending the owning DSN
+        # would bypass RLS and expose the catalog.
         armed = False
         if is_default:
-            if _rls_ready:
-                rearm_rls_if_needed(catalog, settings)
-                armed = True
+            armed = _arm_default_rls()
         else:
             try:
                 ensure_rls(catalog, settings)
