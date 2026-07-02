@@ -19,6 +19,19 @@ NS_DEFAULT = "mc_http_default"
 NS_TENANT = "mc_http_tenant"
 
 
+def _drop_ns_with_tables(client, prefix: str, ns: str) -> None:
+    """Drop every table in the namespace (purge), then the namespace itself.
+    A bare namespace-delete fails on a non-empty namespace, which would leak
+    state into later tests (409 on re-create)."""
+    r = client.get(f"/v1/{prefix}/namespaces/{ns}/tables")
+    if r.status_code == 200:
+        for ident in r.json().get("identifiers", []):
+            client.delete(
+                f"/v1/{prefix}/namespaces/{ns}/tables/{ident['name']}",
+                params={"purgeRequested": "true"})
+    client.delete(f"/v1/{prefix}/namespaces/{ns}")
+
+
 @pytest.fixture()
 def provisioned(client, settings):
     default_prefix = settings.catalog_name
@@ -27,10 +40,10 @@ def provisioned(client, settings):
     assert r.status_code in (201, 409), r.text
     # Clean any leftovers from a prior run.
     for prefix, ns in ((default_prefix, NS_DEFAULT), (TENANT["catalog_id"], NS_TENANT)):
-        client.delete(f"/v1/{prefix}/namespaces/{ns}")
+        _drop_ns_with_tables(client, prefix, ns)
     yield default_prefix
     for prefix, ns in ((default_prefix, NS_DEFAULT), (TENANT["catalog_id"], NS_TENANT)):
-        client.delete(f"/v1/{prefix}/namespaces/{ns}")
+        _drop_ns_with_tables(client, prefix, ns)
     # NOTE: we deliberately do NOT drop the tenant metadata schema here. The
     # running proxy caches the catalog context (with its DuckLake ATTACH); if we
     # dropped the schema out from under it, a re-provision in the same session
@@ -276,3 +289,73 @@ def test_provisioning_open_when_auth_disabled(client, settings):
             c.execute(f'DROP SCHEMA IF EXISTS "dl_{cid}__main" CASCADE')
             c.execute("DELETE FROM public.duckicelake_catalog WHERE catalog_id = %s",
                       [cid])
+
+
+# ---- Stage 4 (merge-stabilization): multi-catalog REST writes --------------
+
+def test_commit_table_routed_to_catalog(provisioned, client, settings):
+    """commit_table used to be default-catalog-only (explicit 404 for other
+    prefixes). An add-schema commit against a tenant catalog must run in THAT
+    catalog: the new column lands in its metadata schema, and the default
+    catalog's same-named table is untouched."""
+    default_prefix = provisioned
+    tenant_prefix = TENANT["catalog_id"]
+    schema = {
+        "type": "struct", "schema-id": 0,
+        "fields": [
+            {"id": 1, "name": "id", "required": True, "type": "long"},
+            {"id": 2, "name": "v", "required": False, "type": "string"},
+        ],
+    }
+    for prefix, ns in ((default_prefix, NS_DEFAULT), (tenant_prefix, NS_TENANT)):
+        assert client.post(f"/v1/{prefix}/namespaces",
+                           json={"namespace": [ns]}).status_code == 200
+        r = client.post(f"/v1/{prefix}/namespaces/{ns}/tables",
+                        json={"name": "ct", "schema": schema})
+        assert r.status_code == 200, r.text
+
+    wider = {
+        "type": "struct", "schema-id": 1,
+        "fields": schema["fields"] + [
+            {"id": 3, "name": "country", "required": False, "type": "string"},
+        ],
+    }
+    r = client.post(
+        f"/v1/{tenant_prefix}/namespaces/{NS_TENANT}/tables/ct",
+        json={"requirements": [],
+              "updates": [{"action": "add-schema", "schema": wider},
+                          {"action": "set-current-schema", "schema-id": -1}]})
+    assert r.status_code == 200, r.text
+    fields = {f["name"] for f in r.json()["metadata"]["schemas"][-1]["fields"]}
+    assert "country" in fields
+
+    # physically landed in the TENANT metadata schema…
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute(
+            f"""SELECT count(*) FROM "{TENANT['metadata_schema']}".ducklake_column
+                WHERE column_name = 'country' AND end_snapshot IS NULL""")
+        assert cur.fetchone()[0] == 1, "column must exist in tenant metadata"
+        # …and NOT in the default catalog's copy of the same-named table
+        cur.execute(
+            """SELECT count(*) FROM public.ducklake_column col
+               JOIN public.ducklake_table t USING (table_id)
+               JOIN public.ducklake_schema s ON s.schema_id = t.schema_id
+               WHERE s.schema_name = %s AND t.table_name = 'ct'
+                 AND col.column_name = 'country' AND col.end_snapshot IS NULL
+                 AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL""",
+            (NS_DEFAULT,))
+        assert cur.fetchone()[0] == 0, "default catalog must be untouched"
+
+
+def test_config_returns_per_catalog_prefix(provisioned, client, settings):
+    """/v1/config?warehouse=<tenant> answers with THAT catalog's prefix
+    (P1d parity); unknown warehouse 404s like any unknown prefix."""
+    r = client.get("/v1/config", params={"warehouse": TENANT["catalog_id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["overrides"]["prefix"] == TENANT["catalog_id"]
+
+    r = client.get("/v1/config")
+    assert r.json()["overrides"]["prefix"] == settings.catalog_name
+
+    r = client.get("/v1/config", params={"warehouse": "no_such_catalog_xyz"})
+    assert r.status_code == 404, r.text

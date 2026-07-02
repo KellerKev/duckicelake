@@ -277,6 +277,13 @@ class DuckLakeCatalog:
             self._pg_pool = None
         self._s3_client = None
 
+    @property
+    def ref(self) -> CatalogRef:
+        """This catalog's identity: name, S3 data prefix, PG metadata schema.
+        Public accessor for the managers (masked_export, materialize, pg_rls)
+        that need the per-catalog prefix/schema."""
+        return self._ref
+
     def _cat(self) -> str:
         # Catalog name is trusted from settings (not user input), so simple quoting is fine.
         return f'"{self._ref.catalog_name}"'

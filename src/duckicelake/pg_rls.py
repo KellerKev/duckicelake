@@ -99,7 +99,7 @@ def _ensure_principal_sidecar(cur) -> None:
 def _meta_schema(catalog: DuckLakeCatalog) -> str:
     """The Postgres schema holding this catalog's ducklake_* tables — the
     per-account metadata schema, or 'public' for the default catalog."""
-    return catalog._ref.metadata_schema or "public"
+    return catalog.ref.metadata_schema or "public"
 
 
 def _suffix(meta_schema: str) -> str:

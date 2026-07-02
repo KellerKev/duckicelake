@@ -280,7 +280,9 @@ async def lifespan(app: FastAPI):
             # CancelledError is the normal shutdown path; any other
             # exception we've already logged inside the listener itself.
             pass
-        catalog.close()
+        # Closes every cached catalog context — the default (module
+        # `catalog`) plus any lazily-attached per-account catalogs.
+        registry.close_all()
 
 
 app = FastAPI(
@@ -519,16 +521,22 @@ def metrics():
 
 
 @app.get("/v1/config", response_model=ConfigResponse)
-def get_config(warehouse: str | None = None) -> ConfigResponse:
+def get_config(request: Request, warehouse: str | None = None) -> ConfigResponse:
     # Many Iceberg clients use a "prefix" in the URL to scope requests to a
     # specific warehouse. We return the catalog name so paths become
-    # /v1/<catalog>/namespaces/...
+    # /v1/<catalog>/namespaces/... A client that asks for a provisioned
+    # (non-default) warehouse gets ITS prefix back — same resolution +
+    # account authorization as every /v1/{prefix}/ route (404 on unknown or
+    # cross-account, so ids can't be probed here either).
+    prefix = settings.catalog_name
+    if warehouse and warehouse != settings.catalog_name:
+        prefix = resolve_catalog(warehouse, request).catalog_id
     return ConfigResponse(
         defaults={
             "warehouse": warehouse or settings.catalog_name,
         },
         overrides={
-            "prefix": settings.catalog_name,
+            "prefix": prefix,
         },
         endpoints=SUPPORTED_ENDPOINTS,
     )
@@ -584,14 +592,6 @@ def provision_catalog(req: ProvisionCatalogRequest, request: Request) -> Catalog
 
 
 # ---- namespaces --------------------------------------------------------
-
-def _check_prefix(prefix: str) -> None:
-    if prefix != settings.catalog_name:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown catalog prefix '{prefix}'",
-        )
-
 
 def resolve_catalog(prefix: str, request: Request) -> CatalogContext:
     """FastAPI dependency: resolve the Iceberg REST {prefix} to its isolated
@@ -1347,7 +1347,8 @@ def rename_table(
     response_model=LoadTableResponse,
 )
 def commit_table(
-    prefix: str, namespace: str, table: str, req: CommitTableRequest
+    prefix: str, namespace: str, table: str, req: CommitTableRequest,
+    ctx: CatalogContext = Depends(resolve_catalog),
 ) -> LoadTableResponse:
     """Commit updates to a table.
 
@@ -1359,12 +1360,12 @@ def commit_table(
         silently corrupt.
 
     Data-plane commits (add-snapshot, set-snapshot-ref) still return 501.
-
-    NOTE: still default-catalog only (its sub-helpers — _check_requirements,
-    _apply_partition_spec, schema/sort diff — use the module catalog). Per-
-    account commit conversion is a focused follow-up; non-default prefixes 404.
     """
-    _check_prefix(prefix)
+    # Per-request catalog context: the commit runs against the resolved
+    # catalog's DuckLake attach / metadata schema / data prefix.
+    catalog = ctx.catalog
+    masking_view_manager = ctx.masking_view_manager
+    masked_export_manager = ctx.masked_export_manager
     ns = _parse_namespace(namespace)
     if not catalog.table_exists(ns, table):
         raise HTTPException(
@@ -1375,7 +1376,7 @@ def commit_table(
     # If the caller asserted "table is at snapshot N" and DuckLake has
     # advanced past that, we refuse the commit. The client retries with a
     # fresh read. This is how Iceberg handles concurrent writers.
-    _check_requirements(ns, table, req.requirements)
+    _check_requirements(catalog, ns, table, req.requirements)
 
     # Pre-scan: writes targeted at a non-main branch (add-snapshot +
     # set-snapshot-ref type=branch, name != main) 501 right away so we
@@ -1570,14 +1571,14 @@ def commit_table(
     schema_changed = False
     with catalog.commit_transaction():
         if new_schema is not None:
-            _apply_schema_diff(ns, table, new_schema)
+            _apply_schema_diff(ctx, ns, table, new_schema)
             schema_changed = True
 
         if pending_partition_spec is not None:
-            _apply_partition_spec(ns, table, pending_partition_spec)
+            _apply_partition_spec(catalog, ns, table, pending_partition_spec)
 
         if pending_sort_order is not None:
-            _apply_sort_order(ns, table, pending_sort_order)
+            _apply_sort_order(catalog, ns, table, pending_sort_order)
 
         # Order matters: add new data first so the new snapshot it creates is
         # the basis for any subsequent tombstones / delete-file registrations
@@ -1668,11 +1669,12 @@ def commit_table(
     # primes the in-process cache. Subsequent readers hit the cache with no
     # S3 / no manifest-generation cost.
     COMMIT_TOTAL.labels("ok").inc()
-    return _build_load_response(_default_ctx, ns, table)
+    return _build_load_response(ctx, ns, table)
 
 
 def _check_requirements(
-    ns: list[str], table: str, requirements: list[dict[str, Any]],
+    catalog: DuckLakeCatalog, ns: list[str], table: str,
+    requirements: list[dict[str, Any]],
 ) -> None:
     """Validate client-supplied `requirements[]` on a CommitTable.
 
@@ -1738,7 +1740,8 @@ def _check_requirements(
             )
 
 
-def _apply_partition_spec(ns: list[str], table: str, spec: dict[str, Any]) -> None:
+def _apply_partition_spec(catalog: DuckLakeCatalog, ns: list[str], table: str,
+                          spec: dict[str, Any]) -> None:
     """Translate Iceberg add-partition-spec → DuckLake ALTER TABLE …
     SET PARTITIONED BY (…).
 
@@ -1813,7 +1816,8 @@ def _apply_partition_spec(ns: list[str], table: str, spec: dict[str, Any]) -> No
         catalog.upsert_iceberg_partition_spec(ns, table, [])
 
 
-def _apply_sort_order(ns: list[str], table: str, sort_order: dict[str, Any]) -> None:
+def _apply_sort_order(catalog: DuckLakeCatalog, ns: list[str], table: str,
+                      sort_order: dict[str, Any]) -> None:
     """Translate Iceberg add-sort-order → direct mutation of
     `ducklake_sort_info` + `ducklake_sort_expression`."""
     from .partition_sort import normalize_iceberg_sort_fields
@@ -1821,7 +1825,8 @@ def _apply_sort_order(ns: list[str], table: str, sort_order: dict[str, Any]) -> 
     catalog.set_sort_order(ns, table, fields)
 
 
-def _apply_schema_diff(ns: list[str], table: str, new_schema: dict[str, Any]) -> None:
+def _apply_schema_diff(ctx: "CatalogContext", ns: list[str], table: str,
+                       new_schema: dict[str, Any]) -> None:
     """Translate an Iceberg `add-schema` into DuckDB ADD/DROP COLUMN.
 
     We match columns by `id` (field-id). Columns in the new schema with an
@@ -1831,6 +1836,8 @@ def _apply_schema_diff(ns: list[str], table: str, new_schema: dict[str, Any]) ->
     """
     from .types import iceberg_type_to_duckdb, ducklake_type_to_iceberg
 
+    catalog = ctx.catalog
+    governance_store = ctx.store
     current = catalog.columns_at(
         ns, table, catalog.current_ducklake_snapshot(ns, table) or 0
     )
