@@ -349,7 +349,10 @@ def test_commit_table_routed_to_catalog(provisioned, client, settings):
 
 def test_config_returns_per_catalog_prefix(provisioned, client, settings):
     """/v1/config?warehouse=<tenant> answers with THAT catalog's prefix
-    (P1d parity); unknown warehouse 404s like any unknown prefix."""
+    (P1d parity). An UNRESOLVED warehouse falls back to the default prefix
+    with 200 — clients send opaque warehouse hints here (the DuckDB iceberg
+    ext passes its ATTACH string, e.g. the bucket name), so a 404 would
+    break every such attach."""
     r = client.get("/v1/config", params={"warehouse": TENANT["catalog_id"]})
     assert r.status_code == 200, r.text
     assert r.json()["overrides"]["prefix"] == TENANT["catalog_id"]
@@ -357,5 +360,7 @@ def test_config_returns_per_catalog_prefix(provisioned, client, settings):
     r = client.get("/v1/config")
     assert r.json()["overrides"]["prefix"] == settings.catalog_name
 
-    r = client.get("/v1/config", params={"warehouse": "no_such_catalog_xyz"})
-    assert r.status_code == 404, r.text
+    # opaque / unknown warehouse hint → default prefix, never 404
+    r = client.get("/v1/config", params={"warehouse": "lakehouse"})
+    assert r.status_code == 200, r.text
+    assert r.json()["overrides"]["prefix"] == settings.catalog_name

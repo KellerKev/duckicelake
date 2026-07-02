@@ -526,11 +526,17 @@ def get_config(request: Request, warehouse: str | None = None) -> ConfigResponse
     # specific warehouse. We return the catalog name so paths become
     # /v1/<catalog>/namespaces/... A client that asks for a provisioned
     # (non-default) warehouse gets ITS prefix back — same resolution +
-    # account authorization as every /v1/{prefix}/ route (404 on unknown or
-    # cross-account, so ids can't be probed here either).
+    # account authorization as every /v1/{prefix}/ route. Anything that
+    # doesn't resolve (or isn't the caller's) falls back to the DEFAULT
+    # prefix, never a 404: clients send OPAQUE warehouse hints here (the
+    # DuckDB iceberg ext passes its ATTACH string, e.g. the bucket name),
+    # and unknown-vs-unauthorized must stay indistinguishable anyway.
     prefix = settings.catalog_name
     if warehouse and warehouse != settings.catalog_name:
-        prefix = resolve_catalog(warehouse, request).catalog_id
+        try:
+            prefix = resolve_catalog(warehouse, request).catalog_id
+        except HTTPException:
+            prefix = settings.catalog_name
     return ConfigResponse(
         defaults={
             "warehouse": warehouse or settings.catalog_name,
