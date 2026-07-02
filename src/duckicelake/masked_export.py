@@ -211,7 +211,7 @@ class MaskedExportManager:
                     return existing
 
                 tok = uuid.uuid4().hex[:8]
-                prefix = (f"{s3.masked_sig_prefix(ns[0], table, sig)}"
+                prefix = (f"{s3.masked_sig_prefix(ns[0], table, sig, self.catalog._ref.data_prefix)}"
                           f"snap-{snap}-{tok}/")
                 select = build_masked_export_select(
                     plan, catalog_name=self.settings.catalog_name,
@@ -382,7 +382,7 @@ class MaskedExportManager:
                 continue
             try:
                 self._delete_prefix(
-                    self.settings.s3.masked_sig_prefix(ns[0], table, sig))
+                    self.settings.s3.masked_sig_prefix(ns[0], table, sig, self.catalog._ref.data_prefix))
                 with self.catalog.pg_cursor() as cur:
                     cur.execute(
                         "DELETE FROM public.duckicelake_masked_export "
@@ -399,7 +399,7 @@ class MaskedExportManager:
         self.gc_table(ns, table, keep=set())
         try:
             self._delete_prefix(
-                self.settings.s3.masked_table_prefix(ns[0], table))
+                self.settings.s3.masked_table_prefix(ns[0], table, self.catalog._ref.data_prefix))
         except Exception:
             log.exception("masked-prefix purge failed for %s.%s", ns[0], table)
 
@@ -411,7 +411,7 @@ class MaskedExportManager:
         that a slow reader was just vended creds for isn't deleted out from
         under its in-flight glob (A3)."""
         try:
-            sig_prefix = self.settings.s3.masked_sig_prefix(schema, table, sig)
+            sig_prefix = self.settings.s3.masked_sig_prefix(schema, table, sig, self.catalog._ref.data_prefix)
             dirs: dict[str, list[str]] = {}
             newest_mtime: dict[str, datetime] = {}
             client = self.catalog.s3_client

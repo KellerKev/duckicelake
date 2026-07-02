@@ -19,6 +19,7 @@ from typing import Any
 
 import duckdb
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request, Response
+from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 
 from .auth import (
@@ -29,6 +30,7 @@ from .auth import (
 )
 from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
+from .registry import CatalogContext, CatalogRegistry, UnknownCatalog
 from .config import apply_file_config, load_settings, redact_password
 from .governance import GovernanceStore
 from .masked_export import MaskedExportManager
@@ -99,24 +101,22 @@ def _iceberg_error(status: int, message: str, type_: str) -> JSONResponse:
 
 
 settings = load_settings()
-catalog = DuckLakeCatalog(settings)
 auth_cfg: AuthConfig = load_auth_config()
 require_bearer = make_bearer_dependency(auth_cfg)
 
-# Phase 2 governance enforcement. The store/engine share the catalog's PG
-# pool; they're consulted on the read path (LoadTable) to mask columns +
-# filter rows per principal. No-op when no governance objects are authored.
-governance_store = GovernanceStore(catalog)
-policy_engine = PolicyEngine(governance_store)
-# Phase 3: ad-hoc masking views — one physical DuckLake view per
-# (table, mask-signature), materialized on the read path so both
-# DuckLake-direct and view-capable REST clients can execute the mask.
-masking_view_manager = MaskingViewManager(catalog, settings)
-# Phase 4: masked Parquet exports for policies flagged file_layer_masking —
-# byte-level enforcement for engines that read Parquet directly.
-masked_export_manager = MaskedExportManager(catalog, settings,
-                                            store=governance_store,
-                                            view_manager=masking_view_manager)
+# Multi-catalog registry. Each isolated catalog (account-scoped) gets its own
+# DuckLakeCatalog + governance managers, bundled in a CatalogContext and
+# resolved per request from the Iceberg REST {prefix}. The default catalog
+# (settings.catalog_name) is pre-registered; the module-level names below alias
+# its members so background components (the notify listener) and helpers that
+# aren't yet per-catalog keep operating on the default catalog unchanged.
+registry = CatalogRegistry(settings)
+_default_ctx = registry.register_default()
+catalog = _default_ctx.catalog
+governance_store = _default_ctx.store
+policy_engine = _default_ctx.policy_engine
+masking_view_manager = _default_ctx.masking_view_manager
+masked_export_manager = _default_ctx.masked_export_manager
 
 #: Set True once lifespan `ensure_rls` succeeds. When `rls_enabled` is on
 #: but this stays False (RLS DDL failed at startup), ducklake-credentials
@@ -157,11 +157,11 @@ def _reject_reserved_property_keys(keys) -> None:
         )
 
 
-def _audit_credentials_denied(sub: str, ns: list[str], table: str | None,
-                              decision: str) -> None:
+def _audit_credentials_denied(ctx: "CatalogContext", sub: str, ns: list[str],
+                              table: str | None, decision: str) -> None:
     """Best-effort audit of a fail-closed credential denial."""
     try:
-        governance_store.audit_load(
+        ctx.store.audit_load(
             principal=sub, object_=f"{ns[0]}.{table or '*'}",
             masked_cols=[], applied_policies=[], row_filtered=False,
             operation="ducklake_credentials", decision=decision, detail={})
@@ -169,23 +169,23 @@ def _audit_credentials_denied(sub: str, ns: list[str], table: str | None,
         log.exception("audit of credential denial failed")
 
 
-def _ensure_file_layer_properties(ns: list[str], table: str, plan) -> None:
+def _ensure_file_layer_properties(ctx: "CatalogContext", ns: list[str], table: str, plan) -> None:
     """Write the Phase-3a interlock properties so RLS hides base file rows
     from non-bypass principals. Best-effort — the masked-prefix credential
     scope is the primary enforcement; RLS is defense-in-depth."""
     try:
-        bypass = policy_engine.file_layer_bypass_roles(plan)
-        catalog.upsert_table_properties(ns, table, set_map={
+        bypass = ctx.policy_engine.file_layer_bypass_roles(plan)
+        ctx.catalog.upsert_table_properties(ns, table, set_map={
             "duckicelake.file-layer-masking": "true",
             "duckicelake.file-layer-bypass-roles": ",".join(bypass),
         })
-        catalog.invalidate_metadata_cache(ns, table)
+        ctx.catalog.invalidate_metadata_cache(ns, table)
     except Exception:
         log.exception("file-layer property stamping failed for %s.%s",
                       ns[0], table)
 
 
-def _file_layer_deny_prefixes(ns: list[str], roles: list[str]) -> list[str] | None:
+def _file_layer_deny_prefixes(ctx: "CatalogContext", ns: list[str], roles: list[str]) -> list[str] | None:
     """For namespace-level vending: base prefixes of file-layer tables the
     principal is masked on (Deny beats the namespace Allow). Enumerates
     *every* table in the namespace — not just already-exported ones — so a
@@ -194,13 +194,13 @@ def _file_layer_deny_prefixes(ns: list[str], roles: list[str]) -> list[str] | No
     already-resolved JWT∪sidecar union. Returns None when there's simply
     nothing to deny; **raises** on any error so the caller fails CLOSED
     (we must never vend a namespace-wide grant we couldn't fully scope)."""
-    tables = [t for (_s, t) in catalog.list_tables(ns)]
+    tables = [t for (_s, t) in ctx.catalog.list_tables(ns)]
     deny: list[str] = []
     for t in tables:
-        plan = policy_engine.plan_for(principal="__deny_probe__",
-                                      roles=roles, schema=ns[0], table=t)
+        plan = ctx.policy_engine.plan_for(principal="__deny_probe__",
+                                          roles=roles, schema=ns[0], table=t)
         if plan.file_layer and not plan.is_empty():
-            deny.append(settings.s3.table_prefix(ns[0], t))
+            deny.append(settings.s3.table_prefix(ns[0], t, ctx.ref.data_prefix))
     return deny or None
 
 
@@ -226,6 +226,7 @@ if os.environ.get("DUCKICELAKE_REQUIRE_AUTH", "0") == "1" and not auth_cfg.enabl
 async def lifespan(app: FastAPI):
     import asyncio
     catalog.connect()
+    registry.ensure_table()
     log.info("DuckLake catalog connected: %s",
              redact_password(settings.ducklake_uri))
     # Phase 3a: reader role + RLS on the ducklake_* catalog tables for
@@ -344,31 +345,35 @@ async def oauth_tokens(
 # Iceberg REST surface above is untouched. Enforcement lives on the read
 # paths (policies.py / masking_views.py / masked_export.py / pg_rls.py).
 
-def _resync_table_governance(ns: list[str], table: str) -> None:
+def _resync_table_governance(ctx: "CatalogContext", ns: list[str], table: str) -> None:
     """Detaching a policy / untagging changes a table's policy set, so its
     masking views + pre-masked exports are now stale and the file-layer
     interlock properties may no longer apply. Drop them (best-effort) — the
     next masked read recreates whatever is still needed and re-stamps the
     properties; if nothing's masked anymore the table is simply clean."""
     try:
-        masking_view_manager.gc_orphans(ns, table, keep=set())
+        ctx.masking_view_manager.gc_orphans(ns, table, keep=set())
     except Exception:
         log.exception("resync: view gc failed for %s.%s", ns[0], table)
     try:
-        masked_export_manager.gc_table(ns, table, keep=set())
+        ctx.masked_export_manager.gc_table(ns, table, keep=set())
     except Exception:
         log.exception("resync: export gc failed for %s.%s", ns[0], table)
     try:
-        catalog.upsert_table_properties(ns, table, remove=[
+        ctx.catalog.upsert_table_properties(ns, table, remove=[
             "duckicelake.file-layer-masking",
             "duckicelake.file-layer-bypass-roles"])
-        catalog.invalidate_metadata_cache(ns, table)
+        ctx.catalog.invalidate_metadata_cache(ns, table)
     except Exception:
         log.exception("resync: property clear failed for %s.%s", ns[0], table)
 
 
+# The governance router is bound to the default catalog (per-catalog governance
+# authoring lands with the account-scoped decision API); its resync callback
+# operates on the default context.
 app.include_router(build_governance_router(
-    catalog, settings, auth_cfg, on_table_policy_change=_resync_table_governance))
+    catalog, settings, auth_cfg,
+    on_table_policy_change=lambda ns, table: _resync_table_governance(_default_ctx, ns, table)))
 
 
 # ---- error handling ---------------------------------------------------
@@ -507,6 +512,41 @@ def get_config(warehouse: str | None = None) -> ConfigResponse:
     )
 
 
+# ---- catalog provisioning (qod integration) ----------------------------
+# Registers an isolated catalog: its own Postgres METADATA_SCHEMA + S3
+# data_prefix. Called by the orchestration layer when an account/catalog is
+# created. The (metadata_schema, data_prefix) names are derived + validated
+# upstream by the orchestration layer's naming contract; here they are trusted.
+# TODO(auth): gate behind an admin/service scope before production.
+
+class ProvisionCatalogRequest(BaseModel):
+    catalog_id: str = Field(..., description="Iceberg REST {prefix} for this catalog")
+    metadata_schema: str
+    data_prefix: str
+    account_id: str | None = None
+    create_default_namespace: bool = True
+
+
+class CatalogInfo(BaseModel):
+    catalog_id: str
+    metadata_schema: str
+    data_prefix: str
+
+
+@app.post("/v1/catalogs", response_model=CatalogInfo, status_code=201)
+def provision_catalog(req: ProvisionCatalogRequest) -> CatalogInfo:
+    ctx = registry.provision(
+        req.catalog_id, req.metadata_schema, req.data_prefix, req.account_id
+    )
+    if req.create_default_namespace and not ctx.catalog.namespace_exists(["default"]):
+        ctx.catalog.create_namespace(["default"])
+    return CatalogInfo(
+        catalog_id=ctx.catalog_id,
+        metadata_schema=ctx.ref.metadata_schema or "",
+        data_prefix=ctx.ref.data_prefix,
+    )
+
+
 # ---- namespaces --------------------------------------------------------
 
 def _check_prefix(prefix: str) -> None:
@@ -517,9 +557,23 @@ def _check_prefix(prefix: str) -> None:
         )
 
 
+def resolve_catalog(prefix: str) -> CatalogContext:
+    """FastAPI dependency: resolve the Iceberg REST {prefix} to its isolated
+    catalog context (the default catalog or a provisioned per-account one).
+    404 if the prefix has no registered catalog. Handlers that depend on this
+    rebind their local `catalog`/managers to the resolved context."""
+    try:
+        return registry.get(prefix)
+    except UnknownCatalog:
+        raise HTTPException(status_code=404, detail=f"Unknown catalog prefix '{prefix}'")
+
+
 @app.get("/v1/{prefix}/namespaces", response_model=ListNamespacesResponse)
-def list_namespaces(prefix: str, parent: str | None = None) -> ListNamespacesResponse:
-    _check_prefix(prefix)
+def list_namespaces(
+    prefix: str, parent: str | None = None,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> ListNamespacesResponse:
+    catalog = ctx.catalog
     parent_list = parent.split(NAMESPACE_SEP) if parent else None
     # Transparent-masking schemas (`__masked_{sig}`) are plumbing, not user
     # namespaces — keep REST enumeration clean. (DuckLake-direct clients
@@ -536,9 +590,10 @@ def list_namespaces(prefix: str, parent: str | None = None) -> ListNamespacesRes
     status_code=200,
 )
 def create_namespace(
-    prefix: str, req: CreateNamespaceRequest
+    prefix: str, req: CreateNamespaceRequest,
+    ctx: CatalogContext = Depends(resolve_catalog),
 ) -> CreateNamespaceResponse:
-    _check_prefix(prefix)
+    catalog = ctx.catalog
     if req.namespace and req.namespace[0].startswith(MASK_SCHEMA_PREFIX):
         raise HTTPException(
             status_code=400,
@@ -555,8 +610,11 @@ def create_namespace(
 
 
 @app.get("/v1/{prefix}/namespaces/{namespace}", response_model=GetNamespaceResponse)
-def get_namespace(prefix: str, namespace: str) -> GetNamespaceResponse:
-    _check_prefix(prefix)
+def get_namespace(
+    prefix: str, namespace: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> GetNamespaceResponse:
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -564,8 +622,11 @@ def get_namespace(prefix: str, namespace: str) -> GetNamespaceResponse:
 
 
 @app.head("/v1/{prefix}/namespaces/{namespace}")
-def head_namespace(prefix: str, namespace: str):
-    _check_prefix(prefix)
+def head_namespace(
+    prefix: str, namespace: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+):
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -573,8 +634,11 @@ def head_namespace(prefix: str, namespace: str):
 
 
 @app.delete("/v1/{prefix}/namespaces/{namespace}", status_code=204)
-def drop_namespace(prefix: str, namespace: str):
-    _check_prefix(prefix)
+def drop_namespace(
+    prefix: str, namespace: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+):
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -588,8 +652,11 @@ def drop_namespace(prefix: str, namespace: str):
     "/v1/{prefix}/namespaces/{namespace}/tables",
     response_model=ListTablesResponse,
 )
-def list_tables(prefix: str, namespace: str) -> ListTablesResponse:
-    _check_prefix(prefix)
+def list_tables(
+    prefix: str, namespace: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> ListTablesResponse:
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -609,8 +676,9 @@ def create_table(
     namespace: str,
     req: CreateTableRequest,
     x_iceberg_access_delegation: str | None = Header(default=None),
+    ctx: CatalogContext = Depends(resolve_catalog),
 ) -> LoadTableResponse:
-    _check_prefix(prefix)
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -625,10 +693,12 @@ def create_table(
 
     ddl, _last_id = schema_to_columns_ddl(req.schema_)
     catalog.create_table(ns, req.name, ddl)
-    if settings.rls_enabled and _rls_ready:
-        rearm_rls_if_needed(catalog, settings)   # cover any new ducklake_* tables
+    # RLS rearm covers new ducklake_* tables for the default catalog. Per-catalog
+    # RLS is armed by the credentials path (P1c-B); skip here for non-default.
+    if settings.rls_enabled and _rls_ready and ctx.catalog_id == settings.catalog_name:
+        rearm_rls_if_needed(catalog, settings)
     return _build_load_response(
-        ns, req.name,
+        ctx, ns, req.name,
         properties=req.properties,
         delegation_header=x_iceberg_access_delegation,
         read_only=False,
@@ -646,15 +716,16 @@ def load_table(
     request: Request,
     snapshot_id: int | None = None,   # time-travel
     x_iceberg_access_delegation: str | None = Header(default=None),
+    ctx: CatalogContext = Depends(resolve_catalog),
 ) -> LoadTableResponse:
-    _check_prefix(prefix)
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.table_exists(ns, table):
         raise HTTPException(
             status_code=404, detail=f"Table does not exist: {ns}.{table}"
         )
     return _build_load_response(
-        ns, table,
+        ctx, ns, table,
         delegation_header=x_iceberg_access_delegation,
         read_only=True,
         snapshot_id_override=snapshot_id,
@@ -663,8 +734,11 @@ def load_table(
 
 
 @app.head("/v1/{prefix}/namespaces/{namespace}/tables/{table}")
-def head_table(prefix: str, namespace: str, table: str):
-    _check_prefix(prefix)
+def head_table(
+    prefix: str, namespace: str, table: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+):
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.table_exists(ns, table):
         raise HTTPException(
@@ -677,14 +751,15 @@ def head_table(prefix: str, namespace: str, table: str):
     "/v1/{prefix}/namespaces/{namespace}/tables/{table}", status_code=204
 )
 def drop_table(
-    prefix: str, namespace: str, table: str, purgeRequested: bool = False
+    prefix: str, namespace: str, table: str, purgeRequested: bool = False,
+    ctx: CatalogContext = Depends(resolve_catalog),
 ):
     """DROP TABLE. When `purgeRequested=true`, also delete every S3 object
     under the table's prefix — Parquet data files, delete files, manifest
     Avros, metadata JSONs. Without purge, DuckLake's own
     `ducklake_cleanup_old_files` eventually reclaims tombstoned data files;
     the metadata Avros become orphans unless purged."""
-    _check_prefix(prefix)
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.table_exists(ns, table):
         raise HTTPException(
@@ -696,13 +771,13 @@ def drop_table(
     # later table reusing the name can't silently inherit a stale mask, and
     # resync to drop its masking views/exports/props. Always — governance
     # rows orphan on any drop, not only a purge-requested one.
-    governance_store.purge_table_governance(None, schema=ns[0], table=table)
-    _resync_table_governance(ns, table)
+    ctx.store.purge_table_governance(None, schema=ns[0], table=table)
+    _resync_table_governance(ctx, ns, table)
     if purgeRequested:
         n = catalog.purge_table_objects(ns, table)
         log.info("purge %s.%s: %d S3 objects removed", ns[0], table, n)
         # file-layer masked exports live under a separate prefix
-        masked_export_manager.purge_table(ns, table)
+        ctx.masked_export_manager.purge_table(ns, table)
     return Response(status_code=204)
 
 
@@ -712,14 +787,17 @@ def drop_table(
     "/v1/{prefix}/admin/namespaces/{namespace}/tables/{table}/compact",
     status_code=200,
 )
-def compact_table(prefix: str, namespace: str, table: str) -> dict[str, Any]:
+def compact_table(
+    prefix: str, namespace: str, table: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> dict[str, Any]:
     """Trigger DuckLake compaction + file cleanup on a table.
 
     Safe to schedule on a cron — each call is idempotent and returns
     quickly when there's nothing to compact. Requires a token with
     write scope on the target namespace.
     """
-    _check_prefix(prefix)
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.table_exists(ns, table):
         raise HTTPException(
@@ -734,8 +812,11 @@ def compact_table(prefix: str, namespace: str, table: str) -> dict[str, Any]:
 # ---- views -----------------------------------------------------------
 
 @app.get("/v1/{prefix}/namespaces/{namespace}/views")
-def list_views(prefix: str, namespace: str) -> dict[str, Any]:
-    _check_prefix(prefix)
+def list_views(
+    prefix: str, namespace: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> dict[str, Any]:
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -748,8 +829,11 @@ def list_views(prefix: str, namespace: str) -> dict[str, Any]:
 
 
 @app.post("/v1/{prefix}/namespaces/{namespace}/views", status_code=200)
-def create_view(prefix: str, namespace: str, body: dict[str, Any]) -> dict[str, Any]:
-    _check_prefix(prefix)
+def create_view(
+    prefix: str, namespace: str, body: dict[str, Any],
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> dict[str, Any]:
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -768,21 +852,27 @@ def create_view(prefix: str, namespace: str, body: dict[str, Any]) -> dict[str, 
     if catalog.view_exists(ns, name):
         raise HTTPException(status_code=409, detail=f"View already exists: {ns}.{name}")
     catalog.create_view(ns, name, sqls[0])
-    return _build_view_response(ns, name)
+    return _build_view_response(ns, name, ctx)
 
 
 @app.get("/v1/{prefix}/namespaces/{namespace}/views/{view}")
-def load_view(prefix: str, namespace: str, view: str) -> dict[str, Any]:
-    _check_prefix(prefix)
+def load_view(
+    prefix: str, namespace: str, view: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> dict[str, Any]:
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.view_exists(ns, view):
         raise HTTPException(status_code=404, detail=f"View does not exist: {ns}.{view}")
-    return _build_view_response(ns, view)
+    return _build_view_response(ns, view, ctx)
 
 
 @app.delete("/v1/{prefix}/namespaces/{namespace}/views/{view}", status_code=204)
-def drop_view(prefix: str, namespace: str, view: str):
-    _check_prefix(prefix)
+def drop_view(
+    prefix: str, namespace: str, view: str,
+    ctx: CatalogContext = Depends(resolve_catalog),
+):
+    catalog = ctx.catalog
     ns = _parse_namespace(namespace)
     if not catalog.view_exists(ns, view):
         raise HTTPException(status_code=404, detail=f"View does not exist: {ns}.{view}")
@@ -790,10 +880,13 @@ def drop_view(prefix: str, namespace: str, view: str):
     return Response(status_code=204)
 
 
-def _build_view_response(ns: list[str], view: str) -> dict[str, Any]:
+def _build_view_response(ns: list[str], view: str, ctx: CatalogContext) -> dict[str, Any]:
     """Iceberg View metadata. SQL comes from information_schema.views;
     schema comes from information_schema.columns on the view itself —
     DuckDB resolves the view once so we get back concrete types."""
+    catalog = ctx.catalog
+    # Per-catalog S3 prefix for the view's advertised location.
+    vp = f"{ctx.ref.data_prefix}{ns[0]}/{view}/"
     sql = catalog.get_view_definition(ns, view) or ""
     view_uuid = catalog.table_uuid(ns, view)
     # Concrete schema from information_schema.columns. Binding can fail
@@ -825,7 +918,7 @@ def _build_view_response(ns: list[str], view: str) -> dict[str, Any]:
     md = {
         "view-uuid": view_uuid,
         "format-version": 1,
-        "location": f"s3://{settings.s3.bucket}/{settings.s3.table_prefix(ns[0], view)}".rstrip("/"),
+        "location": f"s3://{settings.s3.bucket}/{vp}".rstrip("/"),
         "schemas": [view_schema],
         "current-schema-id": 0,
         "current-version-id": 1,
@@ -841,7 +934,7 @@ def _build_view_response(ns: list[str], view: str) -> dict[str, Any]:
         "properties": {},
     }
     return {
-        "metadata-location": f"s3://{settings.s3.bucket}/{settings.s3.table_prefix(ns[0], view)}metadata/view.json",
+        "metadata-location": f"s3://{settings.s3.bucket}/{vp}metadata/view.json",
         "metadata": md,
         "config": _base_s3_config(),
     }
@@ -857,6 +950,7 @@ def ducklake_credentials(
     table: str | None = None,
     duration_seconds: int = 3600,
     principal: str | None = None,
+    ctx: CatalogContext = Depends(resolve_catalog),
 ) -> dict[str, Any]:
     """Vend everything a DuckLake-direct DuckDB client needs, with the
     caller's masking applied cooperatively:
@@ -879,7 +973,11 @@ def ducklake_credentials(
     table directly still reads cleartext (file-layer masking is the
     airtight tier).
     """
-    _check_prefix(prefix)
+    catalog = ctx.catalog
+    governance_store = ctx.store
+    policy_engine = ctx.policy_engine
+    masking_view_manager = ctx.masking_view_manager
+    masked_export_manager = ctx.masked_export_manager
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
@@ -891,14 +989,20 @@ def ducklake_credentials(
     if principal and not auth_cfg.enabled:
         sub = principal
 
-    alias = settings.catalog_name
+    # Per-catalog ATTACH: alias = the catalog id, DATA_PATH = the catalog's S3
+    # prefix, and METADATA_SCHEMA so the client's ducklake_* resolve to THIS
+    # catalog's isolated metadata (omitted for the default catalog).
+    alias = ctx.catalog_id
+    data_path = settings.data_path_for(ctx.ref)
+    meta_opt = (f", METADATA_SCHEMA '{ctx.ref.metadata_schema}'"
+                if ctx.ref.metadata_schema else "")
     clamped = max(900, min(43200, duration_seconds))
     out: dict[str, Any] = {
         "ducklake_dsn": settings.pg_dsn,
-        "ducklake_data_path": settings.ducklake_data_path,
+        "ducklake_data_path": data_path,
         "ducklake_attach_sql": (
             f"ATTACH '{settings.ducklake_uri}' AS {alias} "
-            f"(DATA_PATH '{settings.ducklake_data_path}')"
+            f"(DATA_PATH '{data_path}'{meta_opt})"
         ),
         "post_attach_sql": [],
         "masked_view": None,
@@ -916,13 +1020,25 @@ def ducklake_credentials(
     # whole catalog. Only when rls_enabled is False (operator opt-out, dev)
     # do we vend the owner DSN by design.
     reader_dsn_ok = False
-    if settings.rls_enabled and _rls_ready:
-        # Close the A1 gap: re-arm RLS if a ducklake_* table appeared since
-        # startup and isn't yet granted/policied (cheap no-op otherwise).
-        rearm_rls_if_needed(catalog, settings)
+    is_default = ctx.catalog_id == settings.catalog_name
     if settings.rls_enabled:
-        if not _rls_ready:
-            _audit_credentials_denied(sub, ns, table, "error_rls_not_armed")
+        # Arm RLS for THIS catalog. The default catalog is armed at startup
+        # (gated by _rls_ready); a per-account catalog is armed lazily on its
+        # first vend (ensure_rls is idempotent). FAIL CLOSED if arming fails —
+        # vending the owning DSN would bypass RLS and expose the catalog.
+        armed = False
+        if is_default:
+            if _rls_ready:
+                rearm_rls_if_needed(catalog, settings)
+                armed = True
+        else:
+            try:
+                ensure_rls(catalog, settings)
+                armed = True
+            except Exception:
+                log.exception("per-catalog RLS arming failed for %s", ctx.catalog_id)
+        if not armed:
+            _audit_credentials_denied(ctx, sub, ns, table, "error_rls_not_armed")
             raise HTTPException(
                 status_code=503,
                 detail="row-level security is not armed; refusing to vend "
@@ -935,7 +1051,7 @@ def ducklake_credentials(
             out["ducklake_dsn"] = reader_dsn
             out["ducklake_attach_sql"] = (
                 f"ATTACH 'ducklake:postgres:{reader_dsn}' AS {alias} "
-                f"(DATA_PATH '{settings.ducklake_data_path}', READ_ONLY)"
+                f"(DATA_PATH '{data_path}'{meta_opt}, READ_ONLY)"
             )
             out["pg_role"] = pg_role
             out["pg_valid_until"] = expires_at.isoformat()
@@ -944,7 +1060,7 @@ def ducklake_credentials(
         except Exception:
             log.exception("reader-role provisioning failed for %s — refusing "
                           "to vend the owner DSN (fail-closed)", sub)
-            _audit_credentials_denied(sub, ns, table, "error_reader_role_failed")
+            _audit_credentials_denied(ctx, sub, ns, table, "error_reader_role_failed")
             raise HTTPException(
                 status_code=503,
                 detail="could not provision an RLS reader role; refusing to "
@@ -990,7 +1106,7 @@ def ducklake_credentials(
                     out["mask_signature"] = mask_signature(plan)
                     out["file_layer"] = export is not None
                     if export is not None:
-                        _ensure_file_layer_properties(ns, table, plan)
+                        _ensure_file_layer_properties(ctx, ns, table, plan)
                     if settings.transparent_masking:
                         schema = masking_view_manager.ensure_transparent_schema(
                             ns, table, plan, export=export,
@@ -1012,7 +1128,7 @@ def ducklake_credentials(
     # FAIL CLOSED: a file-layer-masked principal whose export couldn't be
     # materialized must not be vended base-prefix creds. Refuse.
     if file_layer_required and export is None:
-        _audit_credentials_denied(sub, ns, table, "error_file_layer_denied")
+        _audit_credentials_denied(ctx, sub, ns, table, "error_file_layer_denied")
         raise HTTPException(
             status_code=503,
             detail=(f"file-layer masking for {ns[0]}.{table} could not be "
@@ -1027,21 +1143,32 @@ def ducklake_credentials(
             # export's own sig (not out["mask_signature"], which is only
             # set when the view also materialized) so a view-creation
             # failure can't scope creds to a `.../None/` prefix.
-            read_prefixes = [s3.masked_sig_prefix(ns[0], table, export.sig)]
+            read_prefixes = [s3.masked_sig_prefix(ns[0], table, export.sig, ctx.ref.data_prefix)]
         else:
-            read_prefixes = [s3.table_prefix(ns[0], table)]
+            read_prefixes = [s3.table_prefix(ns[0], table, ctx.ref.data_prefix)]
+    elif not ctx.policy_engine.store.has_file_layer_policies():
+        # No specific table AND no file-layer masking anywhere in the catalog
+        # (the common case): a DuckLake-direct ATTACH is CATALOG-wide, so scope
+        # reads to the whole catalog data prefix. The catalog (account) is the
+        # S3 isolation boundary, not the namespace — scoping to one namespace
+        # silently 403s any query whose tables live in a different schema
+        # (e.g. a wrong default namespace, or a cross-schema JOIN). No carve-out
+        # scan needed (nothing is file-layer masked). Per-table least-privilege
+        # is still available via ?table=.
+        read_prefixes = [ctx.ref.data_prefix]
     else:
-        read_prefixes = [f"{s3.data_prefix}{ns[0]}/"]
-        # the namespace allow covers every table's base prefix — carve out
-        # the file-layer-masked tables this principal must not read raw.
-        # FAIL CLOSED: if we can't compute the carve-outs, refuse the
-        # namespace-wide vend rather than grant unscoped base access.
+        # File-layer masking exists in this catalog: keep the tighter
+        # per-namespace scope so a masked table's base bytes can't be read raw
+        # via a catalog-wide grant. Carve out the file-layer-masked tables in
+        # THIS namespace (fail-closed). Cross-namespace reads here require
+        # vending for the right namespace (or ?table=).
+        read_prefixes = [f"{ctx.ref.data_prefix}{ns[0]}/"]
         try:
-            deny_prefixes = _file_layer_deny_prefixes(ns, roles)
+            deny_prefixes = _file_layer_deny_prefixes(ctx, ns, roles)
         except Exception:
             log.exception("file-layer deny-prefix scan failed for %s — "
                           "refusing namespace-wide vend (fail-closed)", ns[0])
-            _audit_credentials_denied(sub, ns, None, "error_deny_scan_failed")
+            _audit_credentials_denied(ctx, sub, ns, None, "error_deny_scan_failed")
             raise HTTPException(
                 status_code=503,
                 detail="could not compute file-layer credential carve-outs; "
@@ -1056,6 +1183,7 @@ def ducklake_credentials(
             deny_prefixes=deny_prefixes,
             duration_seconds=clamped,
             principal=sub,
+            data_prefix=ctx.ref.data_prefix,
         )
         out["s3"] = {
             "endpoint": s3.endpoint,
@@ -1108,8 +1236,11 @@ def ducklake_credentials(
 
 
 @app.post("/v1/{prefix}/tables/rename", status_code=204)
-def rename_table(prefix: str, req: RenameTableRequest):
-    _check_prefix(prefix)
+def rename_table(
+    prefix: str, req: RenameTableRequest,
+    ctx: CatalogContext = Depends(resolve_catalog),
+):
+    catalog = ctx.catalog
     _reject_reserved_table_name(req.destination.name)
     if not catalog.table_exists(req.source.namespace, req.source.name):
         raise HTTPException(
@@ -1129,11 +1260,11 @@ def rename_table(prefix: str, req: RenameTableRequest):
     # the new name so the mask keeps applying (else it silently lapses), then
     # resync both ends so stale masking views/exports for the old name go and
     # the new name rematerializes on next read.
-    governance_store.rename_table_governance(
+    ctx.store.rename_table_governance(
         None, src_schema=req.source.namespace[0], src_table=req.source.name,
         dst_schema=req.destination.namespace[0], dst_table=req.destination.name)
-    _resync_table_governance(req.source.namespace, req.source.name)
-    _resync_table_governance(req.destination.namespace, req.destination.name)
+    _resync_table_governance(ctx, req.source.namespace, req.source.name)
+    _resync_table_governance(ctx, req.destination.namespace, req.destination.name)
     return Response(status_code=204)
 
 
@@ -1154,6 +1285,10 @@ def commit_table(
         silently corrupt.
 
     Data-plane commits (add-snapshot, set-snapshot-ref) still return 501.
+
+    NOTE: still default-catalog only (its sub-helpers — _check_requirements,
+    _apply_partition_spec, schema/sort diff — use the module catalog). Per-
+    account commit conversion is a focused follow-up; non-default prefixes 404.
     """
     _check_prefix(prefix)
     ns = _parse_namespace(namespace)
@@ -1459,7 +1594,7 @@ def commit_table(
     # primes the in-process cache. Subsequent readers hit the cache with no
     # S3 / no manifest-generation cost.
     COMMIT_TOTAL.labels("ok").inc()
-    return _build_load_response(ns, table)
+    return _build_load_response(_default_ctx, ns, table)
 
 
 def _check_requirements(
@@ -1718,6 +1853,7 @@ def _base_s3_config() -> dict[str, str]:
 
 
 def _build_load_response(
+    ctx: CatalogContext,
     ns: list[str],
     table: str,
     properties: dict[str, str] | None = None,
@@ -1727,10 +1863,17 @@ def _build_load_response(
     snapshot_id_override: int | None = None,
     principal_claims: dict | None = None,
 ) -> LoadTableResponse:
+    # Per-request catalog context; managers below are bound to this catalog.
+    catalog = ctx.catalog
+    policy_engine = ctx.policy_engine
+    governance_store = ctx.store
+    masking_view_manager = ctx.masking_view_manager
+    masked_export_manager = ctx.masked_export_manager
+    data_prefix = ctx.ref.data_prefix
     columns = catalog.get_columns(ns, table)
     uuid = catalog.table_uuid(ns, table)
     s3 = settings.s3
-    table_prefix = s3.table_prefix(ns[0], table)
+    table_prefix = s3.table_prefix(ns[0], table, data_prefix)
     loc = f"s3://{s3.bucket}/{table_prefix}".rstrip("/")
     metadata_prefix = f"{table_prefix}metadata/"
     # metadata-location always points at the LATEST vN.metadata.json —
@@ -1825,7 +1968,7 @@ def _build_load_response(
                         shadow = masked_export_manager.shadow_metadata(
                             ns, table, file_layer_export)
                         if shadow is not None:
-                            _ensure_file_layer_properties(ns, table, plan)
+                            _ensure_file_layer_properties(ctx, ns, table, plan)
                             metadata_location, metadata = shadow
                             metadata = apply_plan_to_metadata(metadata, plan)
                         else:
@@ -1908,8 +2051,9 @@ def _build_load_response(
             table=table,
             read_only=True,
             read_prefixes=[s3.masked_sig_prefix(
-                ns[0], table, file_layer_export.sig)],
+                ns[0], table, file_layer_export.sig, data_prefix)],
             principal=principal_for_creds,
+            data_prefix=data_prefix,
         )
         config_out.update(
             {
@@ -1942,6 +2086,7 @@ def _build_load_response(
             read_only=False,           # see comment above
             data_file_uris=allow_uris,
             principal=principal_for_creds,
+            data_prefix=data_prefix,
         )
         config_out.update(
             {

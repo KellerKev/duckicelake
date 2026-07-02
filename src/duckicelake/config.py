@@ -155,22 +155,44 @@ class S3Settings:
     def use_ssl(self) -> bool:
         return self.endpoint.startswith("https://")
 
-    def table_prefix(self, namespace: str, table: str) -> str:
+    def table_prefix(self, namespace: str, table: str, data_prefix: str | None = None) -> str:
         # Used for scoping STS policies to a specific table's objects.
-        return f"{self.data_prefix}{namespace}/{table}/"
+        # `data_prefix` overrides the default for a per-account catalog; None
+        # keeps the single-catalog default (backward-compatible).
+        return f"{data_prefix or self.data_prefix}{namespace}/{table}/"
 
-    def masked_table_prefix(self, namespace: str, table: str) -> str:
+    def masked_table_prefix(self, namespace: str, table: str, data_prefix: str | None = None) -> str:
         """Root of a table's file-layer masked exports. Deliberately under
         `data_prefix` (the vended ListBucket condition covers globbing)
         but disjoint from `table_prefix` — masked-only credentials must
         never reach base bytes, and DuckLake's own cleanup tooling must
         never encounter foreign Parquet inside a table dir."""
-        return f"{self.data_prefix}__masked__/{namespace}/{table}/"
+        return f"{data_prefix or self.data_prefix}__masked__/{namespace}/{table}/"
 
-    def masked_sig_prefix(self, namespace: str, table: str, sig: str) -> str:
+    def masked_sig_prefix(self, namespace: str, table: str, sig: str,
+                          data_prefix: str | None = None) -> str:
         """One mask-signature's export tree: the credential boundary —
         masked principals are vended GetObject on exactly this prefix."""
-        return f"{self.masked_table_prefix(namespace, table)}{sig}/"
+        return f"{self.masked_table_prefix(namespace, table, data_prefix)}{sig}/"
+
+
+@dataclass(frozen=True)
+class CatalogRef:
+    """Identifies one isolated DuckLake catalog within the shared backend.
+
+    - `catalog_name`   — the DuckDB ATTACH alias.
+    - `data_prefix`    — S3 key prefix under the shared bucket for this
+                         catalog's Parquet (disjoint per catalog).
+    - `metadata_schema`— Postgres schema holding this catalog's ducklake_*
+                         metadata tables. `None` uses the extension default,
+                         i.e. today's single-catalog behavior.
+
+    The names are derived and validated by the orchestration layer; the proxy
+    treats them as opaque, trusted identifiers.
+    """
+    catalog_name: str
+    data_prefix: str
+    metadata_schema: str | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +255,16 @@ class Settings:
     @property
     def ducklake_data_path(self) -> str:
         return f"s3://{self.s3.bucket}/{self.s3.data_prefix}"
+
+    def default_catalog_ref(self) -> CatalogRef:
+        """The single-catalog ref matching today's behavior (no
+        METADATA_SCHEMA → extension default schema)."""
+        return CatalogRef(self.catalog_name, self.s3.data_prefix, None)
+
+    def data_path_for(self, ref: CatalogRef) -> str:
+        """S3 data root for a given catalog ref (mirrors `ducklake_data_path`
+        for the default ref)."""
+        return f"s3://{self.s3.bucket}/{ref.data_prefix}"
 
 
 def load_settings() -> Settings:

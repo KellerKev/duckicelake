@@ -437,6 +437,17 @@ class GovernanceStore:
             for r in rows
         ]
 
+    def has_file_layer_policies(self) -> bool:
+        """True if this catalog defines ANY file-layer masking policy. Lets
+        catalog-wide credential vending skip the expensive per-table carve-out
+        scan when there are none (the common case) — one indexed PG read on the
+        metadata pool instead of a plan_for per table across every namespace."""
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute("SELECT EXISTS(SELECT 1 FROM public.duckicelake_masking_policy "
+                        "WHERE file_layer_masking)")
+            return bool(cur.fetchone()[0])
+
     # -- tags -------------------------------------------------------------
 
     def create_tag(self, principal: str, tag_ns: str, tag_name: str,

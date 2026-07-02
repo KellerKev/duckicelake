@@ -24,7 +24,7 @@ import duckdb
 import psycopg
 from psycopg_pool import ConnectionPool
 
-from .config import Settings
+from .config import CatalogRef, Settings
 
 
 # Active commit-scoped cursor. When set (via `commit_transaction()`),
@@ -122,8 +122,12 @@ class DuckLakeCatalog:
     # Most reads now go straight to Postgres via the pg pool, so 2 is plenty.
     _DUCKDB_READ_POOL_SIZE = 2
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, catalog_ref: "CatalogRef | None" = None) -> None:
         self.settings = settings
+        # The isolated catalog this instance serves. Defaults to the single
+        # catalog described by settings (backward-compatible); a per-account
+        # ref carries a distinct metadata_schema + data_prefix.
+        self._ref = catalog_ref or settings.default_catalog_ref()
         self._lock = threading.Lock()                 # serialises the DuckDB write conn
         self._conn: duckdb.DuckDBPyConnection | None = None  # DuckDB write conn
         self._read_conns: queue.Queue | None = None   # DuckDB read pool
@@ -212,10 +216,14 @@ class DuckLakeCatalog:
             ],
         )
 
+        opts = [f"DATA_PATH '{self.settings.data_path_for(self._ref)}'"]
+        if self._ref.metadata_schema:
+            # Isolate this catalog's ducklake_* metadata in its own PG schema.
+            opts.append(f"METADATA_SCHEMA '{self._ref.metadata_schema}'")
+        opts.append("DATA_INLINING_ROW_LIMIT 0")
         conn.execute(
             f"ATTACH '{self.settings.ducklake_uri}' AS {self._cat()} "
-            f"(DATA_PATH '{self.settings.ducklake_data_path}', "
-            f" DATA_INLINING_ROW_LIMIT 0)"
+            f"({', '.join(opts)})"
         )
         conn.execute(f"USE {self._cat()}")
         return conn
@@ -241,7 +249,7 @@ class DuckLakeCatalog:
 
     def _cat(self) -> str:
         # Catalog name is trusted from settings (not user input), so simple quoting is fine.
-        return f'"{self.settings.catalog_name}"'
+        return f'"{self._ref.catalog_name}"'
 
     @property
     def s3_client(self):
@@ -408,7 +416,7 @@ class DuckLakeCatalog:
             return []
         with self.pg_cursor() as cur:
             cur.execute(
-                "SELECT schema_name FROM public.ducklake_schema "
+                "SELECT schema_name FROM ducklake_schema "
                 "WHERE end_snapshot IS NULL ORDER BY schema_name"
             )
             return [[r[0]] for r in cur.fetchall()]
@@ -418,7 +426,7 @@ class DuckLakeCatalog:
             return False
         with self.pg_cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM public.ducklake_schema "
+                "SELECT 1 FROM ducklake_schema "
                 "WHERE schema_name = %s AND end_snapshot IS NULL",
                 (ns[0],),
             )
@@ -445,8 +453,8 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT t.table_name
-                FROM public.ducklake_table t
-                JOIN public.ducklake_schema s USING(schema_id)
+                FROM ducklake_table t
+                JOIN ducklake_schema s USING(schema_id)
                 WHERE s.schema_name = %s
                   AND t.end_snapshot IS NULL
                   AND s.end_snapshot IS NULL
@@ -463,8 +471,8 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT 1
-                FROM public.ducklake_table t
-                JOIN public.ducklake_schema s USING(schema_id)
+                FROM ducklake_table t
+                JOIN ducklake_schema s USING(schema_id)
                 WHERE s.schema_name = %s AND t.table_name = %s
                   AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL
                 """,
@@ -485,10 +493,10 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT c.column_name, c.column_type, c.nulls_allowed, c.column_order
-                FROM public.ducklake_column c
-                JOIN public.ducklake_table  t
+                FROM ducklake_column c
+                JOIN ducklake_table  t
                   ON t.table_id = c.table_id AND t.end_snapshot IS NULL
-                JOIN public.ducklake_schema s
+                JOIN ducklake_schema s
                   ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
                 WHERE s.schema_name = %s AND t.table_name = %s
                   AND c.end_snapshot IS NULL
@@ -513,7 +521,7 @@ class DuckLakeCatalog:
                 "FROM information_schema.columns "
                 "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
                 "ORDER BY ordinal_position",
-                [self.settings.catalog_name, ns[0], name],
+                [self._ref.catalog_name, ns[0], name],
             ).fetchall()
         return [
             ColumnInfo(name=r[0], data_type=r[1], is_nullable=(r[2] == "YES"), ordinal=r[3])
@@ -551,7 +559,7 @@ class DuckLakeCatalog:
         """
         s3 = self.settings.s3
         client = self.s3_client
-        prefix = s3.table_prefix(ns[0], name)
+        prefix = s3.table_prefix(ns[0], name, self._ref.data_prefix)
         deleted = 0
         pages = client.get_paginator("list_objects_v2").paginate(
             Bucket=s3.bucket, Prefix=prefix,
@@ -595,7 +603,7 @@ class DuckLakeCatalog:
         in the response rather than raised, so a partial success still
         returns useful info.
         """
-        cat = self.settings.catalog_name
+        cat = self._ref.catalog_name
         out: dict[str, Any] = {"schema": ns[0], "table": name}
         with self.cursor() as c:
             # Scope the session to the target schema so merge_adjacent's
@@ -641,7 +649,7 @@ class DuckLakeCatalog:
         cur.execute(
             """
             SELECT data_file_id, path, path_is_relative
-            FROM public.ducklake_data_file
+            FROM ducklake_data_file
             WHERE table_id = %s AND end_snapshot IS NULL
             """,
             (table_id,),
@@ -675,8 +683,8 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT t.table_id
-                    FROM public.ducklake_table t
-                    JOIN public.ducklake_schema s USING(schema_id)
+                    FROM ducklake_table t
+                    JOIN ducklake_schema s USING(schema_id)
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND t.end_snapshot IS NULL
                     """,
@@ -701,7 +709,7 @@ class DuckLakeCatalog:
                 new_snap = self._allocate_snapshot(cur)
                 cur.execute(
                     """
-                    UPDATE public.ducklake_data_file
+                    UPDATE ducklake_data_file
                     SET end_snapshot = %s
                     WHERE table_id = %s AND end_snapshot IS NULL
                       AND data_file_id = ANY(%s)
@@ -709,7 +717,7 @@ class DuckLakeCatalog:
                     (new_snap, table_id, target_ids),
                 )
                 cur.execute(
-                    "INSERT INTO public.ducklake_snapshot_changes "
+                    "INSERT INTO ducklake_snapshot_changes "
                     "(snapshot_id, changes_made) VALUES (%s, %s)",
                     (new_snap, change_msg or f"deleted_from_table:{table_id}"),
                 )
@@ -748,8 +756,8 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT t.table_id
-                    FROM public.ducklake_table t
-                    JOIN public.ducklake_schema s USING(schema_id)
+                    FROM ducklake_table t
+                    JOIN ducklake_schema s USING(schema_id)
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND t.end_snapshot IS NULL
                     """,
@@ -776,7 +784,7 @@ class DuckLakeCatalog:
                 # _allocate_snapshot, so file ids [next_file_id - n_files,
                 # next_file_id) are ours.
                 cur.execute(
-                    "SELECT next_file_id FROM public.ducklake_snapshot WHERE snapshot_id = %s",
+                    "SELECT next_file_id FROM ducklake_snapshot WHERE snapshot_id = %s",
                     (new_snap,),
                 )
                 next_file_id = int(cur.fetchone()[0])
@@ -787,7 +795,7 @@ class DuckLakeCatalog:
                     delete_path_abs = spec["path"]
                     cur.execute(
                         """
-                        INSERT INTO public.ducklake_delete_file (
+                        INSERT INTO ducklake_delete_file (
                             delete_file_id, table_id, begin_snapshot, end_snapshot,
                             data_file_id, path, path_is_relative, format,
                             delete_count, file_size_bytes, footer_size,
@@ -808,7 +816,7 @@ class DuckLakeCatalog:
                     )
 
                 cur.execute(
-                    "INSERT INTO public.ducklake_snapshot_changes "
+                    "INSERT INTO ducklake_snapshot_changes "
                     "(snapshot_id, changes_made) VALUES (%s, %s)",
                     (new_snap, change_msg or f"deleted_from_table:{table_id}"),
                 )
@@ -824,7 +832,7 @@ class DuckLakeCatalog:
         cur.execute(
             """
             SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
-            FROM public.ducklake_snapshot
+            FROM ducklake_snapshot
             ORDER BY snapshot_id DESC LIMIT 1
             """
         )
@@ -833,7 +841,7 @@ class DuckLakeCatalog:
         new_next_file_id = int(next_file_id) + n_files
         cur.execute(
             """
-            INSERT INTO public.ducklake_snapshot
+            INSERT INTO ducklake_snapshot
                 (snapshot_id, snapshot_time, schema_version,
                  next_catalog_id, next_file_id)
             VALUES (%s, NOW(), %s, %s, %s)
@@ -868,7 +876,7 @@ class DuckLakeCatalog:
             try:
                 c.execute(
                     "CALL ducklake_add_data_files(?, ?, ?)",
-                    [self.settings.catalog_name, name, paths],
+                    [self._ref.catalog_name, name, paths],
                 )
             finally:
                 # Return to default schema so subsequent catalog operations
@@ -942,7 +950,7 @@ class DuckLakeCatalog:
     # ---- eager-materialisation sidecar --------------------------------
     # DuckLake-direct writes (DuckDB clients attaching `ducklake:` and
     # running INSERT/UPDATE/DELETE) commit straight into
-    # public.ducklake_snapshot without going through the REST proxy. The
+    # ducklake_snapshot without going through the REST proxy. The
     # lazy LoadTable path still materialises them on first read, but
     # external readers pay that cost. The trigger + listener below
     # materialise eagerly so S3 metadata is warm immediately after the
@@ -983,12 +991,12 @@ class DuckLakeCatalog:
         cur.execute("""
             SELECT 1 FROM pg_trigger
             WHERE tgname = 'duckicelake_snapshot_notify'
-              AND tgrelid = 'public.ducklake_snapshot'::regclass
+              AND tgrelid = 'ducklake_snapshot'::regclass
         """)
         if cur.fetchone() is None:
             cur.execute("""
                 CREATE TRIGGER duckicelake_snapshot_notify
-                AFTER INSERT ON public.ducklake_snapshot
+                AFTER INSERT ON ducklake_snapshot
                 FOR EACH ROW
                 EXECUTE FUNCTION public.duckicelake_notify_snapshot()
             """)
@@ -1008,9 +1016,9 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT DISTINCT s.schema_name, t.table_name
-                FROM public.ducklake_data_file d
-                JOIN public.ducklake_table  t ON t.table_id = d.table_id
-                JOIN public.ducklake_schema s ON s.schema_id = t.schema_id
+                FROM ducklake_data_file d
+                JOIN ducklake_table  t ON t.table_id = d.table_id
+                JOIN ducklake_schema s ON s.schema_id = t.schema_id
                 WHERE (d.begin_snapshot = %s OR d.end_snapshot = %s)
                   AND t.end_snapshot IS NULL
                   AND s.end_snapshot IS NULL
@@ -1057,7 +1065,7 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT s.snapshot_id
-                FROM public.ducklake_snapshot s
+                FROM ducklake_snapshot s
                 LEFT JOIN public.duckicelake_materialisation_log l
                   ON l.ducklake_snapshot_id = s.snapshot_id
                   AND l.status = 'done'
@@ -1371,7 +1379,7 @@ class DuckLakeCatalog:
                     return None
 
                 pos_key = (
-                    f"{s3.table_prefix(ns[0], name)}"
+                    f"{s3.table_prefix(ns[0], name, self._ref.data_prefix)}"
                     f"ducklake-eqdel-{df.data_file_id}-{_uuid.uuid4().hex}.parquet"
                 )
                 pos_uri = f"s3://{s3.bucket}/{pos_key}"
@@ -1424,7 +1432,7 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT column_id, column_name
-                    FROM public.ducklake_column
+                    FROM ducklake_column
                     WHERE table_id = %s AND end_snapshot IS NULL
                       AND column_id = ANY(%s)
                     """,
@@ -1446,7 +1454,7 @@ class DuckLakeCatalog:
         with self.cursor() as c:
             arr_literal = "[" + ",".join(f"{int(s)}::UBIGINT" for s in snapshot_ids) + "]"
             c.execute(
-                f"CALL ducklake_expire_snapshots('{self.settings.catalog_name}', "
+                f"CALL ducklake_expire_snapshots('{self._ref.catalog_name}', "
                 f"versions := {arr_literal})"
             )
 
@@ -1484,18 +1492,18 @@ class DuckLakeCatalog:
                     """
                     SELECT pc.partition_key_index, c.column_name,
                            pc.transform, pc.column_id
-                    FROM public.ducklake_partition_column pc
-                    JOIN public.ducklake_partition_info pi
+                    FROM ducklake_partition_column pc
+                    JOIN ducklake_partition_info pi
                       ON pi.partition_id = pc.partition_id
                      AND pi.table_id = pc.table_id
-                    JOIN public.ducklake_column c
+                    JOIN ducklake_column c
                       ON c.column_id = pc.column_id
                      AND c.table_id = pc.table_id
                      AND c.end_snapshot IS NULL
-                    JOIN public.ducklake_table t
+                    JOIN ducklake_table t
                       ON t.table_id = pc.table_id
                      AND t.end_snapshot IS NULL
-                    JOIN public.ducklake_schema s
+                    JOIN ducklake_schema s
                       ON s.schema_id = t.schema_id
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND pi.end_snapshot IS NULL
@@ -1517,8 +1525,8 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT pv.data_file_id, pv.partition_key_index, pv.partition_value
-                    FROM public.ducklake_file_partition_value pv
-                    JOIN public.ducklake_data_file f
+                    FROM ducklake_file_partition_value pv
+                    JOIN ducklake_data_file f
                       ON f.data_file_id = pv.data_file_id
                     WHERE pv.table_id = %s
                       AND f.end_snapshot IS NULL
@@ -1545,18 +1553,18 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT pc.partition_key_index, c.column_name, pc.transform
-                    FROM public.ducklake_partition_column pc
-                    JOIN public.ducklake_partition_info pi
+                    FROM ducklake_partition_column pc
+                    JOIN ducklake_partition_info pi
                       ON pi.partition_id = pc.partition_id
                      AND pi.table_id = pc.table_id
-                    JOIN public.ducklake_column c
+                    JOIN ducklake_column c
                       ON c.column_id = pc.column_id
                      AND c.table_id = pc.table_id
                      AND c.end_snapshot IS NULL
-                    JOIN public.ducklake_table t
+                    JOIN ducklake_table t
                       ON t.table_id = pc.table_id
                      AND t.end_snapshot IS NULL
-                    JOIN public.ducklake_schema s
+                    JOIN ducklake_schema s
                       ON s.schema_id = t.schema_id
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND pi.end_snapshot IS NULL
@@ -1586,8 +1594,8 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT t.table_id
-                    FROM public.ducklake_table t
-                    JOIN public.ducklake_schema s USING(schema_id)
+                    FROM ducklake_table t
+                    JOIN ducklake_schema s USING(schema_id)
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND t.end_snapshot IS NULL
                     """,
@@ -1603,7 +1611,7 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT column_id, column_name
-                    FROM public.ducklake_column
+                    FROM ducklake_column
                     WHERE table_id = %s AND end_snapshot IS NULL
                       AND parent_column IS NULL
                     """,
@@ -1616,7 +1624,7 @@ class DuckLakeCatalog:
                 # Tombstone the previous live sort_info, if any.
                 cur.execute(
                     """
-                    UPDATE public.ducklake_sort_info
+                    UPDATE ducklake_sort_info
                     SET end_snapshot = %s
                     WHERE table_id = %s AND end_snapshot IS NULL
                     RETURNING sort_id
@@ -1630,14 +1638,14 @@ class DuckLakeCatalog:
                     # are scoped per-table in DuckLake).
                     cur.execute(
                         "SELECT COALESCE(MAX(sort_id), -1) + 1 "
-                        "FROM public.ducklake_sort_info WHERE table_id = %s",
+                        "FROM ducklake_sort_info WHERE table_id = %s",
                         (table_id,),
                     )
                     sort_id = int(cur.fetchone()[0])
 
                     cur.execute(
                         """
-                        INSERT INTO public.ducklake_sort_info
+                        INSERT INTO ducklake_sort_info
                             (sort_id, table_id, begin_snapshot, end_snapshot)
                         VALUES (%s, %s, %s, NULL)
                         """,
@@ -1656,7 +1664,7 @@ class DuckLakeCatalog:
                         null_order = f.null_order.replace("-", "_")
                         cur.execute(
                             """
-                            INSERT INTO public.ducklake_sort_expression
+                            INSERT INTO ducklake_sort_expression
                                 (sort_id, sort_key_index, expression,
                                  dialect, sort_direction, null_order)
                             VALUES (%s, %s, %s, 'duckdb', %s, %s)
@@ -1665,7 +1673,7 @@ class DuckLakeCatalog:
                         )
 
                 cur.execute(
-                    "INSERT INTO public.ducklake_snapshot_changes "
+                    "INSERT INTO ducklake_snapshot_changes "
                     "(snapshot_id, changes_made) VALUES (%s, %s)",
                     (new_snap, f"altered_table:{table_id}"),
                 )
@@ -1682,12 +1690,12 @@ class DuckLakeCatalog:
                     """
                     SELECT se.sort_key_index, se.expression,
                            se.sort_direction, se.null_order
-                    FROM public.ducklake_sort_expression se
-                    JOIN public.ducklake_sort_info si
+                    FROM ducklake_sort_expression se
+                    JOIN ducklake_sort_info si
                       ON si.sort_id = se.sort_id
-                    JOIN public.ducklake_table t
+                    JOIN ducklake_table t
                       ON t.table_id = si.table_id AND t.end_snapshot IS NULL
-                    JOIN public.ducklake_schema s
+                    JOIN ducklake_schema s
                       ON s.schema_id = t.schema_id
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND si.end_snapshot IS NULL
@@ -1731,8 +1739,8 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT v.view_name
-                FROM public.ducklake_view v
-                JOIN public.ducklake_schema s USING(schema_id)
+                FROM ducklake_view v
+                JOIN ducklake_schema s USING(schema_id)
                 WHERE s.schema_name = %s
                   AND v.end_snapshot IS NULL
                   AND s.end_snapshot IS NULL
@@ -1749,8 +1757,8 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT 1
-                FROM public.ducklake_view v
-                JOIN public.ducklake_schema s USING(schema_id)
+                FROM ducklake_view v
+                JOIN ducklake_schema s USING(schema_id)
                 WHERE s.schema_name = %s AND v.view_name = %s
                   AND v.end_snapshot IS NULL AND s.end_snapshot IS NULL
                 """,
@@ -1763,8 +1771,8 @@ class DuckLakeCatalog:
             cur.execute(
                 """
                 SELECT v.sql
-                FROM public.ducklake_view v
-                JOIN public.ducklake_schema s USING(schema_id)
+                FROM ducklake_view v
+                JOIN ducklake_schema s USING(schema_id)
                 WHERE s.schema_name = %s AND v.view_name = %s
                   AND v.end_snapshot IS NULL AND s.end_snapshot IS NULL
                 """,
@@ -1800,7 +1808,16 @@ class DuckLakeCatalog:
     def _pg_conninfo(self) -> str:
         # Single source of truth for the owner DSN (incl. any password) lives
         # on Settings; the pool and notify listener both go through here.
-        return self.settings.pg_dsn
+        dsn = self.settings.pg_dsn
+        # For an isolated catalog, the ducklake_* metadata tables live in this
+        # catalog's METADATA_SCHEMA, not public. Direct PG queries reference
+        # them unqualified; set search_path so they resolve to this catalog's
+        # schema while keeping public for cross-catalog sidecars (governance,
+        # the catalog registry). The default catalog (no metadata_schema) keeps
+        # Postgres' default search_path — byte-for-byte the prior behavior.
+        if self._ref.metadata_schema:
+            dsn += f" options='-c search_path={self._ref.metadata_schema},public'"
+        return dsn
 
     def resolve_table(self, ns: list[str], name: str) -> TableIdResolved | None:
         """Look up DuckLake's table_id + schema_id for a qualified table name."""
@@ -1810,8 +1827,8 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT t.table_id, s.schema_id
-                    FROM public.ducklake_table t
-                    JOIN public.ducklake_schema s USING(schema_id)
+                    FROM ducklake_table t
+                    JOIN ducklake_schema s USING(schema_id)
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND t.end_snapshot IS NULL
                     """,
@@ -1829,8 +1846,8 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                    FROM public.ducklake_table t
-                    JOIN public.ducklake_schema s USING(schema_id)
+                    FROM ducklake_table t
+                    JOIN ducklake_schema s USING(schema_id)
                     WHERE s.schema_name = %s AND t.table_name = %s
                       AND t.end_snapshot IS NULL
                     """,
@@ -1844,7 +1861,7 @@ class DuckLakeCatalog:
     def _resolve_full_path(self, ns: list[str], name: str, file_path: str, file_rel: bool) -> str:
         """Compose DATA_PATH + schema.path + table.path + file.path with relatives."""
         s_path, s_rel, t_path, t_rel = self.table_path_pieces(ns, name)
-        base = self.settings.ducklake_data_path
+        base = self.settings.data_path_for(self._ref)
         base = _join_path(base, s_path, s_rel)
         base = _join_path(base, t_path, t_rel)
         return _join_path(base, file_path, file_rel)
@@ -1861,7 +1878,7 @@ class DuckLakeCatalog:
         """
         with self.pg_cursor(autocommit=False) as cur:
                 cur.execute(
-                    "SELECT snapshot_id, changes_made FROM public.ducklake_snapshot_changes"
+                    "SELECT snapshot_id, changes_made FROM ducklake_snapshot_changes"
                 )
                 return {int(r[0]): (r[1] or "") for r in cur.fetchall()}
 
@@ -1882,19 +1899,19 @@ class DuckLakeCatalog:
                 cur.execute(
                     """
                     WITH touched AS (
-                      SELECT DISTINCT begin_snapshot AS snap FROM public.ducklake_data_file       WHERE table_id = %s
-                      UNION SELECT end_snapshot                              FROM public.ducklake_data_file       WHERE table_id = %s AND end_snapshot IS NOT NULL
-                      UNION SELECT begin_snapshot                            FROM public.ducklake_delete_file     WHERE table_id = %s
-                      UNION SELECT end_snapshot                              FROM public.ducklake_delete_file     WHERE table_id = %s AND end_snapshot IS NOT NULL
-                      UNION SELECT begin_snapshot                            FROM public.ducklake_column          WHERE table_id = %s
-                      UNION SELECT end_snapshot                              FROM public.ducklake_column          WHERE table_id = %s AND end_snapshot IS NOT NULL
-                      UNION SELECT begin_snapshot                            FROM public.ducklake_partition_info  WHERE table_id = %s
-                      UNION SELECT end_snapshot                              FROM public.ducklake_partition_info  WHERE table_id = %s AND end_snapshot IS NOT NULL
-                      UNION SELECT begin_snapshot                            FROM public.ducklake_sort_info       WHERE table_id = %s
-                      UNION SELECT end_snapshot                              FROM public.ducklake_sort_info       WHERE table_id = %s AND end_snapshot IS NOT NULL
+                      SELECT DISTINCT begin_snapshot AS snap FROM ducklake_data_file       WHERE table_id = %s
+                      UNION SELECT end_snapshot                              FROM ducklake_data_file       WHERE table_id = %s AND end_snapshot IS NOT NULL
+                      UNION SELECT begin_snapshot                            FROM ducklake_delete_file     WHERE table_id = %s
+                      UNION SELECT end_snapshot                              FROM ducklake_delete_file     WHERE table_id = %s AND end_snapshot IS NOT NULL
+                      UNION SELECT begin_snapshot                            FROM ducklake_column          WHERE table_id = %s
+                      UNION SELECT end_snapshot                              FROM ducklake_column          WHERE table_id = %s AND end_snapshot IS NOT NULL
+                      UNION SELECT begin_snapshot                            FROM ducklake_partition_info  WHERE table_id = %s
+                      UNION SELECT end_snapshot                              FROM ducklake_partition_info  WHERE table_id = %s AND end_snapshot IS NOT NULL
+                      UNION SELECT begin_snapshot                            FROM ducklake_sort_info       WHERE table_id = %s
+                      UNION SELECT end_snapshot                              FROM ducklake_sort_info       WHERE table_id = %s AND end_snapshot IS NOT NULL
                     )
                     SELECT s.snapshot_id, s.snapshot_time, s.schema_version
-                    FROM public.ducklake_snapshot s
+                    FROM ducklake_snapshot s
                     JOIN touched t ON t.snap = s.snapshot_id
                     WHERE s.snapshot_id IS NOT NULL
                     ORDER BY s.snapshot_id
@@ -1920,7 +1937,7 @@ class DuckLakeCatalog:
                     SELECT data_file_id, path, path_is_relative, file_size_bytes,
                            record_count, begin_snapshot, end_snapshot, row_id_start,
                            encryption_key
-                    FROM public.ducklake_data_file
+                    FROM ducklake_data_file
                     WHERE table_id = %s
                       AND begin_snapshot <= %s
                       AND (end_snapshot IS NULL OR end_snapshot > %s)
@@ -1953,7 +1970,7 @@ class DuckLakeCatalog:
                     SELECT delete_file_id, data_file_id, path, path_is_relative,
                            file_size_bytes, delete_count,
                            begin_snapshot, end_snapshot
-                    FROM public.ducklake_delete_file
+                    FROM ducklake_delete_file
                     WHERE table_id = %s
                       AND begin_snapshot <= %s
                       AND (end_snapshot IS NULL OR end_snapshot > %s)
@@ -1987,7 +2004,7 @@ class DuckLakeCatalog:
                     """
                     SELECT data_file_id, column_id, value_count, null_count,
                            min_value, max_value, contains_nan
-                    FROM public.ducklake_file_column_stats
+                    FROM ducklake_file_column_stats
                     WHERE data_file_id = ANY(%s)
                     """,
                     (data_file_ids,),
@@ -2015,7 +2032,7 @@ class DuckLakeCatalog:
                     SELECT column_id, column_name, column_type, column_order,
                            begin_snapshot, end_snapshot,
                            initial_default, default_value, nulls_allowed
-                    FROM public.ducklake_column
+                    FROM ducklake_column
                     WHERE table_id = %s
                       AND begin_snapshot <= %s
                       AND (end_snapshot IS NULL OR end_snapshot > %s)
@@ -2060,5 +2077,5 @@ class DuckLakeCatalog:
 
         # Deterministic fallback keyed on catalog + namespace + name. Good enough
         # for the prototype; production would pull the real DuckLake table id.
-        key = f"{self.settings.catalog_name}.{ns[0]}.{name}"
+        key = f"{self._ref.catalog_name}.{ns[0]}.{name}"
         return str(_uuid.uuid5(_uuid.NAMESPACE_URL, key))

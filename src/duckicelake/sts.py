@@ -187,6 +187,7 @@ def vend_credentials(
     duration_seconds: int = 3600,
     session_name: str | None = None,
     principal: str | None = None,
+    data_prefix: str | None = None,
 ) -> VendedCredentials:
     """Mint temporary credentials for a single table.
 
@@ -207,7 +208,9 @@ def vend_credentials(
     creds from principals who must be masked (coarse, file-granularity) lands
     with file-layer masking (pre-masked Parquet copies).
     """
-    write_prefix = s3.data_prefix  # DuckLake writes everything under this
+    # Per-account catalog scopes writes to its own data prefix; default keeps
+    # the single-catalog data prefix.
+    write_prefix = data_prefix or s3.data_prefix  # DuckLake writes under this
     read_keys = _keys_from_uris(data_file_uris or [], s3.bucket)
     policy = _scoped_policy(
         s3.bucket,
