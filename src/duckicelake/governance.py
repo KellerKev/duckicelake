@@ -20,9 +20,14 @@ delegates to it.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import time
 from typing import Any
 
 from .catalog import DuckLakeCatalog, pg_advisory_lock
+
+log = logging.getLogger("duckicelake.governance")
 
 
 # Object kinds a tag / policy can target.
@@ -194,6 +199,13 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
             PRIMARY KEY (role_name, principal_sub)
         )
     """)
+    # The RLS predicate functions and roles_for_principal look grants up BY
+    # PRINCIPAL; the PK leads with role_name, so those lookups scanned. This
+    # index runs inside every DuckLake-direct reader's query plan.
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS duckicelake_role_grant_principal_idx
+        ON public.duckicelake_role_grant (principal_sub)
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.duckicelake_object_owner (
             object_kind VARCHAR NOT NULL,
@@ -359,6 +371,12 @@ class GovernanceStore:
 
     def __init__(self, catalog: DuckLakeCatalog) -> None:
         self.catalog = catalog
+        # Read-path audit retention: rows older than this are lazily purged
+        # (at most once an hour, piggybacked on audit_load). 0 = keep forever.
+        # The audit table otherwise grows one row per governed read.
+        self.audit_retention_days = int(os.environ.get(
+            "DUCKICELAKE_AUDIT_RETENTION_DAYS", "0"))
+        self._last_audit_purge = 0.0
 
     # -- audit ------------------------------------------------------------
 
@@ -401,19 +419,42 @@ class GovernanceStore:
                    detail: dict | None = None) -> None:
         """Record an enforced read-path decision (LoadTable, or Phase 3's
         ducklake-credentials vending via `operation`/`decision`/`detail`).
-        Best-effort — a failure here must never break the read path, so
-        callers wrap it. Defaults preserve the Phase 2 LoadTable shape."""
-        with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
-            self.audit(
-                cur, principal=principal, operation=operation,
-                object_=object_,
-                decision=decision
-                or ("masked" if (masked_cols or row_filtered) else "ok"),
-                masked_cols=masked_cols or None,
-                applied_policies=applied_policies or None,
-                detail={"row_filtered": row_filtered, **(detail or {})},
-            )
+        Best-effort BY CONSTRUCTION: it sits on the response hot path, so a
+        failed audit is logged and swallowed here — it must never fail (or
+        fail-closed) the read it describes. Defaults preserve the Phase 2
+        LoadTable shape."""
+        try:
+            with self.catalog.pg_cursor() as cur:
+                ensure_governance_sidecars(cur)
+                self.audit(
+                    cur, principal=principal, operation=operation,
+                    object_=object_,
+                    decision=decision
+                    or ("masked" if (masked_cols or row_filtered) else "ok"),
+                    masked_cols=masked_cols or None,
+                    applied_policies=applied_policies or None,
+                    detail={"row_filtered": row_filtered, **(detail or {})},
+                )
+                self._maybe_purge_audit(cur)
+        except Exception:
+            log.exception("read-path audit failed for %s on %s (read served)",
+                          principal, object_)
+
+    def _maybe_purge_audit(self, cur) -> None:
+        """Lazy retention: delete audit rows older than the configured
+        window, at most once an hour per process (piggybacked on the audit
+        write so no scheduler is needed — mirrors gc_expired_roles)."""
+        if self.audit_retention_days <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_audit_purge < 3600:
+            return
+        self._last_audit_purge = now
+        cur.execute(
+            "DELETE FROM public.duckicelake_governance_audit "
+            "WHERE ts < now() - make_interval(days => %s)",
+            (self.audit_retention_days,),
+        )
 
     def list_audit(self, limit: int = 200) -> list[dict]:
         with self.catalog.pg_cursor(autocommit=False) as cur:
@@ -949,15 +990,25 @@ class GovernanceStore:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     @staticmethod
-    def _fetch_attachments(cur) -> list[dict]:
+    def _fetch_attachments(cur, schema: str, table: str) -> list[dict]:
+        # Only rows that can possibly reach THIS table: tag-target
+        # attachments (a tag may sit on any of its columns / the table / the
+        # schema — the resolver intersects with the object's tag set) plus
+        # column/table-target attachments addressed to it by name. Without
+        # the predicate every masked read scanned the whole catalog's
+        # attachments and filtered in Python — O(total governance model).
         cur.execute(
             """
             SELECT policy_kind, policy_name, target_kind, tag_ns, tag_name,
                    schema_name, object_name, column_name, columns
             FROM public.duckicelake_policy_attachment
+            WHERE target_kind = 'tag'
+               OR (target_kind IN ('column', 'table')
+                   AND schema_name = %s AND object_name = %s)
             ORDER BY policy_kind, policy_name, target_kind,
                      tag_ns, tag_name, schema_name, object_name, column_name
-            """
+            """,
+            (schema, table),
         )
         cols = ["policy_kind", "policy_name", "target_kind", "tag_ns", "tag_name",
                 "schema_name", "object_name", "column_name", "columns"]
@@ -994,7 +1045,7 @@ class GovernanceStore:
         with self.catalog.pg_cursor(autocommit=False) as cur:
             ensure_governance_sidecars(cur)
             object_tags = self._fetch_object_tags(cur, schema, table)
-            attachments = self._fetch_attachments(cur)
+            attachments = self._fetch_attachments(cur, schema, table)
             masking_bodies = self._fetch_policy_bodies(cur, "duckicelake_masking_policy")
             row_bodies = self._fetch_policy_bodies(cur, "duckicelake_row_access_policy")
         return {

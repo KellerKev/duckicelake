@@ -273,3 +273,84 @@ def test_planning_error_fails_closed_for_file_layer(client, settings):
     # healed: the file-layer read works again (masked, not denied)
     r = client.get(f"/v1/lake/namespaces/{ns_fl}/tables/events")
     assert r.status_code == 200, r.text
+
+
+# ---- Stage 5 (merge-stabilization): read-path scale + audit hygiene --------
+
+from duckicelake.governance import GovernanceStore
+
+
+def test_attachment_fetch_scoped_to_table(client, settings, direct_catalog):
+    """resolution_inputs must not haul in other tables' direct attachments —
+    the old query scanned the entire catalog's attachments per masked read."""
+    ns = _ns("attscope")
+    _make_table(client, ns, "events")     # gets the pii.email tag + mask
+    _author_demo_policy(client, ns, "events")
+    _make_table_only(client, ns, "other")
+    # a DIRECT column attachment on the other table
+    client.post("/v1/lake/governance/masking-policies",
+                json={"name": f"mask_other_{ns}", "signature": "(val VARCHAR)",
+                      "body": "'x'"}).raise_for_status()
+    client.post("/v1/lake/governance/policy-attachments",
+                json={"policy-kind": "masking", "policy-name": f"mask_other_{ns}",
+                      "target-kind": "column", "schema": ns,
+                      "object": "other", "column": "email"}).raise_for_status()
+
+    store = GovernanceStore(direct_catalog)
+    atts = store.resolution_inputs(ns, "events")["attachments"]
+    kinds = {(a["target_kind"], a.get("object_name")) for a in atts}
+    # tag-target rows are present (resolver intersects with the tag set)...
+    assert any(k == "tag" for k, _ in kinds)
+    # ...but the OTHER table's direct attachment is filtered out at SQL level
+    assert ("column", "other") not in kinds
+    # and masking still resolves correctly for the requested table
+    eff = store.effective_policies(principal="nobody", schema=ns, table="events")
+    masked = [c["column"] for c in eff["column_masks"] if c["masking_policies"]]
+    assert masked == ["email"]
+
+
+def test_audit_load_never_raises():
+    """audit_load sits on the response hot path — a PG failure must be
+    swallowed (logged), never break or fail-close the read it describes."""
+    class BrokenCatalog:
+        def pg_cursor(self, **kw):
+            raise RuntimeError("pg down")
+
+    store = GovernanceStore(BrokenCatalog())
+    store.audit_load(principal="p", object_="s.t", masked_cols=[],
+                     applied_policies=[], row_filtered=False)   # no raise
+
+
+def test_audit_retention_purges_old_rows(settings, direct_catalog):
+    """With DUCKICELAKE_AUDIT_RETENTION_DAYS set, audit_load lazily purges
+    rows older than the window (at most hourly; forced here)."""
+    store = GovernanceStore(direct_catalog)
+    store.audit_retention_days = 30
+    store._last_audit_purge = 0.0        # force the purge window open
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("""
+            INSERT INTO public.duckicelake_governance_audit
+                (ts, principal_sub, operation, object, decision)
+            VALUES (now() - interval '90 days', 'old', 'load_table', 'x.y', 'ok')
+        """)
+    store.audit_load(principal="fresh", object_="x.y", masked_cols=[],
+                     applied_policies=[], row_filtered=False)
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT count(*) FROM public.duckicelake_governance_audit "
+                    "WHERE principal_sub = 'old'")
+        assert cur.fetchone()[0] == 0, "expired audit row must be purged"
+        cur.execute("SELECT count(*) FROM public.duckicelake_governance_audit "
+                    "WHERE principal_sub = 'fresh'")
+        assert cur.fetchone()[0] >= 1
+
+
+def test_role_grant_principal_index_exists(settings, direct_catalog):
+    """The RLS predicates + roles_for_principal look grants up by principal;
+    the sidecar ensure must ship the supporting index."""
+    _gov.reset_sidecar_cache()
+    store = GovernanceStore(direct_catalog)
+    store.create_role("t", "idxprobe_role")
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_indexes "
+                    "WHERE indexname = 'duckicelake_role_grant_principal_idx'")
+        assert cur.fetchone()[0] == 1

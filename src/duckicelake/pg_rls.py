@@ -264,10 +264,42 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
              group, len(table_scoped), len(file_scoped))
 
 
+def _preflight_ownership(cur, meta: str) -> None:
+    """Actionable error when the proxy's role cannot ALTER the ducklake_*
+    tables (brownfield deployment: DuckLake attached under a different role).
+    `ENABLE ROW LEVEL SECURITY` requires table ownership; without this check
+    the failure surfaces as a cryptic permission-denied mid-DDL and wedges
+    the fail-closed vend gate. Superusers own everything effectively —
+    skipped."""
+    cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+    row = cur.fetchone()
+    if row and row[0]:
+        return
+    cur.execute("""
+        SELECT c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s AND c.relkind = 'r'
+          AND c.relname LIKE 'ducklake\\_%%'
+          AND NOT pg_has_role(current_user, c.relowner, 'USAGE')
+        ORDER BY c.relname
+    """, (meta,))
+    foreign = [r[0] for r in cur.fetchall()]
+    if foreign:
+        sample = ", ".join(foreign[:5]) + ("…" if len(foreign) > 5 else "")
+        raise RuntimeError(
+            f"RLS pre-flight: {len(foreign)} ducklake_* tables in schema "
+            f"'{meta}' are not owned by the proxy role — ENABLE ROW LEVEL "
+            f"SECURITY requires ownership. Fix: ALTER TABLE ... OWNER TO "
+            f"<proxy-role> (see OPERATIONS.md, owner-role prerequisites). "
+            f"Tables: {sample}")
+
+
 def _ensure_rls_locked(catalog: DuckLakeCatalog, cur, meta: str, group: str,
                        hidden_table_fn: str, hidden_file_fn: str,
                        ) -> tuple[list[str], list[str]]:
     """The DDL body of ensure_rls — caller holds the advisory lock."""
+    _preflight_ownership(cur, meta)
     # Sidecars the predicate functions reference must exist before any
     # reader query can invoke them (always in public, cross-catalog).
     ensure_governance_sidecars(cur)
