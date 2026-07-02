@@ -142,7 +142,7 @@ sidecar is maybe half a day of work.
 
 ### Testing gaps
 
-**No Spark / Trino integration tests.** 19 tests cover PyIceberg +
+**No Spark / Trino integration tests.** 133 tests cover PyIceberg +
 DuckDB iceberg-ext + REST-direct + the Puffin writer. Real production
 deployments will also connect Spark and Trino, which catch different
 bugs (v2 vs v3 shape divergences, partition-spec edge cases, write-mode

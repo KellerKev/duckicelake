@@ -78,7 +78,7 @@ layered, and you choose the tier per masking policy:
   PyIceberg, anything holding the vended creds) **physically cannot reach
   the unmasked data**. Airtight; costs one masked copy per mask shape.
 
-Everything below is **implemented and tested** (an 80-test suite plus live
+Everything below is **implemented and tested** (a 133-test suite plus live
 end-to-end runs — see *What's verified*).
 
 ### A worked example — policies in, masked SQL out
@@ -316,9 +316,14 @@ Parquet directly: DuckDB has no per-column Parquet encryption and no REST
 scan-planning client, so pre-masked copies are the path. The default stays
 catalog-level only.
 
-Everything is **fail-open** (a governance error never breaks a read — it
-serves unmasked and audits the failure) and **root S3 keys are no longer
-embedded in responses by default**: clients see only vended credentials.
+Failure posture is **tiered**: the airtight surfaces — file-layer masking
+and RLS credential vending — always fail **closed** (an internal error
+denies the read/vend rather than leaking base bytes or the owner DSN),
+while the cooperative catalog-level tier fails **open** by default (a
+governance error degrades to unmasked-with-audit, never a broken read) —
+flip `DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1` to make governance errors deny
+there too. **Root S3 keys are no longer embedded in responses by
+default**: clients see only vended credentials.
 
 **Hardening & boundaries** (audited by two adversarial review passes):
 
@@ -391,7 +396,7 @@ same API, with every access audited.
 
 ### What's verified
 
-Beyond the 80-test `pytest` suite, the governance layer has been exercised
+Beyond the 133-test `pytest` suite, the governance layer has been exercised
 end-to-end against a live local stack (proxy + MinIO + Postgres). All of
 the following are confirmed working:
 
@@ -420,6 +425,18 @@ the following are confirmed working:
   copies.
 - **Performance.** Export materialization and masked scans are on par with
   base scans on a 1M-row table; re-vending reuses the existing export.
+- **Multi-worker stability.** `serve-hi` (4 uvicorn workers) boots with
+  zero startup-DDL races (advisory-lock-serialized `ensure_rls` / sidecar /
+  trigger DDL), all workers arm RLS, and credential vends return 200 from
+  every worker — including after killing a worker mid-run (the respawn
+  re-arms cleanly; a worker that misses startup arming self-heals on its
+  first vend).
+- **Multi-catalog isolation.** A provisioned tenant catalog's namespaces,
+  tables, commits, and vended credentials are fully disjoint from the
+  default catalog (own PG metadata schema + S3 prefix); a tenant reader
+  role is denied the default catalog's metadata with
+  `InsufficientPrivilege`; an add-schema commit against the tenant lands in
+  its schema and leaves the default catalog's same-named table untouched.
 
 ## Current state
 
@@ -435,6 +452,7 @@ to be concrete, shipped today:
 | File-layer masking — pre-masked Parquet + shadow Iceberg metadata (byte-level, every engine) | ✅ |
 | Multi-catalog registry — isolated per-tenant catalogs (PG schema + S3 prefix), account-scoped access | ✅ |
 | Multi-worker safe — advisory-locked startup DDL, self-healing RLS arming, per-catalog contexts | ✅ |
+| Tiered failure posture — airtight tier + RLS always fail closed; `DUCKICELAKE_GOVERNANCE_FAIL_CLOSED` hardens the cooperative tier | ✅ |
 
 The code has been through multiple adversarial review + audit passes; the
 security/correctness findings (reserved-property protection, reserved-name
@@ -531,6 +549,10 @@ Everything runs out of a single `pixi` environment — no Docker.
 
 - All catalog ops: `/v1/config`, namespace CRUD, table CRUD, rename,
   views CRUD.
+- Multi-catalog: `POST /v1/catalogs` provisions an isolated per-tenant
+  catalog (own PG metadata schema + S3 prefix); every `/v1/{prefix}/…`
+  route — including commits and credential vending — resolves through the
+  registry with account-scoped authorization.
 - `LoadTable` returns inline TableMetadata + (optionally) vended STS
   creds via `X-Iceberg-Access-Delegation: vended-credentials`.
 - `LoadTable?snapshot-id=N` pins a historical snapshot for time-travel.
@@ -728,9 +750,12 @@ machine.
 
 ### Tests + CI
 
-- 78 `pytest` tests covering the REST surface, cache LRU, metrics
+- 133 `pytest` tests covering the REST surface, cache LRU, metrics
   endpoint, Puffin writer byte-level structure, the eager-materialisation
-  listener, config-file loading, and the governance layer end-to-end —
+  listener, config-file loading, multi-catalog isolation (per-tenant PG
+  schemas / S3 prefixes / reader roles, account-scoped routing, per-catalog
+  commits), the fail-closed regression suite (multi-worker DDL race,
+  planning-error denial, strict mode), and the governance layer end-to-end —
   including the byte-level proofs that a masked principal's vended
   credentials cannot read base Parquet (403) while masked copies, the
   RLS-governed reader role, and the shadow Iceberg metadata all serve
@@ -951,6 +976,8 @@ duckicelake/
 │   ├── sql_proof.py              # masked-vs-unmasked rows from the live policy SQL
 │   └── probe_searchpath.py       # DuckDB search_path transparency probe (file-layer transparent routing)
 ├── duckicelake.toml.example      # config-file template (env ↔ TOML key map)
+├── docs/
+│   └── multi_catalog_isolation.md # multi-catalog design: isolation model + phasing
 ├── src/duckicelake/
 │   ├── config.py                 # settings: env > .env > duckicelake.toml
 │   ├── auth.py                   # OAuth2 + JWT + scope grammar + roles claim
@@ -963,6 +990,7 @@ duckicelake/
 │   ├── masking_views.py          # ad-hoc DuckLake masking views: materialise/GC/transparent
 │   ├── masked_export.py          # file-layer masking: masked Parquet exports + shadow metadata
 │   ├── pg_rls.py                 # per-principal PG reader roles + RLS on ducklake_*
+│   ├── registry.py               # multi-catalog registry: per-tenant contexts + provisioning
 │   ├── notify.py                 # eager materialisation listener (LISTEN/NOTIFY + election)
 │   ├── types.py                  # Iceberg ↔ DuckDB ↔ DuckLake type translation
 │   ├── bounds.py                 # Iceberg binary bound encoders
@@ -979,6 +1007,7 @@ duckicelake/
 │   ├── models.py                 # Pydantic REST request/response models
 │   ├── server.py                 # FastAPI app: endpoints + middleware + handlers
 │   ├── bootstrap.py              # `pixi run ducklake-init`
+│   ├── seed.py                   # `pixi run seed[-governed]` — optional sample data
 │   ├── smoke.py                  # catalog-only smoke
 │   └── duckdb_client.py          # full demo with assertions across all features
 └── tests/
@@ -987,8 +1016,13 @@ duckicelake/
     ├── test_cache_and_observability.py
     ├── test_config.py            # config-file loading + precedence + root-key suppression
     ├── test_governance.py        # authoring, audit, plan, LoadTable stamping
+    ├── test_governance_lifecycle.py # one-mask-per-column, delete/detach/revoke, rename/drop carry
     ├── test_governance_phase3.py # masking views, ducklake-credentials, STS scoping, RLS, fail-open
     ├── test_governance_phase4.py # file-layer masking: exports, byte proofs, shadow metadata
+    ├── test_governance_security.py # fail-closed regressions: DDL race, planning errors, strict mode
+    ├── test_catalog_registry.py  # multi-catalog registry: provision/resolve/cache
+    ├── test_multi_catalog.py     # per-tenant PG-schema + S3-prefix + row isolation
+    ├── test_multi_catalog_http.py# multi-catalog REST: routing, authz, per-catalog commits
     ├── test_notify_materialise.py# eager materialisation end-to-end
     └── test_puffin.py            # byte-level Puffin writer tests
 ```
@@ -1030,6 +1064,7 @@ carry secrets.
 | `DUCKICELAKE_GOVERNANCE_FAIL_CLOSED` | `0` | `1` → the cooperative tier ALSO fails closed: any governance error on a governed read denies (503) instead of degrading to unmasked-with-audit |
 | `DUCKICELAKE_READER_GROUP_ROLE` | `duckicelake_reader` | NOLOGIN group carrying reader grants + RLS targets |
 | `DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS` | `2` | snap dirs kept per mask-signature (file-layer masking) |
+| `DUCKICELAKE_MASKED_RETAIN_GRACE_SECONDS` | `3900` | never sweep a snap dir younger than this (outlives the STS credential TTL) |
 | `DUCKICELAKE_MASKED_EXPORT_TTL_DAYS` | `7` | idle signatures stop being eagerly refreshed |
 | `DUCKICELAKE_MASKED_EXPORT_FILE_SIZE` | `256MB` | parquet part size for masked exports |
 | `DUCKICELAKE_DISABLE_NOTIFY` | *(unset)* | `1` → disable the eager materialisation listener |
