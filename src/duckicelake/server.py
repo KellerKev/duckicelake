@@ -1214,6 +1214,17 @@ def ducklake_credentials(
             detail=(f"file-layer masking for {ns[0]}.{table} could not be "
                     f"materialized; refusing to vend base credentials"))
 
+    # Strict mode (DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1): the COOPERATIVE
+    # tier also fails closed. `error_unmasked` marks both failure shapes —
+    # planning threw, or the plan demanded masking and no view materialized.
+    if settings.governance_fail_closed and decision == "error_unmasked":
+        _audit_credentials_denied(ctx, sub, ns, table, "error_governance_denied")
+        raise HTTPException(
+            status_code=503,
+            detail=(f"governance enforcement for {ns[0]}.{table} failed and "
+                    "this deployment is configured fail-closed "
+                    "(DUCKICELAKE_GOVERNANCE_FAIL_CLOSED); refusing to vend"))
+
     s3 = settings.s3
     deny_prefixes: list[str] | None = None
     if table is not None:
@@ -2012,6 +2023,7 @@ def _build_load_response(
     principal_for_creds: str | None = None
     file_layer_export = None
     file_layer_required = False
+    governance_error = False
     if principal_claims is not None:
         principal_for_creds = principal_claims.get("sub") or "anonymous"
         try:
@@ -2071,6 +2083,11 @@ def _build_load_response(
                 )
                 if view_name:
                     metadata["properties"]["duckicelake.masking-view-name"] = view_name
+                elif file_layer_export is None:
+                    # the plan demands masking but its view could not be
+                    # materialized — the cooperative tier is degraded to
+                    # advisory-signals-only (strict mode denies below)
+                    governance_error = True
                 governance_store.audit_load(
                     principal=principal_for_creds, object_=f"{ns[0]}.{table}",
                     masked_cols=plan.masked_columns,
@@ -2084,6 +2101,7 @@ def _build_load_response(
             log.exception("governance enforcement failed for %s.%s — "
                           "fail-open only for the cooperative tier", ns[0], table)
             file_layer_export = None
+            governance_error = True
             # B3: planning itself failed BEFORE the plan could classify the
             # table, so file_layer_required may be a stale False. Consult the
             # reserved property stamp — a file-layer table must fail CLOSED
@@ -2132,6 +2150,27 @@ def _build_load_response(
                 status_code=503,
                 detail=(f"file-layer masking for {ns[0]}.{table} could not be "
                         f"materialized; refusing to serve base data"),
+            )
+
+        # Strict mode (DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1): the COOPERATIVE
+        # tier also fails closed — a governance error (planning threw, or a
+        # demanded masking view could not be materialized) denies the read
+        # instead of serving base metadata with advisory-only signals.
+        if settings.governance_fail_closed and governance_error:
+            try:
+                governance_store.audit_load(
+                    principal=principal_for_creds, object_=f"{ns[0]}.{table}",
+                    masked_cols=[], applied_policies=[], row_filtered=False,
+                    operation="load_table", decision="error_governance_denied",
+                    detail={"strict": True})
+            except Exception:
+                log.exception("audit of strict governance denial failed")
+            raise HTTPException(
+                status_code=503,
+                detail=(f"governance enforcement for {ns[0]}.{table} failed "
+                        "and this deployment is configured fail-closed "
+                        "(DUCKICELAKE_GOVERNANCE_FAIL_CLOSED); refusing to "
+                        "serve"),
             )
 
     config_out: dict[str, str] = _base_s3_config()

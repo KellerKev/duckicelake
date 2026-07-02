@@ -28,8 +28,12 @@ without knowing any principal's JWT. A recomputed signature mismatch
 (schema or policy changed) drops the export instead of refreshing it —
 the next request lazily creates the new shape.
 
-Everything is fail-open and audited: an export failure degrades to
-catalog-level masking, never a broken read.
+This MODULE is fail-open and audited: an export failure degrades to
+catalog-level masking rather than raising. The read-path fail-closed
+decisions live in the server — a file-layer (airtight) principal whose
+export/shadow is missing is DENIED there, and with
+DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1 the cooperative tier denies on
+governance errors too.
 """
 from __future__ import annotations
 

@@ -67,7 +67,11 @@ layered, and you choose the tier per masking policy:
 - **Catalog-level (default).** Cooperative engines get masking signals in
   the table metadata plus an executed masking *view*. Cheap, no extra
   storage. A determined client that names the base table directly can still
-  read raw — fine for trusted BI / analysts.
+  read raw — fine for trusted BI / analysts. This tier is fail-open by
+  default (a governance error degrades to unmasked-with-audit, never a
+  broken read); set `DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1` to make
+  governance errors deny (503) here too. The file-layer tier below and the
+  RLS credential vend always fail closed, regardless of the flag.
 - **File-layer (`file-layer-masking: true`).** The bytes themselves are
   pre-masked and served via shadow Iceberg metadata + scoped credentials,
   so an engine that reads Parquet directly (the DuckDB `iceberg` extension,
@@ -1023,6 +1027,7 @@ carry secrets.
 | `DUCKICELAKE_SUPPRESS_ROOT_CREDS` | `1` | omit root S3 keys from response configs; `0` is dev-only (bypasses governance masking) |
 | `DUCKICELAKE_TRANSPARENT_MASKING` | `1` | `SET search_path` transparent routing from `ducklake-credentials` |
 | `DUCKICELAKE_RLS` | `1` | per-principal PG reader roles + RLS on `ducklake_*` for vended credentials |
+| `DUCKICELAKE_GOVERNANCE_FAIL_CLOSED` | `0` | `1` → the cooperative tier ALSO fails closed: any governance error on a governed read denies (503) instead of degrading to unmasked-with-audit |
 | `DUCKICELAKE_READER_GROUP_ROLE` | `duckicelake_reader` | NOLOGIN group carrying reader grants + RLS targets |
 | `DUCKICELAKE_MASKED_RETAIN_SNAP_DIRS` | `2` | snap dirs kept per mask-signature (file-layer masking) |
 | `DUCKICELAKE_MASKED_EXPORT_TTL_DAYS` | `7` | idle signatures stop being eagerly refreshed |

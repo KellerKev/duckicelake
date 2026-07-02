@@ -23,10 +23,17 @@ transparent_masking = true
 #require_auth = true
 
 # PG row-level security for vended DuckLake-direct readers (default: true).
-# Per-principal LOGIN roles in the duckicelake_reader group; see GOVERNANCE.md
+# Per-principal LOGIN roles in the duckicelake_reader group; see OPERATIONS.md
 # for the production pg_hba recipe (dev trust-auth can't enforce login).
 #rls = true
 #reader_group_role = "duckicelake_reader"
+
+# Strict governance: the cooperative (catalog-level) tier ALSO fails closed —
+# any governance error on a governed read denies (503) instead of degrading
+# to unmasked-with-audit. The file-layer tier + RLS vend always fail closed
+# regardless. Trade-off: a governance-sidecar outage takes governed reads
+# down with it (default: false).
+#governance_fail_closed = true
 
 # File-layer masking (governance Phase 4) tuning.
 #masked_retain_snap_dirs = 2       # snap dirs kept per mask-signature

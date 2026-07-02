@@ -354,3 +354,106 @@ def test_role_grant_principal_index_exists(settings, direct_catalog):
         cur.execute("SELECT count(*) FROM pg_indexes "
                     "WHERE indexname = 'duckicelake_role_grant_principal_idx'")
         assert cur.fetchone()[0] == 1
+
+
+# ---- Strict mode: DUCKICELAKE_GOVERNANCE_FAIL_CLOSED --------------------------
+
+import os as _os
+import signal as _signal
+import subprocess as _subprocess
+import time as _time
+from pathlib import Path as _Path
+
+import httpx as _httpx
+
+_STRICT_PORT = 18282
+_REPO = _Path(__file__).resolve().parents[1]
+
+
+def _author_broken_cooperative_policy(client, ns: str, table: str) -> None:
+    """A catalog-level (NON-file-layer) mask whose body is invalid SQL — the
+    masking view can never materialize, so the read degrades (fail-open) or
+    denies (strict)."""
+    tag = f"coopbrk_{uuid.uuid4().hex[:6]}"
+    client.post("/v1/lake/governance/tags",
+                json={"namespace": "pii", "name": tag}).raise_for_status()
+    client.post("/v1/lake/governance/object-tags",
+                json={"object-kind": "column", "schema": ns, "object": table,
+                      "column": "email", "tag-namespace": "pii",
+                      "tag-name": tag}).raise_for_status()
+    client.post("/v1/lake/governance/masking-policies",
+                json={"name": f"mask_{tag}", "signature": "(val VARCHAR)",
+                      "body": "no_such_function_xyz(val)",
+                      "unmasked-roles": ["pii_reader"]}).raise_for_status()
+    client.post("/v1/lake/governance/policy-attachments",
+                json={"policy-kind": "masking", "policy-name": f"mask_{tag}",
+                      "target-kind": "tag", "tag-namespace": "pii",
+                      "tag-name": tag}).raise_for_status()
+
+
+def test_strict_mode_fails_closed_for_cooperative_tier(client, settings):
+    """DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1 extends fail-closed to the
+    cooperative tier: a broken catalog-level mask DENIES the read + vend
+    (503, error_governance_denied) instead of degrading to advisory signals.
+    Healthy masking still serves, ungoverned tables still serve, and the
+    default (fail-open) proxy keeps serving the same broken table — the flag
+    changes posture, not behavior for healthy state."""
+    ns_broken = _ns("strictbrk")
+    ns_healthy = _ns("strictok")
+    ns_plain = _ns("strictplain")
+    _make_table(client, ns_broken, "events")
+    _author_broken_cooperative_policy(client, ns_broken, "events")
+    _make_table(client, ns_healthy, "events")
+    _author_demo_policy(client, ns_healthy, "events")
+    _make_table(client, ns_plain, "events")          # no governance at all
+
+    env = dict(_os.environ, DUCKICELAKE_GOVERNANCE_FAIL_CLOSED="1")
+    proc = _subprocess.Popen(
+        ["uvicorn", "duckicelake.server:app",
+         "--host", "127.0.0.1", "--port", str(_STRICT_PORT),
+         "--log-level", "warning"],
+        cwd=_REPO, env=env,
+    )
+    try:
+        base = f"http://127.0.0.1:{_STRICT_PORT}"
+        deadline = _time.time() + 30
+        while True:
+            try:
+                if _httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
+                    break
+            except Exception:
+                pass
+            assert _time.time() < deadline, "strict proxy failed to start"
+            _time.sleep(0.3)
+        strict = _httpx.Client(base_url=base, timeout=30)
+
+        # broken cooperative mask → strict DENIES read + vend
+        r = strict.get(f"/v1/lake/namespaces/{ns_broken}/tables/events")
+        assert r.status_code == 503, f"strict LoadTable must deny: {r.status_code}"
+        r = strict.get(f"/v1/lake/namespaces/{ns_broken}/ducklake-credentials",
+                       params={"table": "events", "principal": "bob"})
+        assert r.status_code == 503, f"strict vend must deny: {r.status_code}"
+
+        # the denial is audited distinctly
+        audit = strict.get("/v1/lake/governance/audit").json()["entries"]
+        assert any(e.get("decision") == "error_governance_denied"
+                   and e["object"] == f"{ns_broken}.events" for e in audit)
+
+        # healthy governed table still serves (masked), ungoverned serves
+        r = strict.get(f"/v1/lake/namespaces/{ns_healthy}/tables/events")
+        assert r.status_code == 200, r.text
+        assert r.json()["metadata"]["properties"][
+            "duckicelake.masked-columns"] == "email"
+        r = strict.get(f"/v1/lake/namespaces/{ns_plain}/tables/events")
+        assert r.status_code == 200, r.text
+
+        # the DEFAULT proxy (flag off) keeps its documented fail-open on the
+        # same broken table
+        r = client.get(f"/v1/lake/namespaces/{ns_broken}/tables/events")
+        assert r.status_code == 200, r.text
+    finally:
+        proc.send_signal(_signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except _subprocess.TimeoutExpired:
+            proc.kill()

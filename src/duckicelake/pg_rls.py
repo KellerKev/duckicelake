@@ -39,8 +39,9 @@ set breaks the masking views' binder).
 Dev honesty: the pixi stack is trust-auth on a unix socket, so anyone can
 connect as any role — the predicates are fully exercised but authentication
 is only enforceable under prod scram+TLS (see OPERATIONS.md for the pg_hba
-recipe). All entry points are fail-open: an RLS setup error must never
-break vending; callers fall back to the owner DSN and audit the fact.
+recipe). Vending is fail-CLOSED: when RLS can't be armed the server refuses
+to vend (503, self-healing retry per request) — it never falls back to the
+owner DSN.
 """
 from __future__ import annotations
 

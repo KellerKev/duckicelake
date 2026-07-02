@@ -238,6 +238,22 @@ retries the arming, so no restart is needed after the fix.
   governance sidecars, the notify trigger) — `tuple concurrently updated`
   at boot means you're running a pre-lock build.
 
+### Fail-open vs fail-closed
+
+Enforcement posture is tiered. The **airtight surfaces always fail closed**
+— file-layer (byte-level) masking denies (503) when its export/shadow can't
+be materialized or governance planning fails on a stamped table, and
+`ducklake-credentials` refuses to vend when RLS isn't armed. The
+**cooperative (catalog-level) tier fails open by default**: a governance
+error degrades the read to unmasked-with-audit (`error_unmasked` in the
+audit trail) rather than breaking it. Set
+**`DUCKICELAKE_GOVERNANCE_FAIL_CLOSED=1`** (or `governance_fail_closed =
+true`) to make the cooperative tier deny too — every governance error on a
+governed read/vend returns 503 with an `error_governance_denied` audit row.
+Choose it when leak-prevention outranks availability; the trade-off is that
+a governance-sidecar outage takes governed reads down with it. Alert on
+`error_unmasked` (fail-open) or 503 rates (fail-closed) accordingly.
+
 ### Audit retention
 
 `DUCKICELAKE_AUDIT_RETENTION_DAYS` (default `0` = keep forever) lazily

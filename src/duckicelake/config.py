@@ -221,6 +221,14 @@ class Settings:
     rls_enabled: bool = True
     # NOLOGIN group role carrying all reader grants + RLS targets.
     reader_group_role: str = "duckicelake_reader"
+    # Strict mode: extend the airtight tier's fail-CLOSED posture to the
+    # COOPERATIVE tier. When true, a governance error on a governed read
+    # path — policy planning threw, or a demanded masking view could not be
+    # materialized — DENIES the read/vend (503) instead of degrading to
+    # unmasked-with-audit. Default false: the documented cooperative
+    # behavior (a governance error never breaks a read). Trade-off when on:
+    # a governance-sidecar outage takes governed reads down with it.
+    governance_fail_closed: bool = False
     # Password for the owning PG role. Optional: dev uses trust auth and
     # production can use cert/ident, but managed Postgres (RDS, Supabase,
     # Neon, Cloud SQL, a password-protected container) needs scram with a
@@ -294,6 +302,8 @@ def load_settings() -> Settings:
         transparent_masking=os.environ.get(
             "DUCKICELAKE_TRANSPARENT_MASKING", "1") == "1",
         rls_enabled=os.environ.get("DUCKICELAKE_RLS", "1") == "1",
+        governance_fail_closed=os.environ.get(
+            "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(
             "DUCKICELAKE_READER_GROUP_ROLE", "duckicelake_reader"),
     )
