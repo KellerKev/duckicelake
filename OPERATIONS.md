@@ -266,12 +266,21 @@ Hetzner gotchas the code already handles or you should know:
   masked-copy prefixes stayed readable, kept the policy bucket-local,
   and restored access on `DeleteBucketPolicy`.
 
-Remaining caveats: cross-key Allow-only isolation needs a *second*
-access key (Hetzner S3 credentials are Console-only — no management
-API), and the botocore checksum rejection did not reproduce on
-`put_object` during the live run — Hetzner may have added checksum
-support — but keep `when_required` (correct everywhere). See
-`MISSING.md`.
+- Cross-key matrix with a second project key: the listed reader key's
+  masked-base **Deny is enforced**; unlisted keys (the proxy root key)
+  keep full read/write while the policy is live. **Same-project keys
+  are not confined by the Allow statements** — project keys start with
+  full bucket access, so only explicit Denies subtract. For positive
+  prefix confinement, mint reader keys in a *different* Hetzner
+  project (baseline no access → the Allows then grant exactly the
+  listed prefixes; the Principal ARN's `p<project_id>` is the project
+  of the credentials, so this is the intended shape).
+
+Remaining caveats: cross-*project* principal semantics are untested
+(needs a key from a second project), and the botocore checksum
+rejection did not reproduce on `put_object` during the live run —
+Hetzner may have added checksum support — but keep `when_required`
+(correct everywhere). See `MISSING.md`.
 
 ## Auth / RBAC
 

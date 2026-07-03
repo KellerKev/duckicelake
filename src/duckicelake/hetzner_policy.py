@@ -21,6 +21,18 @@ of registered principals. The remote-signing tier (signer.py) is the
 dynamic, airtight one — this exists so DuckLake-direct readers aren't
 locked out entirely.
 
+Enforcement semantics, verified live (2026-07): for SAME-project keys only
+the explicit **Deny** statements subtract — project-scoped keys start with
+full bucket access, so the Allow statements are redundant for them and do
+NOT confine a reader to its prefixes. The Deny carve-outs (file-layer
+masked base prefixes) ARE enforced, which is the security-critical part.
+For positive prefix confinement, mint the reader keys in a DIFFERENT
+Hetzner project (baseline: no access; the Allows then grant exactly the
+listed prefixes) — the `p<project_id>` in the Principal ARN is the project
+of the CREDENTIALS, so cross-project grants are the intended shape.
+Unlisted keys are unaffected by the policy (the proxy's root key keeps
+working).
+
 CLI (dry-run prints the policy JSON; --apply PUTs it):
 
     python -m duckicelake.hetzner_policy [--apply] [--catalog ID]

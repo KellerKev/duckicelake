@@ -167,11 +167,18 @@ carve-out was enforced** (AccessDenied even for the bucket-owning key)
 while plain-table and masked-copy prefixes stayed readable, the policy
 stayed bucket-local, and deleting it restored access.
 
-The one Hetzner test that cannot be automated: **cross-key Allow-only
-isolation** — verifying that a policy grants a *non-owner* key access
-it wouldn't otherwise have. Hetzner S3 credentials are Console-only
-(no management API), so it needs a manually minted second key; with
-one in hand it's a five-minute run of the same harness.
+**Cross-key semantics: verified live with a second key (2026-07-03).**
+The full matrix: the listed reader key's masked-base **Deny is
+enforced** (AccessDenied), unlisted keys (the proxy root key) keep
+full read/write while the policy is live, and the policy is
+bucket-local. One important finding: **same-project keys are NOT
+confined by the Allow statements** — Hetzner project keys start with
+full bucket access, so only explicit Denies subtract. The static-key
+tier therefore guarantees masked-base carve-outs, not positive prefix
+confinement, for same-project keys. For hard confinement, mint reader
+keys in a *different* Hetzner project (baseline no access; the policy
+Allows then grant exactly the listed prefixes) — semantics for
+cross-project principals remain untested (needs a second project).
 
 Notes from the live run (the backend has drifted from its docs):
 default botocore checksums did NOT trip the documented `AccessDenied`
