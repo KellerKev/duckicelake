@@ -150,25 +150,35 @@ MaxSessionDuration retry — unit-tested), but has **not been run against
 live AWS STS**. Before shipping on AWS: smoke the vend → read → write
 flow against a real role.
 
-**Hetzner: live-verified 2026-07-03** against a real Hetzner bucket
-(fsn1): pre-provisioned-bucket bootstrap, DuckDB httpfs TLS writes,
-LoadTable → remote-signing config, signed GET/PUT (UNSIGNED-PAYLOAD
-accepted by Ceph RGW), file-layer masked export materialized on
-Hetzner with base-bytes denial + masked-bytes reads through the signer,
-no-STS fail-closed vending, and the **bucket-policy tier applied live
-on a throwaway bucket**: `PutBucketPolicy` accepted the generated
-per-key Principal ARN (`arn:aws:iam:::user/p<project>:<key>`), the
-masked-base **Deny carve-out was enforced** (AccessDenied even for the
-bucket-owning key) while allowed and masked-copy prefixes stayed
-readable, the policy stayed bucket-local, and deleting it restored
-access. Still unverified live: cross-key isolation with a *second*
-access key granted Allow-only access (Hetzner has no API for S3
-credential creation — Console-only — so that needs a manually minted
-key). Notes from the live run: default botocore checksums did NOT trip
-the documented `AccessDenied` on `put_object` (Hetzner may have added
-checksum support; `when_required` stays configured — correct on every
-backend), and `CreateBucket`/`DeleteBucket` work via the S3 API with
-~2s visibility propagation.
+**Hetzner: live-verified 2026-07-03** against real Hetzner Object
+Storage (fsn1), full sweep: pre-provisioned-bucket bootstrap, DuckDB
+httpfs TLS writes, LoadTable → remote-signing config, signed GET/PUT
+and ranged GETs (UNSIGNED-PAYLOAD accepted by Ceph RGW), the **complete
+multipart lifecycle through the signer** (create / 5 MiB + final part /
+complete / abort), vhost-style URIs, PyIceberg's own `S3V4RestSigner`,
+file-layer masked exports materialized on Hetzner with base-bytes
+denial + masked-bytes reads through the signer, no-STS fail-closed
+vending, and the **bucket-policy tier end-to-end via the CLI** on a
+throwaway bucket: static key registered through the governance API,
+`hetzner_policy --apply` derived grants from live governance state,
+`PutBucketPolicy` accepted the per-key Principal ARN
+(`arn:aws:iam:::user/p<project>:<key>`), the masked-base **Deny
+carve-out was enforced** (AccessDenied even for the bucket-owning key)
+while plain-table and masked-copy prefixes stayed readable, the policy
+stayed bucket-local, and deleting it restored access.
+
+The one Hetzner test that cannot be automated: **cross-key Allow-only
+isolation** — verifying that a policy grants a *non-owner* key access
+it wouldn't otherwise have. Hetzner S3 credentials are Console-only
+(no management API), so it needs a manually minted second key; with
+one in hand it's a five-minute run of the same harness.
+
+Notes from the live run (the backend has drifted from its docs):
+default botocore checksums did NOT trip the documented `AccessDenied`
+on `put_object` (keep `when_required` — correct on every backend);
+`ListBuckets` worked despite being documented as unsupported;
+`CreateBucket`/`DeleteBucket` work via the S3 API with ~2s visibility
+propagation and eventually-consistent `ListBuckets` after a delete.
 
 **No sustained-load benchmarks.** We measured ~349 req/s once, 4 workers,
 cache-hit. No p99 latency tracking, no soak tests, no pool-saturation

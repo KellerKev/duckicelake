@@ -231,8 +231,12 @@ Hetzner gotchas the code already handles or you should know:
   "when_required"` (`s3util.py`). **Client-side write paths** (PyIceberg
   writers) must do the same: set `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`
   and `AWS_RESPONSE_CHECKSUM_VALIDATION=when_required` in the client env.
-- **No `ListBuckets`** — even valid keys get `AccessDenied`; bootstrap
-  never calls it and tolerates pre-provisioned buckets.
+- **`ListBuckets` historically returned `AccessDenied`** even for valid
+  keys (per Hetzner's docs); it *worked* during our 2026-07 live run —
+  Hetzner appears to have added it. Bootstrap never relies on it either
+  way and tolerates pre-provisioned buckets. `CreateBucket` /
+  `DeleteBucket` also work via the S3 API (~2s visibility propagation;
+  `ListBuckets` is eventually consistent after a delete).
 - **Fresh keys propagate slowly** (seconds) — bootstrap retries
   `head_bucket` with backoff before giving up.
 - **Keys are project-scoped**: any key can reach every bucket in its
@@ -242,20 +246,32 @@ Hetzner gotchas the code already handles or you should know:
   principal without a static key. The server logs a loud startup
   warning; dev only.
 
-**Live-verified (2026-07-03, fsn1):** bootstrap against a
-pre-provisioned bucket, DuckDB httpfs TLS writes, remote-signed GET and
-PUT (Ceph RGW accepts the UNSIGNED-PAYLOAD signatures), file-layer
-masked exports materialized on Hetzner with base-byte denial and
-masked-byte reads through the signer, fail-closed no-STS vending, and
-the **bucket-policy tier applied live**: Hetzner accepted the generated
-per-key Principal ARN, enforced the masked-base Deny carve-out
-(AccessDenied even for the bucket-owning key), kept the policy
-bucket-local, and restored access on `DeleteBucketPolicy`. Remaining
-caveats: cross-key Allow-only isolation needs a second access key
-(Hetzner S3 credentials are Console-only — no API), and the botocore
-checksum rejection did not reproduce on `put_object` during the live
-run — Hetzner may have added checksum support — but keep
-`when_required` (correct everywhere). See `MISSING.md`.
+**Live-verified (2026-07-03, fsn1):**
+
+- Data plane: bootstrap against a pre-provisioned bucket, DuckDB httpfs
+  TLS writes, put/get/batch-delete through the s3util client.
+- Remote signing: signed GET and PUT (Ceph RGW accepts the
+  UNSIGNED-PAYLOAD signatures), ranged GETs, **the full multipart
+  lifecycle through the signer** (CreateMultipartUpload, 5 MiB + final
+  UploadPart, CompleteMultipartUpload, AbortMultipartUpload),
+  vhost-style URIs, and PyIceberg's own `S3V4RestSigner` client class.
+- Governance: file-layer masked exports materialized on Hetzner with
+  base-byte denial + masked-byte reads through the signer; fail-closed
+  no-STS vending.
+- Bucket-policy tier **end-to-end via the CLI**: static key registered
+  through the governance API, `python -m duckicelake.hetzner_policy
+  --apply` derived the grants from live governance state, Hetzner
+  accepted the per-key Principal ARN, enforced the masked-base Deny
+  (AccessDenied even for the bucket-owning key) while plain-table and
+  masked-copy prefixes stayed readable, kept the policy bucket-local,
+  and restored access on `DeleteBucketPolicy`.
+
+Remaining caveats: cross-key Allow-only isolation needs a *second*
+access key (Hetzner S3 credentials are Console-only — no management
+API), and the botocore checksum rejection did not reproduce on
+`put_object` during the live run — Hetzner may have added checksum
+support — but keep `when_required` (correct everywhere). See
+`MISSING.md`.
 
 ## Auth / RBAC
 
