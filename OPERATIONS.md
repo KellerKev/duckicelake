@@ -246,12 +246,15 @@ Hetzner gotchas the code already handles or you should know:
 pre-provisioned bucket, DuckDB httpfs TLS writes, remote-signed GET and
 PUT (Ceph RGW accepts the UNSIGNED-PAYLOAD signatures), file-layer
 masked exports materialized on Hetzner with base-byte denial and
-masked-byte reads through the signer, and fail-closed no-STS vending.
-Two caveats: applying a generated **bucket policy has not been
-exercised live** (verify the per-key Principal enforcement with your
-real project id before relying on the static-key tier), and the
-botocore checksum rejection did not reproduce on `put_object` during
-the live run — Hetzner may have added checksum support — but keep
+masked-byte reads through the signer, fail-closed no-STS vending, and
+the **bucket-policy tier applied live**: Hetzner accepted the generated
+per-key Principal ARN, enforced the masked-base Deny carve-out
+(AccessDenied even for the bucket-owning key), kept the policy
+bucket-local, and restored access on `DeleteBucketPolicy`. Remaining
+caveats: cross-key Allow-only isolation needs a second access key
+(Hetzner S3 credentials are Console-only — no API), and the botocore
+checksum rejection did not reproduce on `put_object` during the live
+run — Hetzner may have added checksum support — but keep
 `when_required` (correct everywhere). See `MISSING.md`.
 
 ## Auth / RBAC

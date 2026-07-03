@@ -155,13 +155,20 @@ flow against a real role.
 LoadTable → remote-signing config, signed GET/PUT (UNSIGNED-PAYLOAD
 accepted by Ceph RGW), file-layer masked export materialized on
 Hetzner with base-bytes denial + masked-bytes reads through the signer,
-no-STS fail-closed vending, and the bucket-policy generator dry run.
-Still unverified live: actually **applying** a generated bucket policy
-(needs a real project id; verify the per-key Principal ARN enforcement
-before relying on the static-key tier). Note: default botocore
-checksums did NOT trip the documented `AccessDenied` on `put_object`
-during the live run — Hetzner may have added checksum support — but
-`when_required` stays configured (correct on every backend).
+no-STS fail-closed vending, and the **bucket-policy tier applied live
+on a throwaway bucket**: `PutBucketPolicy` accepted the generated
+per-key Principal ARN (`arn:aws:iam:::user/p<project>:<key>`), the
+masked-base **Deny carve-out was enforced** (AccessDenied even for the
+bucket-owning key) while allowed and masked-copy prefixes stayed
+readable, the policy stayed bucket-local, and deleting it restored
+access. Still unverified live: cross-key isolation with a *second*
+access key granted Allow-only access (Hetzner has no API for S3
+credential creation — Console-only — so that needs a manually minted
+key). Notes from the live run: default botocore checksums did NOT trip
+the documented `AccessDenied` on `put_object` (Hetzner may have added
+checksum support; `when_required` stays configured — correct on every
+backend), and `CreateBucket`/`DeleteBucket` work via the S3 API with
+~2s visibility propagation.
 
 **No sustained-load benchmarks.** We measured ~349 req/s once, 4 workers,
 cache-hit. No p99 latency tracking, no soak tests, no pool-saturation
