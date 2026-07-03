@@ -11,7 +11,7 @@ import signal
 import subprocess
 import time
 
-import boto3
+from duckicelake import s3util
 import httpx
 import psycopg
 import pytest
@@ -49,11 +49,7 @@ def _wipe_postgres(dsn: str) -> None:
 
 
 def _purge_bucket(s3) -> None:
-    c = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    c = s3util.s3_client(s3)
     for p in c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket):
         for o in p.get("Contents", []):
             c.delete_object(Bucket=s3.bucket, Key=o["Key"])

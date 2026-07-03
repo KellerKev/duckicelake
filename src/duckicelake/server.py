@@ -66,10 +66,13 @@ from .models import (
 )
 from .observability import (
     COMMIT_TOTAL,
+    S3_SIGN_TOTAL,
     metrics_endpoint as _metrics_endpoint,
     metrics_middleware,
     setup_logging,
 )
+from . import signer as signer_mod
+from .signer import S3SignRequest, S3SignResponse
 from .sts import vend_credentials
 
 
@@ -104,6 +107,19 @@ def _iceberg_error(status: int, message: str, type_: str) -> JSONResponse:
 settings = load_settings()
 auth_cfg: AuthConfig = load_auth_config()
 require_bearer = make_bearer_dependency(auth_cfg)
+
+if settings.s3.sts_disabled:
+    log.info(
+        "STS disabled (DUCKICELAKE_STS_ENDPOINT=none): REST clients get "
+        "remote signing via /v1/{prefix}/aws/s3/sign; DuckLake-direct "
+        "clients need registered static keys + generated bucket policies "
+        "(python -m duckicelake.hetzner_policy).")
+    if not settings.suppress_root_creds:
+        log.warning(
+            "STS is disabled AND suppress_root_creds=0 — ducklake-"
+            "credentials will fall back to handing ROOT S3 keys to "
+            "principals without a registered static key. This bypasses "
+            "all storage-layer governance. Dev only; never production.")
 
 # Multi-catalog registry. Each isolated catalog (account-scoped) gets its own
 # DuckLakeCatalog + governance managers, bundled in a CatalogContext and
@@ -323,6 +339,19 @@ async def bearer_auth_middleware(request: Request, call_next):
     if path in _AUTH_EXEMPT_PATHS or path.startswith("/docs"):
         return await call_next(request)
     if not path.startswith("/v1/"):
+        return await call_next(request)
+    if path.endswith("/aws/s3/sign"):
+        # Remote-signer requests: AUTHN only. The scope gate below keys on
+        # the HTTP method (always POST here), but read-vs-write is decided
+        # by the *S3* method inside the body — a read-only `ns:x:r` token
+        # must be able to POST sign requests for GETs. The signer endpoint
+        # does its own per-object, per-S3-method authorization.
+        try:
+            from .auth import verify_bearer
+            verify_bearer(auth_cfg, request.headers.get("authorization"))
+        except HTTPException as e:
+            return _iceberg_error(
+                e.status_code, str(e.detail), "UnauthorizedException")
         return await call_next(request)
     try:
         from .auth import verify_bearer, scope_allows, request_namespace
@@ -731,6 +760,7 @@ def create_table(
     prefix: str,
     namespace: str,
     req: CreateTableRequest,
+    request: Request,
     x_iceberg_access_delegation: str | None = Header(default=None),
     ctx: CatalogContext = Depends(resolve_catalog),
 ) -> LoadTableResponse:
@@ -758,6 +788,7 @@ def create_table(
         properties=req.properties,
         delegation_header=x_iceberg_access_delegation,
         read_only=False,
+        request=request,
     )
 
 
@@ -786,6 +817,7 @@ def load_table(
         read_only=True,
         snapshot_id_override=snapshot_id,
         principal_claims=claims_from_request(auth_cfg, request),
+        request=request,
     )
 
 
@@ -996,6 +1028,70 @@ def _build_view_response(ns: list[str], view: str, ctx: CatalogContext) -> dict[
     }
 
 
+# ---- Remote signing (no-STS backends, e.g. Hetzner) --------------------
+
+def _handle_sign(ctx: "CatalogContext", req: S3SignRequest,
+                 request: Request) -> S3SignResponse:
+    """Shared body of the sign routes: authenticate, authorize the exact
+    (S3 method, object) against governance, then SigV4-sign with root keys.
+    Fail CLOSED on every deny — the signer is the airtight tier."""
+    claims = claims_from_request(auth_cfg, request)
+    parsed = signer_mod.parse_s3_uri(req.uri, settings.s3)
+    if parsed is None:
+        S3_SIGN_TOTAL.labels(decision="sign_denied_endpoint").inc()
+        raise HTTPException(
+            status_code=403,
+            detail="refusing to sign a request for a foreign endpoint")
+    bucket, key = parsed
+    decision = signer_mod.authorize_sign(
+        ctx, settings, claims, req.method, bucket, key)
+    S3_SIGN_TOTAL.labels(decision=decision.reason).inc()
+    if not decision.allowed:
+        sub = claims.get("sub") or "anonymous"
+        try:
+            ctx.store.audit_load(
+                principal=sub, object_=f"s3://{bucket}/{key}",
+                masked_cols=[], applied_policies=[], row_filtered=False,
+                operation="s3_sign", decision=decision.reason,
+                detail={"method": req.method})
+        except Exception:
+            log.exception("audit of sign denial failed")
+        raise HTTPException(
+            status_code=403,
+            detail=f"signing denied: {decision.reason}")
+    return signer_mod.sign_v4(settings.s3, req.method, req.uri, req.headers)
+
+
+@app.post("/v1/{prefix}/aws/s3/sign", response_model=S3SignResponse)
+def sign_s3_request(
+    prefix: str, req: S3SignRequest, request: Request,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> S3SignResponse:
+    """Iceberg REST remote signer (s3-signer-open-api.yaml). Emitted to
+    clients as `s3.signer.endpoint` in no-STS mode; also useful against
+    STS-capable backends for engines that prefer remote signing."""
+    return _handle_sign(ctx, req, request)
+
+
+@app.post("/v1/aws/s3/sign", response_model=S3SignResponse)
+def sign_s3_request_default(req: S3SignRequest, request: Request) -> S3SignResponse:
+    """Spec-default signer path (no {prefix}) for clients that ignore the
+    emitted `s3.signer.endpoint`. Resolves the catalog by longest
+    data-prefix match of the requested key; falls back to the default
+    catalog. The account gate still runs via resolve_catalog."""
+    target = registry.settings.catalog_name
+    parsed = signer_mod.parse_s3_uri(req.uri, settings.s3)
+    if parsed is not None:
+        _, key = parsed
+        best = ""
+        for cid, ref in registry.list_refs():
+            if ref.data_prefix and key.startswith(ref.data_prefix) \
+                    and len(ref.data_prefix) > len(best):
+                best, target = ref.data_prefix, cid
+    ctx = resolve_catalog(target, request)
+    return _handle_sign(ctx, req, request)
+
+
 # ---- DuckLake-direct credentials (governance Phase 3) ------------------
 
 def _arm_default_rls() -> bool:
@@ -1073,7 +1169,10 @@ def ducklake_credentials(
     data_path = settings.data_path_for(ctx.ref)
     meta_opt = (f", METADATA_SCHEMA '{ctx.ref.metadata_schema}'"
                 if ctx.ref.metadata_schema else "")
-    clamped = max(900, min(43200, duration_seconds))
+    # Upper bound from config (default 43200 = the AWS absolute max). Note
+    # AWS additionally REJECTS durations above the role's MaxSessionDuration
+    # rather than clamping like MinIO — sts.py retries once at 3600 on that.
+    clamped = max(900, min(settings.s3.sts_max_duration, duration_seconds))
     out: dict[str, Any] = {
         "ducklake_dsn": settings.pg_dsn,
         "ducklake_data_path": data_path,
@@ -1264,35 +1363,51 @@ def ducklake_credentials(
                 status_code=503,
                 detail="could not compute file-layer credential carve-outs; "
                        "refusing namespace-wide vend (fail-closed)")
-    try:
-        creds = vend_credentials(
-            s3,
-            namespace=ns[0],
-            table=table or "*",
-            read_only=True,
-            read_prefixes=read_prefixes,
-            deny_prefixes=deny_prefixes,
-            duration_seconds=clamped,
-            principal=sub,
-            data_prefix=ctx.ref.data_prefix,
-        )
-        out["s3"] = {
-            "endpoint": s3.endpoint,
-            "region": s3.region,
-            "path-style-access": s3.path_style,
-            "access-key-id": creds.access_key_id,
-            "secret-access-key": creds.secret_access_key,
-            "session-token": creds.session_token,
-            "expiration": creds.expiration_iso,
-        }
-    except Exception:
-        log.exception("ducklake-credentials STS vending failed for %s — %s",
-                      ns[0], "falling back to root keys"
-                      if not settings.suppress_root_creds else "no creds returned")
-        if settings.suppress_root_creds:
+    sts_degraded = False
+    if s3.sts_disabled:
+        # No STS on this backend (Hetzner): DuckLake-direct clients can't
+        # remote-sign (DuckDB httpfs), so the compensation tier is a
+        # per-principal STATIC key scoped server-side by a generated bucket
+        # policy (python -m duckicelake.hetzner_policy). The proxy vends
+        # the key id (+ secret only when the operator opted into storing
+        # it); enforcement lives in the bucket policy, not a session policy.
+        masked_principal = export is not None or file_layer_required
+        entry = None
+        try:
+            entry = governance_store.static_key_for_principal(sub)
+        except Exception:
+            log.exception("static-key lookup failed for %s", sub)
+        if entry is not None and not masked_principal:
+            out["s3"] = {
+                "endpoint": s3.endpoint,
+                "region": s3.region,
+                "path-style-access": s3.path_style,
+                "access-key-id": entry.access_key_id,
+                "secret-access-key": entry.secret_access_key,
+                "session-token": None,
+                "expiration": None,
+                "static-key": True,
+                "enforcement": "bucket-policy",
+            }
+            decision = ("static_key_bucket_policy"
+                        if decision == "ok" else decision)
+        elif entry is not None and masked_principal:
+            # A static key can only serve a masked principal if the bucket
+            # policy already carves them to the CURRENT masked sig prefix —
+            # unverifiable at vend time, and sig rotation makes it stale.
+            # Fail closed rather than risk base-byte reads.
             out["s3"] = None
-            decision = "error_no_creds"
+            decision = "error_no_sts_masked"
+            _audit_credentials_denied(ctx, sub, ns, table, decision)
+        elif settings.suppress_root_creds:
+            out["s3"] = None
+            decision = "error_no_sts"
+            _audit_credentials_denied(ctx, sub, ns, table, decision)
         else:
+            # Dev opt-in semantics preserved (suppress_root_creds=0) — but
+            # never for masked principals, caught above. Loud by design.
+            log.warning("no-STS mode with suppress_root_creds=0: vending "
+                        "ROOT keys to %s — dev only", sub)
             out["s3"] = {
                 "endpoint": s3.endpoint,
                 "region": s3.region,
@@ -1303,6 +1418,49 @@ def ducklake_credentials(
                 "expiration": None,
             }
             decision = "error_unmasked" if decision != "masked" else decision
+    else:
+        try:
+            creds = vend_credentials(
+                s3,
+                namespace=ns[0],
+                table=table or "*",
+                read_only=True,
+                read_prefixes=read_prefixes,
+                deny_prefixes=deny_prefixes,
+                duration_seconds=clamped,
+                principal=sub,
+                data_prefix=ctx.ref.data_prefix,
+            )
+            out["s3"] = {
+                "endpoint": s3.endpoint,
+                "region": s3.region,
+                "path-style-access": s3.path_style,
+                "access-key-id": creds.access_key_id,
+                "secret-access-key": creds.secret_access_key,
+                "session-token": creds.session_token,
+                "expiration": creds.expiration_iso,
+            }
+            sts_degraded = creds.degraded
+        except Exception:
+            log.exception(
+                "ducklake-credentials STS vending failed for %s — %s",
+                ns[0], "falling back to root keys"
+                if not settings.suppress_root_creds else "no creds returned")
+            if settings.suppress_root_creds:
+                out["s3"] = None
+                decision = "error_no_creds"
+            else:
+                out["s3"] = {
+                    "endpoint": s3.endpoint,
+                    "region": s3.region,
+                    "path-style-access": s3.path_style,
+                    "access-key-id": s3.root_access_key,
+                    "secret-access-key": s3.root_secret_key,
+                    "session-token": None,
+                    "expiration": None,
+                }
+                decision = ("error_unmasked"
+                            if decision != "masked" else decision)
 
     try:
         governance_store.audit_load(
@@ -1318,6 +1476,7 @@ def ducklake_credentials(
                 "masked_view": out["masked_view"],
                 "reader_dsn": reader_dsn_ok,
                 "file_layer": out["file_layer"],
+                "sts_degraded": sts_degraded,
             },
         )
     except Exception:
@@ -1365,6 +1524,7 @@ def rename_table(
 )
 def commit_table(
     prefix: str, namespace: str, table: str, req: CommitTableRequest,
+    request: Request,
     ctx: CatalogContext = Depends(resolve_catalog),
 ) -> LoadTableResponse:
     """Commit updates to a table.
@@ -1681,12 +1841,38 @@ def commit_table(
             log.exception("post-schema-change masking GC failed for %s.%s",
                           ns[0], table)
 
+    # Commit audit: land data commits in the same duckicelake_governance_audit
+    # trail governed reads use, so "who wrote what, when" is queryable rather
+    # than a log line. Best-effort (audit_load swallows its own failures) and
+    # AFTER the transaction — a failed audit must never roll back a commit.
+    try:
+        commit_sub = (claims_from_request(auth_cfg, request).get("sub")
+                      or "anonymous")
+        ctx.store.audit_load(
+            principal=commit_sub, object_=f"{ns[0]}.{table}",
+            masked_cols=[], applied_policies=[], row_filtered=False,
+            operation="commit_table", decision="ok",
+            detail={
+                "added_files": len(pending_add_paths),
+                "removed_files": len(pending_remove_paths),
+                "pos_delete_files": len(pending_pos_deletes),
+                "eq_delete_files": len(pending_eq_deletes),
+                "expired_snapshots": len(pending_remove_snapshot_ids),
+                "schema_changed": schema_changed,
+                "properties_set": sorted(pending_properties_set),
+                "properties_removed": sorted(pending_properties_remove),
+                "tag_set": pending_tag[0] if pending_tag else None,
+                "tag_removed": pending_tag_remove,
+            })
+    except Exception:
+        log.exception("commit audit failed for %s.%s", ns[0], table)
+
     # Eager materialise: _build_load_response calls materialize_all, which
     # writes all the snapshot/manifest Avros + the new vN.metadata.json and
     # primes the in-process cache. Subsequent readers hit the cache with no
     # S3 / no manifest-generation cost.
     COMMIT_TOTAL.labels("ok").inc()
-    return _build_load_response(ctx, ns, table)
+    return _build_load_response(ctx, ns, table, request=request)
 
 
 def _check_requirements(
@@ -1904,13 +2090,10 @@ def _latest_metadata_location(metadata_prefix: str) -> str:
     version-hint.text on every snapshot to make this cheap.
     """
     s3 = settings.s3
-    import boto3
     from botocore.exceptions import ClientError
-    c = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+
+    from . import s3util
+    c = s3util.s3_client(s3)
     try:
         body = c.get_object(Bucket=s3.bucket, Key=f"{metadata_prefix}version-hint.text")["Body"].read()
         n = int(body.decode("utf-8").strip())
@@ -1929,6 +2112,34 @@ def _wants_vended_credentials(header: str | None) -> bool:
         token.strip().lower() == "vended-credentials"
         for token in header.split(",")
     )
+
+
+def _wants_remote_signing(header: str | None) -> bool:
+    if not header:
+        return False
+    return any(
+        token.strip().lower() == "remote-signing"
+        for token in header.split(",")
+    )
+
+
+def _remote_signing_config(request: Request | None,
+                           ctx: CatalogContext) -> dict[str, str]:
+    """Config keys that route a client's S3 I/O through the proxy signer.
+    Emits BOTH activation switches: `s3.remote-signing-enabled` (Java
+    S3FileIO) and `s3.signer=S3V4RestSigner` (PyIceberg FsspecFileIO —
+    which ignores the Java flag)."""
+    base = (settings.public_url
+            or (str(request.base_url) if request is not None else "")
+            ).rstrip("/")
+    return {
+        "s3.remote-signing-enabled": "true",
+        "s3.signer": "S3V4RestSigner",
+        "s3.signer.uri": base,
+        "s3.signer.endpoint": f"v1/{ctx.catalog_id}/aws/s3/sign",
+        # PyIceberg's pyarrow FileIO has no signer support; fsspec does.
+        "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
+    }
 
 
 def _base_s3_config() -> dict[str, str]:
@@ -1960,6 +2171,7 @@ def _build_load_response(
     read_only: bool = True,
     snapshot_id_override: int | None = None,
     principal_claims: dict | None = None,
+    request: Request | None = None,
 ) -> LoadTableResponse:
     # Per-request catalog context; managers below are bound to this catalog.
     catalog = ctx.catalog
@@ -2174,7 +2386,18 @@ def _build_load_response(
             )
 
     config_out: dict[str, str] = _base_s3_config()
-    if _wants_vended_credentials(delegation_header) and file_layer_export is not None:
+    wants_delegation = (_wants_vended_credentials(delegation_header)
+                        or _wants_remote_signing(delegation_header))
+    if wants_delegation and settings.s3.sts_disabled:
+        # No STS on this backend (Hetzner): answer BOTH delegation header
+        # values with remote signing. Masked file-layer and normal
+        # principals get the SAME config — per-object authorization lives
+        # in the signer, which re-derives the plan/sig on every request
+        # (and shadow metadata already points masked principals at the
+        # __masked__ prefix). No static keys are emitted; revocation is
+        # immediate.
+        config_out.update(_remote_signing_config(request, ctx))
+    elif _wants_vended_credentials(delegation_header) and file_layer_export is not None:
         # Masked file-layer principal: READ-ONLY creds on the masked sig
         # prefix only — never the base table's bytes (and never write).
         creds = vend_credentials(
@@ -2197,7 +2420,6 @@ def _build_load_response(
             }
         )
     elif _wants_vended_credentials(delegation_header):
-        snap = metadata.get("current-snapshot-id") or 0
         # Vended creds must cover *everything* a client may do with this
         # table during the token's lifetime. The Iceberg REST spec doesn't
         # distinguish read vs write at vending time — the same header
@@ -2205,18 +2427,16 @@ def _build_load_response(
         # both GET LoadTable (reader) and POST CreateTable / commit
         # (writer). PyIceberg fetches creds via LoadTable then uses them
         # for subsequent writes. So we always vend write-capable creds
-        # here. RBAC (per-token capability scoping) is the right way to
-        # restrict this and is on the to-do list.
-        data_files = catalog.data_files_at(ns, table, snap)
-        delete_files = catalog.delete_files_at(ns, table, snap)
-        allow_uris = [f.file_path for f in data_files] + [f.file_path for f in delete_files]
-        allow_uris.append(f"s3://{s3.bucket}/{metadata_prefix}*")
+        # here — and a write-mode session policy is prefix-scoped by
+        # construction (we can't predict the filenames a writer will
+        # upload), so no per-file key list is passed. RBAC (per-token
+        # capability scoping) is the right way to restrict this and is on
+        # the to-do list.
         creds = vend_credentials(
             s3,
             namespace=ns[0],
             table=table,
             read_only=False,           # see comment above
-            data_file_uris=allow_uris,
             principal=principal_for_creds,
             data_prefix=data_prefix,
         )

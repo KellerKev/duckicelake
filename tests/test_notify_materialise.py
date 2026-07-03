@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 import uuid
 
-import boto3
+from duckicelake import s3util
 import duckdb
 import psycopg
 import pytest
@@ -137,11 +137,7 @@ def test_ducklake_direct_write_triggers_eager_materialisation(client, settings):
     # Capture the metadata key set BEFORE the DuckLake-direct write so
     # we can detect a new vN.metadata.json arriving without a LoadTable.
     s3 = settings.s3
-    s3c = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    s3c = s3util.s3_client(s3)
     metadata_prefix = f"{s3.data_prefix}{ns}/t1/metadata/"
     before = {
         o["Key"]

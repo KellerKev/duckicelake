@@ -6,31 +6,59 @@ Idempotent: safe to run repeatedly.
 """
 from __future__ import annotations
 
-import boto3
+import time
+
 from botocore.exceptions import ClientError
 
+from . import s3util
 from .catalog import DuckLakeCatalog
 from .config import load_settings, redact_password
 
 
-def ensure_bucket(settings) -> None:
-    s3 = settings.s3
-    client = boto3.client(
-        "s3",
-        endpoint_url=s3.endpoint,
-        region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+def _head_ok(client, bucket: str) -> bool:
+    """True only when head_bucket succeeds. 403 and 404 both count as
+    "not confirmed" — backends disagree on the code for a missing-vs-denied
+    bucket (Hetzner in particular), and the caller retries either way."""
     try:
-        client.head_bucket(Bucket=s3.bucket)
+        client.head_bucket(Bucket=bucket)
+        return True
+    except ClientError:
+        return False
+
+
+def ensure_bucket(settings, *, retries: int = 5, delay: float = 2.0) -> None:
+    s3 = settings.s3
+    client = s3util.s3_client(s3)
+    if _head_ok(client, s3.bucket):
         print(f"S3 bucket '{s3.bucket}' already exists.")
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code not in {"404", "NoSuchBucket", "NoSuchBucketPolicy"}:
-            raise
+        return
+    try:
         client.create_bucket(Bucket=s3.bucket)
         print(f"Created S3 bucket '{s3.bucket}'.")
+        return
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
+            print(f"S3 bucket '{s3.bucket}' already exists.")
+            return
+        if code not in {"AccessDenied", "403", "InvalidAccessKeyId"}:
+            raise
+    # Bucket-create denied. On Hetzner this is normal for pre-provisioned
+    # buckets (keys often lack create rights), and freshly issued keys can
+    # return AccessDenied for a few seconds before they propagate — so
+    # re-probe head_bucket with backoff before concluding it's broken.
+    for _ in range(retries):
+        time.sleep(delay)
+        if _head_ok(client, s3.bucket):
+            print(f"S3 bucket '{s3.bucket}' pre-provisioned; proceeding.")
+            return
+    raise RuntimeError(
+        f"create_bucket was denied and head_bucket still fails for "
+        f"'{s3.bucket}'. If the backend is Hetzner Object Storage: "
+        f"pre-create the bucket in the SAME project as the access key "
+        f"(keys are project-scoped) and allow ~30s for fresh keys to "
+        f"propagate before retrying."
+    )
 
 
 def main() -> int:

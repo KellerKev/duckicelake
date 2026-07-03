@@ -23,11 +23,23 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from .catalog import DuckLakeCatalog, pg_advisory_lock
 
 log = logging.getLogger("duckicelake.governance")
+
+
+@dataclass(frozen=True)
+class StaticKey:
+    """A per-principal storage credential for no-STS backends. The proxy
+    only requires `access_key_id` (it becomes a bucket-policy Principal);
+    `secret_access_key` is optionally stored for turnkey vending."""
+    principal: str
+    access_key_id: str
+    secret_access_key: str | None = None
+    note: str | None = None
 
 
 # Object kinds a tag / policy can target.
@@ -224,6 +236,21 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
             privilege   VARCHAR NOT NULL,
             role_name   VARCHAR NOT NULL,
             PRIMARY KEY (object_kind, schema_name, object_name, privilege, role_name)
+        )
+    """)
+    # --- static S3 keys (no-STS backends, e.g. Hetzner) -------------------
+    # Per-principal storage credentials for DuckLake-direct clients when the
+    # backend has no STS. The proxy only NEEDS access_key_id (it becomes the
+    # bucket-policy Principal); storing secret_access_key is an operator
+    # opt-in for turnkey vending — with it, a governance-DB dump is a full
+    # project S3 compromise on Hetzner (keys are project-scoped).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.duckicelake_static_s3_key (
+            principal          VARCHAR PRIMARY KEY,
+            access_key_id      VARCHAR NOT NULL,
+            secret_access_key  VARCHAR,
+            note               VARCHAR,
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
     # --- audit log -------------------------------------------------------
@@ -956,6 +983,57 @@ class GovernanceStore:
                 (principal_sub,),
             )
             return [r[0] for r in cur.fetchall()]
+
+    # -- static S3 keys (no-STS backends) ----------------------------------
+
+    def set_static_key(self, principal: str, access_key_id: str,
+                       secret: str | None = None,
+                       note: str | None = None) -> None:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                """
+                INSERT INTO public.duckicelake_static_s3_key
+                    (principal, access_key_id, secret_access_key, note)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (principal) DO UPDATE
+                    SET access_key_id = EXCLUDED.access_key_id,
+                        secret_access_key = EXCLUDED.secret_access_key,
+                        note = EXCLUDED.note
+                """,
+                (principal, access_key_id, secret, note),
+            )
+
+    def delete_static_key(self, principal: str) -> bool:
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "DELETE FROM public.duckicelake_static_s3_key "
+                "WHERE principal = %s", (principal,))
+            return cur.rowcount > 0
+
+    def static_key_for_principal(self, principal: str) -> "StaticKey | None":
+        with self.catalog.pg_cursor(autocommit=False) as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "SELECT access_key_id, secret_access_key, note "
+                "FROM public.duckicelake_static_s3_key WHERE principal = %s",
+                (principal,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return StaticKey(principal=principal, access_key_id=row[0],
+                         secret_access_key=row[1], note=row[2])
+
+    def list_static_keys(self) -> "list[StaticKey]":
+        with self.catalog.pg_cursor(autocommit=False) as cur:
+            ensure_governance_sidecars(cur)
+            cur.execute(
+                "SELECT principal, access_key_id, secret_access_key, note "
+                "FROM public.duckicelake_static_s3_key ORDER BY principal")
+            rows = cur.fetchall()
+        return [StaticKey(principal=r[0], access_key_id=r[1],
+                          secret_access_key=r[2], note=r[3]) for r in rows]
 
     # -- effective policy view -------------------------------------------
 

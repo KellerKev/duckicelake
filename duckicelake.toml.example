@@ -59,6 +59,31 @@ root_secret = "minioadmin"
 path_style = true
 prefix = "data/"
 
+# Where STS AssumeRole lives (credential vending).
+#   unset      -> the S3 endpoint itself (MinIO co-hosts STS; the default)
+#   "aws"      -> https://sts.{region}.amazonaws.com (real AWS, regional)
+#   "none"     -> backend has NO STS (Hetzner): REST clients get remote
+#                 signing, DuckLake-direct clients use static keys +
+#                 generated bucket policies (see OPERATIONS.md)
+#   any URL    -> used verbatim (GovCloud, VPC endpoints, LocalStack)
+[sts]
+#endpoint = "aws"
+# Real AWS needs an existing, assumable role; MinIO accepts any string.
+#role_arn = "arn:aws:iam::123456789012:role/duckicelake-vend"
+# Upper clamp for vended DurationSeconds. AWS also REJECTS values above the
+# role's MaxSessionDuration (sts vending retries once at 3600 on that).
+#max_duration = 43200
+
+# Hetzner Object Storage (only with [sts] endpoint = "none"):
+#[hetzner]
+#project_id = "123456"   # project owning the S3 CREDENTIALS (Principal ARNs)
+
+# External base URL of the proxy — becomes `s3.signer.uri` for remote-signing
+# clients. Unset: each request's own base URL (fine without a reverse proxy).
+#public_url = "https://catalog.example.com"
+# Signer authorization cache TTL, seconds (bounds PG load AND revocation lag).
+#signer_cache_ttl = 10.0
+
 #[oauth]
 #clients = "agent:s3cr3t|ns:analytics:r|agent"
 #clients_file = "/etc/duckicelake/clients.json"

@@ -1,7 +1,7 @@
 """CatalogRegistry: provisioning, resolution, caching, and isolation."""
 from __future__ import annotations
 
-import boto3
+from duckicelake import s3util
 import psycopg
 import pytest
 
@@ -16,11 +16,7 @@ CATALOGS = {
 
 def _s3(settings):
     s3 = settings.s3
-    return boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    return s3util.s3_client(s3)
 
 
 @pytest.fixture()

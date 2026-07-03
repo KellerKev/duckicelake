@@ -22,8 +22,9 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 
-import boto3
 from botocore.exceptions import ClientError
+
+from . import s3util
 from fastavro import reader
 
 from .config import S3Settings
@@ -59,13 +60,7 @@ class CommitChanges:
 
 
 def _s3_client(s3: S3Settings):
-    return boto3.client(
-        "s3",
-        endpoint_url=s3.endpoint,
-        region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    return s3util.s3_client(s3)
 
 
 def _read_s3(client, uri: str) -> bytes:

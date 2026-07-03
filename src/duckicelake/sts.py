@@ -1,30 +1,50 @@
-"""MinIO STS AssumeRole client for Iceberg credential vending.
+"""STS AssumeRole client for Iceberg credential vending.
 
-MinIO speaks the AWS STS protocol on the same endpoint as S3 (no separate STS
-service). We call AssumeRole with an inline session policy scoped to the
-target table's prefix so the vended credentials can only touch that one
-table's objects.
+Backends differ in where STS lives (see `S3Settings.sts_endpoint`):
 
-We use boto3's STS client under the hood so the request signing / XML parsing
-is handled by botocore. Production use would want credential caching and
-retries, both skipped here for clarity.
+- MinIO speaks the AWS STS protocol on the same endpoint as S3 — the
+  default when `sts_endpoint` is unset.
+- Real AWS serves STS at `sts.{region}.amazonaws.com` (`sts_endpoint =
+  "aws"`), requires a real, assumable `sts_role_arn`, packs inline session
+  policies to a 2048-character limit (we degrade per-file scoping to a
+  table-prefix scope past ~1900 chars, and retry once on
+  PackedPolicyTooLarge), and REJECTS DurationSeconds above the role's
+  MaxSessionDuration where MinIO clamps (we retry once at 3600).
+- Backends with no STS at all (`sts_endpoint = "none"`, e.g. Hetzner) must
+  never reach this module — the server reroutes vending to remote signing /
+  static keys.
+
+We call AssumeRole with an inline session policy scoped to the target
+table's prefix so the vended credentials can only touch that one table's
+objects. boto3's STS client handles request signing / XML parsing.
+Production use would want credential caching; skipped here for clarity.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 
 import boto3
-from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from .config import S3Settings
 
+log = logging.getLogger("duckicelake")
 
-# MinIO's built-in role. AWS would use a real RoleArn here; MinIO accepts any
-# non-empty value for AssumeRole when using root credentials, but we pass a
-# recognizable string for readability in minio's audit log.
+
+# Back-compat alias; the configurable value lives on
+# `S3Settings.sts_role_arn`. MinIO accepts any non-empty RoleArn when using
+# root credentials; real AWS requires an existing role whose trust policy
+# allows the base credentials to sts:AssumeRole it.
 DEFAULT_ROLE_ARN = "arn:aws:iam::duckicelake:role/IcebergClient"
+
+# AWS limits inline session policies to 2048 plaintext characters (and
+# additionally enforces a packed-size quota). We degrade below the limit
+# with margin; MinIO has no comparable cap so the guard is a no-op there
+# in practice.
+_POLICY_MAX = 1900
 
 
 @dataclass(frozen=True)
@@ -33,6 +53,9 @@ class VendedCredentials:
     secret_access_key: str
     session_token: str
     expiration_iso: str
+    # True when per-file read scoping was widened to a table-prefix scope
+    # to fit the session-policy size limit. Callers stamp this into audit.
+    degraded: bool = False
 
 
 def _scoped_policy(
@@ -138,13 +161,20 @@ def _scoped_policy(
 
 
 def _sts_client(s3: S3Settings):
+    if s3.sts_disabled:
+        raise RuntimeError(
+            "STS is disabled (sts_endpoint='none'); vend_credentials must "
+            "not be called — the server reroutes to remote signing / static "
+            "keys in this mode.")
+    # botocore's default SigV4 for service "sts" is what both real AWS and
+    # MinIO's STS handler expect (the old forced signature_version="s3v4"
+    # was unnecessary — verified against the MinIO suite).
     return boto3.client(
         "sts",
-        endpoint_url=s3.endpoint,
+        endpoint_url=s3.resolved_sts_endpoint(),
         region_name=s3.region,
         aws_access_key_id=s3.root_access_key,
         aws_secret_access_key=s3.root_secret_key,
-        config=Config(signature_version="s3v4"),
     )
 
 
@@ -175,6 +205,64 @@ def _keys_from_uris(uris: list[str], bucket: str) -> list[str]:
     return keys
 
 
+def _build_policy(
+    s3: S3Settings,
+    *,
+    namespace: str,
+    table: str,
+    write_prefix: str,
+    read_only: bool,
+    read_keys: list[str],
+    read_prefixes: list[str] | None,
+    deny_prefixes: list[str] | None,
+    data_prefix: str | None,
+    force_degrade: bool = False,
+) -> tuple[str, bool]:
+    """Build the compact session-policy JSON, degrading per-file read
+    scoping to a table-prefix scope when the policy would blow the AWS
+    inline-session-policy size limit.
+
+    Degradation only ever WIDENS the read scope from "these exact keys" to
+    "this table's prefix" — still single-table. `deny_prefixes` are NEVER
+    dropped or collapsed: the Deny carve-outs are the file-layer masking
+    security boundary, so a policy that stays oversized even after
+    degradation raises instead of shipping without them.
+    """
+    def _render(keys: list[str], prefixes: list[str] | None) -> str:
+        policy = _scoped_policy(
+            s3.bucket,
+            write_prefix=write_prefix,
+            read_only=read_only,
+            read_keys=keys,
+            read_prefixes=prefixes,
+            deny_prefixes=deny_prefixes,
+        )
+        return json.dumps(policy, separators=(",", ":"))
+
+    compact = _render(read_keys, read_prefixes)
+    degraded = False
+    if read_only and read_keys and (
+            force_degrade or len(compact) > _POLICY_MAX):
+        fallback = list(read_prefixes or [])
+        table_prefix = s3.table_prefix(namespace, table, data_prefix)
+        if table_prefix not in fallback:
+            fallback.append(table_prefix)
+        log.warning(
+            "STS session policy for %s.%s too large (%d files, %d chars); "
+            "degrading per-file read scope to table prefix %s",
+            namespace, table, len(read_keys), len(compact), table_prefix)
+        compact = _render([], fallback)
+        degraded = True
+    if len(compact) > _POLICY_MAX:
+        raise ValueError(
+            f"STS session policy for {namespace}.{table} is {len(compact)} "
+            f"chars even after degradation (limit ~{_POLICY_MAX}; AWS caps "
+            f"inline session policies at 2048). The deny-prefix list alone "
+            f"exceeds the limit — reduce file-layer-masked table count per "
+            f"namespace or vend per-table instead.")
+    return compact, degraded
+
+
 def vend_credentials(
     s3: S3Settings,
     *,
@@ -191,47 +279,97 @@ def vend_credentials(
 ) -> VendedCredentials:
     """Mint temporary credentials for a single table.
 
-    `duration_seconds` is clamped by MinIO — the default build accepts values
-    between 900 (15 min) and 604800 (7 days).
+    `duration_seconds` semantics differ by backend: MinIO CLAMPS out-of-range
+    values (default build accepts 900–604800); real AWS REJECTS values above
+    the role's MaxSessionDuration (default 3600, absolute max 43200) with a
+    ValidationError — we retry once at 3600 when that happens.
 
     `data_file_uris` is the list of live data files for this table (pulled
-    from DuckLake's `ducklake_data_file` catalog table). When provided,
-    reads are restricted to exactly those object keys. For writes we still
-    have to allow the DuckLake data-path prefix (we can't predict filenames).
+    from DuckLake's `ducklake_data_file` catalog table). When provided with
+    `read_only=True`, reads are restricted to exactly those object keys —
+    unless the resulting session policy would exceed the AWS size limit, in
+    which case scoping degrades to the table's prefix (`degraded=True` on
+    the result). For writes we allow the DuckLake data-path prefix (we
+    can't predict filenames).
 
     `read_prefixes` (read-only) grants GetObject on whole key prefixes —
     for long-lived DuckLake-direct sessions that must keep reading files
     committed after vending (see `_scoped_policy`).
 
-    `principal` (governance) stamps the STS session name so MinIO audit logs
-    attribute vended creds to a principal. The Phase 2 hook for *withholding*
-    creds from principals who must be masked (coarse, file-granularity) lands
-    with file-layer masking (pre-masked Parquet copies).
+    `principal` (governance) stamps the STS session name so backend audit
+    logs attribute vended creds to a principal.
     """
     # Per-account catalog scopes writes to its own data prefix; default keeps
     # the single-catalog data prefix.
     write_prefix = data_prefix or s3.data_prefix  # DuckLake writes under this
     read_keys = _keys_from_uris(data_file_uris or [], s3.bucket)
-    policy = _scoped_policy(
-        s3.bucket,
-        write_prefix=write_prefix,
-        read_only=read_only,
-        read_keys=read_keys,
-        read_prefixes=read_prefixes,
-        deny_prefixes=deny_prefixes,
+    build = dict(
+        namespace=namespace, table=table, write_prefix=write_prefix,
+        read_only=read_only, read_keys=read_keys,
+        read_prefixes=read_prefixes, deny_prefixes=deny_prefixes,
+        data_prefix=data_prefix,
     )
+    policy_json, degraded = _build_policy(s3, **build)
     sts = _sts_client(s3)
-    resp = sts.assume_role(
-        RoleArn=DEFAULT_ROLE_ARN,
-        RoleSessionName=_session_name(
-            session_name, principal, namespace, table),
-        Policy=json.dumps(policy),
-        DurationSeconds=duration_seconds,
-    )
+    role_arn = s3.sts_role_arn or DEFAULT_ROLE_ARN
+    session = _session_name(session_name, principal, namespace, table)
+
+    def _assume(policy: str, duration: int):
+        return sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=session,
+            Policy=policy,
+            DurationSeconds=duration,
+        )
+
+    try:
+        resp = _assume(policy_json, duration_seconds)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "PackedPolicyTooLarge" and not degraded and read_keys \
+                and read_only:
+            # AWS's packed-size accounting can trip before our plaintext
+            # estimate does — degrade to prefix scoping and retry once.
+            policy_json, degraded = _build_policy(
+                s3, force_degrade=True, **build)
+            resp = _assume(policy_json, duration_seconds)
+        elif (code == "ValidationError" and "DurationSeconds" in str(e)
+                and duration_seconds > 3600):
+            # AWS rejects durations above the role's MaxSessionDuration
+            # (MinIO clamps instead). Retry once at the AWS default.
+            log.warning(
+                "STS rejected DurationSeconds=%d (role MaxSessionDuration "
+                "too low?); retrying at 3600. Raise the role's "
+                "MaxSessionDuration to allow longer sessions.",
+                duration_seconds)
+            resp = _assume(policy_json, 3600)
+        else:
+            _log_assume_role_error(code, role_arn)
+            raise
     creds = resp["Credentials"]
     return VendedCredentials(
         access_key_id=creds["AccessKeyId"],
         secret_access_key=creds["SecretAccessKey"],
         session_token=creds["SessionToken"],
         expiration_iso=creds["Expiration"].isoformat(),
+        degraded=degraded,
     )
+
+
+def _log_assume_role_error(code: str, role_arn: str) -> None:
+    """One clear operator-facing line per well-known AssumeRole failure."""
+    if code == "AccessDenied":
+        log.error(
+            "STS AssumeRole denied: the base credentials are not allowed "
+            "to sts:AssumeRole %s — fix the role's trust policy (it must "
+            "allow the proxy's base-credential principal).", role_arn)
+    elif code in {"InvalidClientTokenId", "ExpiredToken", "SignatureDoesNotMatch"}:
+        log.error(
+            "STS rejected the proxy's base credentials (%s) — check "
+            "DUCKICELAKE_S3_ROOT_KEY/SECRET.", code)
+    elif code == "MalformedPolicyDocument":
+        log.error(
+            "STS rejected the session policy as malformed — likely a "
+            "backend that does not support an action/condition we emit.")
+    elif code:
+        log.error("STS AssumeRole failed with %s (role %s)", code, role_arn)

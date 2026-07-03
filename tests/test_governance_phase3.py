@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 
 import boto3
+from duckicelake import s3util
 import duckdb
 import psycopg
 import pytest
@@ -384,12 +385,9 @@ def test_ducklake_credentials_sts_prefix_scoping(client, settings):
         aws_access_key_id=s3c["access-key-id"],
         aws_secret_access_key=s3c["secret-access-key"],
         aws_session_token=s3c["session-token"],
+        config=s3util.boto_config(s3),
     )
-    root = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    root = s3util.s3_client(s3)
 
     def _keys(prefix: str) -> list[str]:
         out = []

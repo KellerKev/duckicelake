@@ -18,8 +18,9 @@ import json
 import uuid
 from typing import Any, Iterable
 
-import boto3
 from botocore.exceptions import ClientError
+
+from . import s3util
 
 from .bounds import UnsupportedBoundType, encode_bound
 from .catalog import (
@@ -45,13 +46,7 @@ from .manifest import (
 def _s3_client(s3: S3Settings):
     # Back-compat: still exported; materialize_all uses the shared
     # `catalog.s3_client` now. Kept so external callers don't break.
-    return boto3.client(
-        "s3",
-        endpoint_url=s3.endpoint,
-        region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    return s3util.s3_client(s3)
 
 
 def _put(client, bucket: str, key: str, body: bytes) -> None:

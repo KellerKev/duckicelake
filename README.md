@@ -47,12 +47,23 @@ No "sync job", no manual rewrite step, no second-class write path.
 ### Requirements
 
 > **Object storage is S3.** Any S3-compatible backend works for data
-> I/O; the credential-vending and governance layers additionally need a
-> backend that implements **STS `AssumeRole` with session policies** —
-> that's what scopes a vended credential to one table's (or one masked
-> export's) prefix. The pixi dev stack bundles **MinIO** purely so you can
-> spin the whole thing up locally in one command; for production, point
-> `DUCKICELAKE_S3_*` at your real STS-capable S3 backend.
+> I/O. Storage-credential scoping comes in two flavors:
+>
+> - Backends with **STS `AssumeRole` + session policies** (AWS, MinIO):
+>   the proxy vends temporary credentials scoped to one table's (or one
+>   masked export's) prefix. For real AWS, see
+>   *Running against real AWS S3 + STS* below.
+> - Backends with **no STS at all** (e.g. Hetzner Object Storage): set
+>   `DUCKICELAKE_STS_ENDPOINT=none` and the proxy switches to **remote
+>   signing** — every S3 request is authorized against governance and
+>   SigV4-signed server-side, so root keys never leave the proxy.
+>   DuckLake-direct DuckDB clients (which can't remote-sign) use static
+>   per-principal keys scoped by generated bucket policies. See the
+>   *Hetzner Object Storage* section in [`OPERATIONS.md`](OPERATIONS.md).
+>
+> The pixi dev stack bundles **MinIO** purely so you can spin the whole
+> thing up locally in one command; for production, point
+> `DUCKICELAKE_S3_*` at your real backend.
 >
 > **PostgreSQL is required as the DuckLake metastore.**
 > The proxy talks to DuckLake's catalog tables through a psycopg pool
@@ -65,6 +76,44 @@ No "sync job", no manual rewrite step, no second-class write path.
 > visible through the lazy `LoadTable` materialisation, just without
 > the ~1s warm-S3 guarantee. Switching backends is not currently
 > wired through the proxy's config.
+
+### Running against real AWS S3 + STS
+
+The STS vending path is AWS-shaped by construction — regional STS
+endpoint, configurable role ARN, session-policy size handling, duration
+semantics — but has **not yet been run against live AWS**
+([`MISSING.md`](MISSING.md)). What you need:
+
+```toml
+[s3]
+endpoint   = "https://s3.eu-central-1.amazonaws.com"
+region     = "eu-central-1"
+bucket     = "my-lakehouse"
+root_key   = "…"                  # the proxy's BASE credentials
+root_secret = "…"                 # (IAM user or role-derived keys)
+path_style = false
+
+[sts]
+endpoint = "aws"                  # -> https://sts.eu-central-1.amazonaws.com
+role_arn = "arn:aws:iam::123456789012:role/duckicelake-vend"
+```
+
+- **Trust policy**: the vending role's trust policy must allow the
+  proxy's base-credential principal to `sts:AssumeRole` it.
+- **Intersection semantics**: a session policy can only *narrow* the
+  role's own permissions, so the role's permission policy must be a
+  superset of everything the proxy vends — grant it `s3:*` on
+  `arn:aws:s3:::{bucket}` and `arn:aws:s3:::{bucket}/{prefix}*`; each
+  vend then narrows to one table/export prefix.
+- **DurationSeconds**: AWS *rejects* values above the role's
+  `MaxSessionDuration` (default 3600) where MinIO clamps; the proxy
+  retries once at 3600 and logs a pointer at the role setting.
+  `DUCKICELAKE_STS_MAX_DURATION` caps what clients may request.
+- **Session-policy size**: AWS packs inline session policies to 2048
+  chars. Per-file read scoping degrades automatically to a table-prefix
+  scope past ~1900 chars (audited as `sts_degraded`); governance Deny
+  carve-outs are **never** dropped — an unshrinkable policy fails the
+  vend instead (fail closed).
 
 ## 🛡️ Governance: tags, RBAC, masking
 
@@ -86,7 +135,7 @@ layered, and you choose the tier per masking policy:
   PyIceberg, anything holding the vended creds) **physically cannot reach
   the unmasked data**. Airtight; costs one masked copy per mask shape.
 
-Everything below is **implemented and tested** (a 133-test suite plus live
+Everything below is **implemented and tested** (a 180+-test suite plus live
 end-to-end runs — see *What's verified*).
 
 ### A worked example — policies in, masked SQL out
@@ -404,7 +453,7 @@ same API, with every access audited.
 
 ### What's verified
 
-Beyond the 133-test `pytest` suite, the governance layer has been exercised
+Beyond the full `pytest` suite, the governance layer has been exercised
 end-to-end against a live local stack (proxy + MinIO + Postgres). All of
 the following are confirmed working:
 
@@ -759,12 +808,16 @@ machine.
 
 ### Tests + CI
 
-- 133 `pytest` tests covering the REST surface, cache LRU, metrics
+- 180+ `pytest` tests covering the REST surface, cache LRU, metrics
   endpoint, Puffin writer byte-level structure, the eager-materialisation
   listener, config-file loading, multi-catalog isolation (per-tenant PG
   schemas / S3 prefixes / reader roles, account-scoped routing, per-catalog
   commits), the fail-closed regression suite (multi-worker DDL race,
-  planning-error denial, strict mode), and the governance layer end-to-end —
+  planning-error denial, strict mode), STS vending unit coverage
+  (endpoint sentinels, session-policy size degradation, AssumeRole retry
+  paths), the no-STS remote-signing path end-to-end against MinIO
+  (including PyIceberg's own `S3V4RestSigner` client class and file-layer
+  masking enforced per signed request), and the governance layer end-to-end —
   including the byte-level proofs that a masked principal's vended
   credentials cannot read base Parquet (403) while masked copies, the
   RLS-governed reader role, and the shadow Iceberg metadata all serve
@@ -1065,7 +1118,13 @@ carry secrets.
 | `DUCKICELAKE_S3_BUCKET` | `lakehouse` | |
 | `DUCKICELAKE_S3_ROOT_KEY` / `_ROOT_SECRET` | `minioadmin` | dev defaults; production: IAM role / IRSA / Vault |
 | `DUCKICELAKE_S3_PREFIX` | `data/` | |
-| `DUCKICELAKE_S3_PATH_STYLE` | `1` | path-style addressing (MinIO) |
+| `DUCKICELAKE_S3_PATH_STYLE` | `1` | path-style addressing (MinIO, Hetzner) |
+| `DUCKICELAKE_STS_ENDPOINT` | *(unset → the S3 endpoint)* | `aws` → regional AWS STS; `none` → no STS (remote signing + static keys, e.g. Hetzner); or an explicit URL |
+| `DUCKICELAKE_STS_ROLE_ARN` | *(MinIO placeholder)* | AssumeRole target; real AWS requires an existing, assumable role |
+| `DUCKICELAKE_STS_MAX_DURATION` | `43200` | upper clamp for vended DurationSeconds; keep ≤ the role's MaxSessionDuration on AWS |
+| `DUCKICELAKE_PUBLIC_URL` | *(unset → request base URL)* | external proxy URL; becomes `s3.signer.uri` for remote-signing clients |
+| `DUCKICELAKE_SIGNER_CACHE_TTL` | `10.0` | signer authorization cache TTL, seconds (bounds PG load and revocation lag) |
+| `DUCKICELAKE_HETZNER_PROJECT_ID` | *(empty)* | Hetzner project owning the S3 credentials — bucket-policy generator only |
 | `DUCKICELAKE_CONFIG_FILE` | *(unset → `./duckicelake.toml`)* | alternate TOML config path |
 | `DUCKICELAKE_SUPPRESS_ROOT_CREDS` | `1` | omit root S3 keys from response configs; `0` is dev-only (bypasses governance masking) |
 | `DUCKICELAKE_TRANSPARENT_MASKING` | `1` | `SET search_path` transparent routing from `ducklake-credentials` |

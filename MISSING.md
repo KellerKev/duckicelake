@@ -135,20 +135,33 @@ PromQL queries for an SLO dashboard (p95 LoadTable latency, commit
 error rate, cache hit-rate, pool saturation) but the Grafana JSON isn't
 in the repo. An operator builds them on first deploy.
 
-**Commit audit is partial.** Governance authoring and every governed READ
-land in the structured `duckicelake_governance_audit` sidecar (with
-`DUCKICELAKE_AUDIT_RETENTION_DAYS` retention), but plain `commit_table`
-data commits still only `log.info(...)` — wiring commits into the same
-sidecar is maybe half a day of work.
-
 ### Testing gaps
 
-**No Spark / Trino integration tests.** 133 tests cover PyIceberg +
-DuckDB iceberg-ext + REST-direct + the Puffin writer. Real production
-deployments will also connect Spark and Trino, which catch different
-bugs (v2 vs v3 shape divergences, partition-spec edge cases, write-mode
-properties). Run `spark-iceberg` or a Trino Docker image against the
-proxy before shipping to users.
+**No Spark / Trino integration tests.** The pytest suite covers
+PyIceberg + DuckDB iceberg-ext + REST-direct + the Puffin writer. Real
+production deployments will also connect Spark and Trino, which catch
+different bugs (v2 vs v3 shape divergences, partition-spec edge cases,
+write-mode properties). Run `spark-iceberg` or a Trino Docker image
+against the proxy before shipping to users.
+
+**No live AWS STS run.** The STS vending path is AWS-shaped (regional
+STS endpoint, configurable role ARN, session-policy size degradation,
+MaxSessionDuration retry — unit-tested), but has **not been run against
+live AWS STS**. Before shipping on AWS: smoke the vend → read → write
+flow against a real role.
+
+**Hetzner: live-verified 2026-07-03** against a real Hetzner bucket
+(fsn1): pre-provisioned-bucket bootstrap, DuckDB httpfs TLS writes,
+LoadTable → remote-signing config, signed GET/PUT (UNSIGNED-PAYLOAD
+accepted by Ceph RGW), file-layer masked export materialized on
+Hetzner with base-bytes denial + masked-bytes reads through the signer,
+no-STS fail-closed vending, and the bucket-policy generator dry run.
+Still unverified live: actually **applying** a generated bucket policy
+(needs a real project id; verify the per-key Principal ARN enforcement
+before relying on the static-key tier). Note: default botocore
+checksums did NOT trip the documented `AccessDenied` on `put_object`
+during the live run — Hetzner may have added checksum support — but
+`when_required` stays configured (correct on every backend).
 
 **No sustained-load benchmarks.** We measured ~349 req/s once, 4 workers,
 cache-hit. No p99 latency tracking, no soak tests, no pool-saturation
@@ -171,10 +184,10 @@ multi-platform support.
   envoy / ingress). Deploy Postgres HA. Enable S3 versioning +
   cross-region replication.
 - **Day 2** — wire OpenTelemetry tracing. Build Grafana dashboards from
-  the `/metrics` queries in [OPERATIONS.md](OPERATIONS.md). Add audit
-  log table + handler.
+  the `/metrics` queries in [OPERATIONS.md](OPERATIONS.md).
 - **Day 3** — run Spark + Trino against the proxy, fix what breaks.
-  Matrix-test CI across your target platforms.
+  Smoke the credential path against your REAL backend (AWS STS or
+  Hetzner remote signing). Matrix-test CI across your target platforms.
 - **Day 4** — load-test with realistic concurrency + payload shapes.
   Tune `DUCKICELAKE_CACHE_MAX`, `psycopg_pool` `max_size`, uvicorn
   worker count. Document the tuned values in your deploy config.

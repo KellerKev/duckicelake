@@ -199,6 +199,9 @@ def test_gc_and_purge(client, settings, direct_catalog):
 import boto3
 import botocore.exceptions
 
+from duckicelake import s3util
+from duckicelake.config import load_settings
+
 
 def _author_file_layer_policy(client, ns: str, table: str) -> None:
     """pii.flemail tag + mask_email_fl policy with file-layer-masking=true,
@@ -239,16 +242,13 @@ def _s3_client_from(creds_s3: dict):
         aws_access_key_id=creds_s3["access-key-id"],
         aws_secret_access_key=creds_s3["secret-access-key"],
         aws_session_token=creds_s3["session-token"],
+        config=s3util.boto_config(load_settings().s3),
     )
 
 
 def _base_keys(settings, ns: str, table: str = "events") -> list[str]:
     s3 = settings.s3
-    root = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    root = s3util.s3_client(s3)
     keys = []
     for p in root.get_paginator("list_objects_v2").paginate(
             Bucket=s3.bucket, Prefix=s3.table_prefix(ns, table)):
@@ -599,10 +599,7 @@ def test_retention_grace_keeps_recent_dir(settings, direct_catalog):
     grace window survives, so a slow reader's in-flight glob isn't deleted
     out from under it. With grace=0 it's swept (count cap alone)."""
     s3 = settings.s3
-    root = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key)
+    root = s3util.s3_client(s3)
     sig = "deadbeef0000"
     schema, table = "gp4ret", f"t_{uuid.uuid4().hex[:6]}"
     sig_prefix = s3.masked_sig_prefix(schema, table, sig)

@@ -98,6 +98,17 @@ class ObjectGrantRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class StaticS3KeyRequest(BaseModel):
+    principal: str
+    access_key_id: str = Field(alias="access-key-id")
+    # Optional: storing the secret server-side enables turnkey vending via
+    # ducklake-credentials, at the cost of the governance DB holding a
+    # project-scoped storage secret. Recommended: omit; clients keep it.
+    secret_access_key: str | None = Field(default=None, alias="secret-access-key")
+    note: str | None = None
+    model_config = {"populate_by_name": True}
+
+
 def build_governance_router(
     catalog: DuckLakeCatalog,
     settings: Settings,
@@ -294,6 +305,34 @@ def build_governance_router(
             privilege=req.privilege, role_name=req.role_name,
         )
         return {"status": "revoked"}
+
+    # ---- static S3 keys (no-STS backends, e.g. Hetzner) -----------------
+
+    @router.post("/static-s3-keys", status_code=200)
+    def set_static_s3_key(prefix: str, req: StaticS3KeyRequest, request: Request):
+        _check_prefix(prefix)
+        store.set_static_key(req.principal, req.access_key_id,
+                             secret=req.secret_access_key, note=req.note)
+        return {"status": "set", "principal": req.principal,
+                "access-key-id": req.access_key_id,
+                "has-secret": req.secret_access_key is not None}
+
+    @router.get("/static-s3-keys", status_code=200)
+    def list_static_s3_keys(prefix: str):
+        _check_prefix(prefix)
+        # Never echo stored secrets — key ids + a has-secret flag only.
+        return {"keys": [
+            {"principal": k.principal, "access-key-id": k.access_key_id,
+             "has-secret": k.secret_access_key is not None, "note": k.note}
+            for k in store.list_static_keys()
+        ]}
+
+    @router.delete("/static-s3-keys/{principal}", status_code=200)
+    def delete_static_s3_key(prefix: str, principal: str, request: Request):
+        _check_prefix(prefix)
+        if not store.delete_static_key(principal):
+            raise HTTPException(404, f"no static key for principal '{principal}'")
+        return {"status": "deleted", "principal": principal}
 
     @router.get("/effective-policies", status_code=200)
     def effective_policies(prefix: str, table: str, principal: str | None = None):

@@ -146,6 +146,40 @@ class S3Settings:
     root_secret_key: str       # minioadmin
     path_style: bool           # True for MinIO
     data_prefix: str           # e.g. "data/" — DuckLake writes under this
+    # Where STS AssumeRole lives. Sentinels:
+    #   None/""  → the S3 endpoint itself (MinIO co-hosts STS; the default)
+    #   "aws"    → https://sts.{region}.amazonaws.com (real AWS, regional)
+    #   "none"   → the backend has NO STS (Hetzner). Credential vending is
+    #              replaced by remote signing (REST clients) / static keys +
+    #              bucket policies (DuckLake-direct clients).
+    #   any URL  → used verbatim (GovCloud, VPC endpoints, LocalStack)
+    sts_endpoint: str | None = None
+    # RoleArn passed to AssumeRole. MinIO accepts any non-empty string; real
+    # AWS requires an existing role whose trust policy allows the root/base
+    # credentials to sts:AssumeRole it.
+    sts_role_arn: str = "arn:aws:iam::duckicelake:role/IcebergClient"
+    # Upper clamp for vended-credential DurationSeconds. AWS additionally
+    # enforces the role's MaxSessionDuration by REJECTING (not clamping)
+    # larger values — sts.py retries once at 3600 on that rejection.
+    sts_max_duration: int = 43200
+    # Hetzner project id ("p<id>" without the p) — only used by the
+    # bucket-policy generator (duckicelake.hetzner_policy).
+    hetzner_project_id: str = ""
+
+    @property
+    def sts_disabled(self) -> bool:
+        """True when the backend has no STS at all (sts_endpoint = "none")."""
+        return (self.sts_endpoint or "").strip().lower() == "none"
+
+    def resolved_sts_endpoint(self) -> str:
+        """The endpoint URL for the boto3 STS client. Callers must check
+        `sts_disabled` first."""
+        raw = (self.sts_endpoint or "").strip()
+        if not raw:
+            return self.endpoint
+        if raw.lower() == "aws":
+            return f"https://sts.{self.region}.amazonaws.com"
+        return raw
 
     @property
     def host(self) -> str:
@@ -229,6 +263,15 @@ class Settings:
     # behavior (a governance error never breaks a read). Trade-off when on:
     # a governance-sidecar outage takes governed reads down with it.
     governance_fail_closed: bool = False
+    # External base URL of the proxy (scheme://host[:port]). Used as the
+    # `s3.signer.uri` handed to Iceberg clients in no-STS (remote signing)
+    # mode. Unset → fall back to each request's own base URL, which is right
+    # whenever clients reach the proxy directly (no reverse proxy rewriting
+    # Host).
+    public_url: str | None = None
+    # TTL (seconds) for the signer's per-worker policy-plan cache. Bounds PG
+    # load under ranged-GET storms; also bounds revocation staleness.
+    signer_cache_ttl: float = 10.0
     # Password for the owning PG role. Optional: dev uses trust auth and
     # production can use cert/ident, but managed Postgres (RDS, Supabase,
     # Neon, Cloud SQL, a password-protected container) needs scram with a
@@ -288,6 +331,14 @@ def load_settings() -> Settings:
         root_secret_key=os.environ.get("DUCKICELAKE_S3_ROOT_SECRET", "minioadmin"),
         path_style=os.environ.get("DUCKICELAKE_S3_PATH_STYLE", "1") == "1",
         data_prefix=os.environ.get("DUCKICELAKE_S3_PREFIX", "data/"),
+        sts_endpoint=os.environ.get("DUCKICELAKE_STS_ENDPOINT") or None,
+        sts_role_arn=os.environ.get(
+            "DUCKICELAKE_STS_ROLE_ARN",
+            "arn:aws:iam::duckicelake:role/IcebergClient"),
+        sts_max_duration=int(
+            os.environ.get("DUCKICELAKE_STS_MAX_DURATION", "43200")),
+        hetzner_project_id=os.environ.get(
+            "DUCKICELAKE_HETZNER_PROJECT_ID", ""),
     )
     return Settings(
         pg_host=os.environ.get("DUCKICELAKE_PG_HOST", str(REPO_ROOT / ".pgsock")),
@@ -306,4 +357,7 @@ def load_settings() -> Settings:
             "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(
             "DUCKICELAKE_READER_GROUP_ROLE", "duckicelake_reader"),
+        public_url=os.environ.get("DUCKICELAKE_PUBLIC_URL") or None,
+        signer_cache_ttl=float(
+            os.environ.get("DUCKICELAKE_SIGNER_CACHE_TTL", "10.0")),
     )

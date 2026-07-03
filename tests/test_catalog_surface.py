@@ -108,6 +108,15 @@ def test_set_and_get_properties(client):
     props2 = client.get(f"/v1/lake/namespaces/{ns}/tables/t").json()["metadata"]["properties"]
     assert props2.get("owner") == "ci"
 
+    # The commit landed in the governance audit trail (MISSING.md gap:
+    # data commits used to be log.info-only).
+    audit = client.get("/v1/lake/governance/audit").json()["entries"]
+    row = next(e for e in audit
+               if e.get("operation") == "commit_table"
+               and e.get("object") == f"{ns}.t")
+    assert row["decision"] == "ok"
+    assert sorted(row["detail"]["properties_set"]) == ["owner", "retention"]
+
     client.delete(f"/v1/lake/namespaces/{ns}/tables/t?purgeRequested=true")
     client.delete(f"/v1/lake/namespaces/{ns}")
 

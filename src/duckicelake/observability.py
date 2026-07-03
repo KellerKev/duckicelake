@@ -108,6 +108,12 @@ MATERIALIZE_LATENCY = Histogram(
     ["cache"],      # "hit", "miss"
 )
 
+S3_SIGN_TOTAL = Counter(
+    "duckicelake_s3_sign_total",
+    "Remote-signing requests, by decision",
+    ["decision"],   # "signed" or a sign_denied_* reason
+)
+
 CACHE_SIZE = Gauge(
     "duckicelake_metadata_cache_size",
     "In-process metadata cache occupancy",

@@ -147,6 +147,113 @@ Lifecycle rule suggestions (AWS S3):
 - Non-current Parquet versions (if versioning is on): delete at 30 days.
 - Table prefix stays permanent; DROP TABLE with `purgeRequested=true` cleans it explicitly.
 
+## Hetzner Object Storage
+
+Hetzner is S3-compatible but has **no STS** — there is no way to mint
+scoped temporary credentials. duckicelake compensates with two tiers,
+switched on by `sts_endpoint = "none"`:
+
+```toml
+[s3]
+endpoint   = "https://fsn1.your-objectstorage.com"   # regional endpoint
+region     = "fsn1"        # pick ONE value and keep proxy + clients on it —
+                           # the remote signer stamps it into every SigV4
+                           # scope ("auto" also works, but don't mix)
+bucket     = "my-lakehouse"
+root_key   = "…"           # project S3 credentials (Console → Security)
+root_secret = "…"
+path_style = true
+
+[sts]
+endpoint = "none"
+
+[hetzner]
+project_id = "123456"      # project owning the S3 CREDENTIALS
+
+public_url = "https://catalog.example.com"   # becomes s3.signer.uri
+```
+
+**Tier 1 — remote signing (REST engines; the airtight tier).** With STS
+disabled, LoadTable answers `X-Iceberg-Access-Delegation` with the
+Iceberg REST remote-signing protocol instead of credentials: clients
+POST each S3 request to `/v1/{prefix}/aws/s3/sign`, the proxy authorizes
+the exact object + S3 method against governance (file-layer-masked
+principals only reach their current masked-sig prefix; base prefixes are
+denied and audited) and SigV4-signs with the root keys. Root keys never
+leave the proxy; revoking a policy takes effect on the *next request* —
+strictly better than an outstanding STS token. Verified end-to-end
+against MinIO in `tests/test_remote_signing.py`, including with
+PyIceberg's own signer class.
+
+Engines matrix:
+
+| Engine | Remote signing | Fallback |
+|---|---|---|
+| PyIceberg (`py-io-impl` = FsspecFileIO, needs `s3fs`) | ✅ | — |
+| Spark / Trino / Flink (Java S3FileIO) | ✅ (native) | — |
+| PyIceberg with PyArrow FileIO | ❌ (no signer support) | switch to fsspec |
+| DuckDB iceberg extension | ❌ | static-key tier |
+| DuckDB DuckLake-direct (httpfs) | ❌ | static-key tier |
+
+**Tier 2 — static keys + bucket policies (DuckLake-direct; coarse).**
+Hetzner bucket policies can target a **specific access key** as
+Principal (`arn:aws:iam:::user/p<project_id>:<access_key>`). Per
+principal: create a key in the Hetzner Console, register it
+(`POST /v1/{prefix}/governance/static-s3-keys` — key id only; the
+client keeps its secret), then generate + apply the bucket policy:
+
+```bash
+python -m duckicelake.hetzner_policy          # dry run, prints JSON
+python -m duckicelake.hetzner_policy --apply  # put_bucket_policy
+```
+
+The generated policy mirrors what an STS session policy would have
+carried: Allow ListBucket/GetObject on the principal's readable
+prefixes, **Deny** on file-layer-masked base prefixes, Allow on their
+current masked-sig prefix. `ducklake-credentials` returns the key id +
+endpoint config (decision `static_key_bucket_policy`); principals
+without a key fail closed (`error_no_sts`), and file-layer-masked
+principals always fail closed on this tier (`error_no_sts_masked`) —
+mask signatures rotate and a stale bucket policy must never expose base
+bytes.
+
+**Limits of tier 2 (be honest with yourself):** keys are provisioned
+manually; the policy must be re-applied after governance changes (the
+proxy logs a staleness warning on policy resyncs); the ~20 KB
+bucket-policy ceiling bounds you to dozens of principals; a restrictive
+policy can break the Hetzner Console's own bucket browser.
+
+Hetzner gotchas the code already handles or you should know:
+
+- **botocore ≥ 1.36 default checksums** (`x-amz-checksum-*`,
+  `aws-chunked`) are rejected with a *misleading* `AccessDenied`. The
+  proxy's own S3 clients set `request_checksum_calculation =
+  "when_required"` (`s3util.py`). **Client-side write paths** (PyIceberg
+  writers) must do the same: set `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`
+  and `AWS_RESPONSE_CHECKSUM_VALIDATION=when_required` in the client env.
+- **No `ListBuckets`** — even valid keys get `AccessDenied`; bootstrap
+  never calls it and tolerates pre-provisioned buckets.
+- **Fresh keys propagate slowly** (seconds) — bootstrap retries
+  `head_bucket` with backoff before giving up.
+- **Keys are project-scoped**: any key can reach every bucket in its
+  project (before bucket policies). Dedicate one Hetzner project per
+  deployment — one leaked key is a whole-project compromise.
+- `suppress_root_creds=0` in no-STS mode hands root keys to any
+  principal without a static key. The server logs a loud startup
+  warning; dev only.
+
+**Live-verified (2026-07-03, fsn1):** bootstrap against a
+pre-provisioned bucket, DuckDB httpfs TLS writes, remote-signed GET and
+PUT (Ceph RGW accepts the UNSIGNED-PAYLOAD signatures), file-layer
+masked exports materialized on Hetzner with base-byte denial and
+masked-byte reads through the signer, and fail-closed no-STS vending.
+Two caveats: applying a generated **bucket policy has not been
+exercised live** (verify the per-key Principal enforcement with your
+real project id before relying on the static-key tier), and the
+botocore checksum rejection did not reproduce on `put_object` during
+the live run — Hetzner may have added checksum support — but keep
+`when_required` (correct everywhere). See `MISSING.md`.
+
 ## Auth / RBAC
 
 Production defaults:

@@ -6,7 +6,7 @@ another's — the account boundary enforced through the Iceberg REST surface.
 """
 from __future__ import annotations
 
-import boto3
+from duckicelake import s3util
 import psycopg
 import pytest
 
@@ -51,9 +51,7 @@ def provisioned(client, settings):
     # schema is correct and re-run safe. S3 objects under the tenant prefix are
     # cleaned (harmless, keeps MinIO tidy).
     s3 = settings.s3
-    cl = boto3.client("s3", endpoint_url=s3.endpoint, region_name=s3.region,
-                      aws_access_key_id=s3.root_access_key,
-                      aws_secret_access_key=s3.root_secret_key)
+    cl = s3util.s3_client(s3)
     for p in cl.get_paginator("list_objects_v2").paginate(
         Bucket=s3.bucket, Prefix=TENANT["data_prefix"]
     ):

@@ -126,6 +126,25 @@ class CatalogRegistry:
         ref = CatalogRef(catalog_id, data_prefix=row[1], metadata_schema=row[0])
         return ref, row[2]
 
+    def list_refs(self) -> list[tuple[str, CatalogRef]]:
+        """(catalog_id, ref) for every registered catalog, default included.
+        Used by the bare remote-signer route to resolve a catalog from an
+        object key by longest data-prefix match."""
+        out: list[tuple[str, CatalogRef]] = [
+            (self.settings.catalog_name, self.settings.default_catalog_ref())]
+        try:
+            with self._pg() as c, c.cursor() as cur:
+                ensure_catalog_registry_table(cur)
+                rows = cur.execute(
+                    "SELECT catalog_id, metadata_schema, data_prefix "
+                    "FROM public.duckicelake_catalog").fetchall()
+        except Exception:
+            return out
+        for cid, meta_schema, data_prefix in rows:
+            out.append((cid, CatalogRef(cid, data_prefix=data_prefix,
+                                        metadata_schema=meta_schema)))
+        return out
+
     # ---- lifecycle -----------------------------------------------------
     def register_default(self) -> CatalogContext:
         """Build (unconnected) the default catalog context and register it, so

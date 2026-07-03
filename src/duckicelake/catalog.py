@@ -20,11 +20,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-import boto3
 import duckdb
 import psycopg
 from psycopg_pool import ConnectionPool
 
+from . import s3util
 from .config import CatalogRef, Settings
 
 
@@ -210,14 +210,7 @@ class DuckLakeCatalog:
         # Shared boto3 S3 client — thread-safe, pools its own HTTPS conns.
         # Building it per-request (the old path) re-did botocore session
         # init + TLS handshakes for every LoadTable.
-        s3 = self.settings.s3
-        self._s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.endpoint,
-            region_name=s3.region,
-            aws_access_key_id=s3.root_access_key,
-            aws_secret_access_key=s3.root_secret_key,
-        )
+        self._s3_client = s3util.s3_client(self.settings.s3)
 
     def _build_duckdb_conn(self) -> duckdb.DuckDBPyConnection:
         conn = duckdb.connect(":memory:")

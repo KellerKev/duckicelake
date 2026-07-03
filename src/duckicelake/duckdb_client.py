@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import sys
 
-import boto3
+from duckicelake import s3util
 import duckdb
 import httpx
 
@@ -36,22 +36,14 @@ def hr(title: str) -> None:
 
 
 def _purge_bucket(s3) -> None:
-    c = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    c = s3util.s3_client(s3)
     for p in c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket):
         for o in p.get("Contents", []):
             c.delete_object(Bucket=s3.bucket, Key=o["Key"])
 
 
 def _list_keys(s3) -> list[str]:
-    c = boto3.client(
-        "s3", endpoint_url=s3.endpoint, region_name=s3.region,
-        aws_access_key_id=s3.root_access_key,
-        aws_secret_access_key=s3.root_secret_key,
-    )
+    c = s3util.s3_client(s3)
     keys = []
     for p in c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket):
         keys.extend(o["Key"] for o in p.get("Contents", []))
@@ -221,8 +213,7 @@ def main() -> int:
     hr("Raw-Avro check: manifests encode stats + row_id correctly")
     from fastavro import reader
     import io
-    s3_client = boto3.client("s3", endpoint_url=s3.endpoint, region_name=s3.region,
-                             aws_access_key_id=s3.root_access_key, aws_secret_access_key=s3.root_secret_key)
+    s3_client = s3util.s3_client(s3)
     list_key = md["snapshots"][-1]["manifest-list"].replace(f"s3://{s3.bucket}/", "")
     for mref in reader(io.BytesIO(s3_client.get_object(Bucket=s3.bucket, Key=list_key)["Body"].read())):
         kind = "DATA" if mref["content"] == 0 else "DELETES"
@@ -544,10 +535,7 @@ def main() -> int:
         assert any(o in {"append", "delete", "overwrite"} for o in ops)
 
         # metadata versioning: version-hint.text and vN files on S3
-        s3c = boto3.client("s3", endpoint_url=s3.endpoint,
-                           aws_access_key_id=s3.root_access_key,
-                           aws_secret_access_key=s3.root_secret_key,
-                           region_name=s3.region)
+        s3c = s3util.s3_client(s3)
         vh = s3c.get_object(Bucket=s3.bucket, Key=f"data/analytics/orders/metadata/version-hint.text")["Body"].read().decode()
         keys = {o["Key"].rsplit("/",1)[-1] for p in s3c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket, Prefix="data/analytics/orders/metadata/") for o in p.get("Contents",[])}
         v_files = sorted(k for k in keys if k.startswith("v") and k.endswith(".metadata.json"))
