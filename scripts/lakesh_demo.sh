@@ -15,13 +15,13 @@
 #
 # Tunables:
 #   BASE=http://127.0.0.1:8181     proxy base URL
-#   S3_ENDPOINT=http://127.0.0.1:9100   object store the proxy serves (MUST match)
+#   S3_ENDPOINT=http://127.0.0.1:9000   object store the proxy serves (MUST match)
 #   PRINCIPAL=bob                  principal to resolve masking for
 #   SLEEP=10                       seconds between steps (0 to go fast)
 set -uo pipefail
 
 BASE="${BASE:-http://127.0.0.1:8181}"
-S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9100}"
+S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9000}"
 PRINCIPAL="${PRINCIPAL:-bob}"
 SLEEP="${SLEEP:-10}"
 WAREHOUSE="lake"

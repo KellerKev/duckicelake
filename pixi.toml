@@ -39,6 +39,12 @@ smoke = "python -m duckicelake.smoke"
 # Full-fat DuckDB-as-Iceberg-client test
 duckdb-client = "python -m duckicelake.duckdb_client"
 
+# Runnable demos (proxy must be up: `pixi run serve`). SLEEP=0 skips pauses.
+demo-governance = "scripts/governance_demo.sh"   # 10-step REST governance walkthrough
+demo-sql-proof  = "python scripts/sql_proof.py"  # masked-vs-unmasked side by side
+demo-lakesh     = "scripts/lakesh_demo.sh"       # lakesh: REST read vs vended masked view
+demo            = { depends-on = ["demo-governance", "demo-sql-proof"] }
+
 # Integration test suite
 test = "pytest -xvs tests/"
 

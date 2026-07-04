@@ -63,6 +63,14 @@ post "$BASE/v1/lake/namespaces/analytics/tables" \
      {"id":1,"name":"id","required":true,"type":"long"},
      {"id":2,"name":"email","required":false,"type":"string"},
      {"id":3,"name":"country","required":false,"type":"string"}]}}' || true
+
+# Seed 3 rows via DuckLake-direct (idempotent) so the lakesh demo below has
+# real bytes to mask. Uses the same eager-materialise path a client would.
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+if command -v pixi >/dev/null 2>&1; then
+  ( cd "$REPO" && pixi run --quiet python scripts/seed_events.py ) \
+    2>&1 | grep -vE "WARN|deprecated|[│╭╰·]|platforms =|replace this with" || true
+fi
 pause
 
 # ---- 2. tag the email column ---------------------------------------------
