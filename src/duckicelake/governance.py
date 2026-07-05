@@ -1037,6 +1037,50 @@ class GovernanceStore:
 
     # -- effective policy view -------------------------------------------
 
+    def governance_stamp(self) -> str:
+        """Cheap global governance freshness token: max(created_at) across the
+        policy/tag tables. Changes on any policy ADD — so a credential cache
+        keyed on it never serves cleartext for a newly-added mask. A DELETE
+        leaves it unchanged (brief over-masking until TTL/next add — fail-safe)."""
+        with self.catalog.pg_cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(max(created_at)::text, '')
+                FROM (
+                    SELECT created_at FROM public.duckicelake_object_tag
+                    UNION ALL SELECT created_at FROM public.duckicelake_policy_attachment
+                    UNION ALL SELECT created_at FROM public.duckicelake_masking_policy
+                    UNION ALL SELECT created_at FROM public.duckicelake_row_access_policy
+                ) x
+                """
+            )
+            return cur.fetchone()[0]
+
+    def tables_with_policies(self, schema: str) -> list[str]:
+        """Tables in `schema` carrying at least one policy attachment — via a
+        tagged column whose tag is attached, or a direct column/table
+        attachment. A SUPERSET (plan_for still applies role bypass); lets the
+        catalog-wide masking vend scan only these instead of every table."""
+        with self.catalog.pg_cursor() as cur:
+            cur.execute(
+                """
+                SELECT ot.object_name
+                FROM public.duckicelake_object_tag ot
+                JOIN public.duckicelake_policy_attachment pa
+                  ON pa.target_kind = 'tag'
+                 AND pa.tag_ns = ot.tag_ns AND pa.tag_name = ot.tag_name
+                WHERE ot.schema_name = %s AND COALESCE(ot.object_name, '') <> ''
+                UNION
+                SELECT pa.object_name
+                FROM public.duckicelake_policy_attachment pa
+                WHERE pa.schema_name = %s
+                  AND COALESCE(pa.object_name, '') <> ''
+                  AND pa.target_kind IN ('column', 'table')
+                """,
+                (schema, schema),
+            )
+            return [r[0] for r in cur.fetchall()]
+
     def effective_policies(self, *, principal: str, schema: str, table: str) -> dict:
         """Fetch the rows needed to derive the policy set for principal +
         table, then delegate to the pure `resolve_effective_policies`."""

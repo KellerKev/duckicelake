@@ -1115,6 +1115,14 @@ def _arm_default_rls() -> bool:
         return False
 
 
+# Per-(catalog, principal, namespace, table) credential cache: skips the reader-
+# role provisioning + masking materialization + audit write when governance is
+# unchanged (keyed on governance_stamp) within a short TTL. Bounds PG load under
+# concurrent query bursts; a policy ADD invalidates it immediately (cleartext-safe).
+_CRED_CACHE: dict = {}
+_CRED_TTL = 30.0
+
+
 @app.get("/v1/{prefix}/namespaces/{namespace}/ducklake-credentials")
 def ducklake_credentials(
     prefix: str,
@@ -1161,6 +1169,17 @@ def ducklake_credentials(
     sub = claims.get("sub") or "anonymous"
     if principal and not auth_cfg.enabled:
         sub = principal
+
+    # Credential cache lookup (governance-stamp keyed; see _CRED_CACHE above).
+    _now = time.time()
+    _ck = (ctx.catalog_id, sub, namespace, table or "")
+    try:
+        _stamp = governance_store.governance_stamp()
+    except Exception:
+        _stamp = None
+    _hit = _CRED_CACHE.get(_ck)
+    if _hit is not None and _stamp is not None and _hit[0] > _now and _hit[1] == _stamp:
+        return dict(_hit[2])
 
     # Per-catalog ATTACH: alias = the catalog id, DATA_PATH = the catalog's S3
     # prefix, and METADATA_SCHEMA so the client's ducklake_* resolve to THIS
@@ -1327,7 +1346,7 @@ def ducklake_credentials(
             # File-layer tables are skipped here; their base bytes stay S3-denied
             # below (airtight), so omitting their view can't leak.
             schemas: list[str] = []
-            for _, tbl in catalog.list_tables(ns):
+            for tbl in governance_store.tables_with_policies(ns[0]):
                 tplan = policy_engine.plan_for(
                     principal=sub, roles=roles, schema=ns[0], table=tbl)
                 if tplan.is_empty() or tplan.file_layer:
@@ -1534,6 +1553,8 @@ def ducklake_credentials(
     except Exception:
         log.exception("ducklake-credentials audit failed")
 
+    if _stamp is not None:
+        _CRED_CACHE[_ck] = (_now + _CRED_TTL, _stamp, dict(out))
     return out
 
 
