@@ -47,7 +47,7 @@ from .pg_rls import (
     provision_principal_role,
     rearm_rls_if_needed,
 )
-from .policies import PolicyEngine, apply_plan_to_metadata, mask_signature
+from .policies import PolicyEngine, _masked_projection, apply_plan_to_metadata, mask_signature
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
 from .notify import run_listener as run_notify_listener
@@ -1187,6 +1187,14 @@ def ducklake_credentials(
         "file_layer": False,
         "pg_role": None,
         "pg_valid_until": None,
+        # Governed distributed-scan spec (?table only): a map-reduce reader that
+        # scans Parquet file subsets in parallel must NOT bypass masking. For the
+        # cooperative/view tier we vend the masked projection + row filter to
+        # apply over read_parquet; for the airtight file tier we vend the
+        # pre-masked export files to read directly (base bytes stay denied).
+        "mask_projection": None,   # SELECT list to apply over read_parquet, or null
+        "row_filter": None,        # WHERE predicate to apply, or null
+        "scan_files": None,        # explicit file list (file-layer export), or null
     }
 
     # Phase 3a: vend a per-principal RLS-governed reader role instead of
@@ -1275,6 +1283,20 @@ def ducklake_credentials(
                     )
                 view = masking_view_manager.ensure_view_for_plan(
                     ns, table, plan, export=export)
+                # Governed distributed-scan spec: file-layer -> the pre-masked
+                # export files (base bytes stay S3-denied); view/cooperative tier
+                # -> the masked projection + row filter to apply over read_parquet.
+                if plan.file_layer:
+                    if export is not None:
+                        out["scan_files"] = [
+                            f"s3://{settings.s3.bucket}/{k}"
+                            for k, _ in masked_export_manager.list_export_files(export.prefix)
+                        ]
+                else:
+                    _masks = {m.column: m.mask_expr for m in plan.masks}
+                    out["mask_projection"] = (
+                        _masked_projection(plan.columns, _masks) if _masks else None)
+                    out["row_filter"] = plan.row_filter
                 if view:
                     decision = "masked_file_layer" if export else "masked"
                     out["masked_view"] = f"{ns[0]}.{view}"
