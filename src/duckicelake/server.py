@@ -1317,6 +1317,36 @@ def ducklake_credentials(
                     # plan demands masking but no view could be materialized
                     # — fail-open, flag it in the audit trail
                     decision = "error_unmasked"
+        else:
+            # Catalog-wide transparent masking: a DuckLake-direct ATTACH is
+            # catalog-wide, so mask EVERY view-tier-policied table in the
+            # namespace and route them all through one search_path. Unqualified
+            # refs in arbitrary / multi-table queries then resolve to masked
+            # views — the whole-namespace analogue of ?table, so the single-node
+            # reader (which can't name one table) no longer reads cleartext.
+            # File-layer tables are skipped here; their base bytes stay S3-denied
+            # below (airtight), so omitting their view can't leak.
+            schemas: list[str] = []
+            for _, tbl in catalog.list_tables(ns):
+                tplan = policy_engine.plan_for(
+                    principal=sub, roles=roles, schema=ns[0], table=tbl)
+                if tplan.is_empty() or tplan.file_layer:
+                    continue
+                if masking_view_manager.ensure_view_for_plan(ns, tbl, tplan) is None:
+                    continue
+                sch = masking_view_manager.ensure_transparent_schema(ns, tbl, tplan)
+                if sch and sch not in schemas:
+                    schemas.append(sch)
+                masked_cols.extend(tplan.masked_columns)
+                applied.extend(tplan.applied_policies)
+            if schemas and settings.transparent_masking:
+                out["transparent"] = True
+                out["post_attach_sql"] = [
+                    "SET search_path = '"
+                    + ",".join(f"{alias}.{s}" for s in schemas)
+                    + f",{alias}.{ns[0]}'"
+                ]
+                decision = "masked"
     except Exception:
         log.exception("ducklake-credentials governance failed for %s.%s — "
                       "fail-open only for the cooperative tier", ns[0], table)
