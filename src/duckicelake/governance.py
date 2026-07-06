@@ -35,11 +35,20 @@ log = logging.getLogger("duckicelake.governance")
 class StaticKey:
     """A per-principal storage credential for no-STS backends. The proxy
     only requires `access_key_id` (it becomes a bucket-policy Principal);
-    `secret_access_key` is optionally stored for turnkey vending."""
+    `secret_access_key` is optionally stored for turnkey vending.
+
+    `confined=True` attests that the bucket policy keeps this key confined —
+    Deny on every file-layer table's base (raw) prefix + Allow only the current
+    masked-sig export prefix (kept current by `python -m
+    duckicelake.hetzner_policy`). Only then is it safe to vend to a file-layer-
+    masked principal: raw bytes are physically unreadable, so the masked export
+    is served instead of failing closed. Mint such keys in a DIFFERENT project
+    (cross-project → positive Allow-only confinement) for the strongest form."""
     principal: str
     access_key_id: str
     secret_access_key: str | None = None
     note: str | None = None
+    confined: bool = False
 
 
 # Object kinds a tag / policy can target.
@@ -253,6 +262,13 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
             created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
+    # `confined` attests the bucket policy denies base prefixes + allows only
+    # the masked-sig export — lets a file-layer-masked principal be vended this
+    # key instead of failing closed. Default false = pre-existing fail-closed.
+    cur.execute(
+        "ALTER TABLE public.duckicelake_static_s3_key "
+        "ADD COLUMN IF NOT EXISTS confined BOOLEAN NOT NULL DEFAULT false"
+    )
     # --- audit log -------------------------------------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.duckicelake_governance_audit (
@@ -988,20 +1004,21 @@ class GovernanceStore:
 
     def set_static_key(self, principal: str, access_key_id: str,
                        secret: str | None = None,
-                       note: str | None = None) -> None:
+                       note: str | None = None, confined: bool = False) -> None:
         with self.catalog.pg_cursor() as cur:
             ensure_governance_sidecars(cur)
             cur.execute(
                 """
                 INSERT INTO public.duckicelake_static_s3_key
-                    (principal, access_key_id, secret_access_key, note)
-                VALUES (%s, %s, %s, %s)
+                    (principal, access_key_id, secret_access_key, note, confined)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (principal) DO UPDATE
                     SET access_key_id = EXCLUDED.access_key_id,
                         secret_access_key = EXCLUDED.secret_access_key,
-                        note = EXCLUDED.note
+                        note = EXCLUDED.note,
+                        confined = EXCLUDED.confined
                 """,
-                (principal, access_key_id, secret, note),
+                (principal, access_key_id, secret, note, confined),
             )
 
     def delete_static_key(self, principal: str) -> bool:
@@ -1016,24 +1033,24 @@ class GovernanceStore:
         with self.catalog.pg_cursor(autocommit=False) as cur:
             ensure_governance_sidecars(cur)
             cur.execute(
-                "SELECT access_key_id, secret_access_key, note "
+                "SELECT access_key_id, secret_access_key, note, confined "
                 "FROM public.duckicelake_static_s3_key WHERE principal = %s",
                 (principal,))
             row = cur.fetchone()
         if row is None:
             return None
         return StaticKey(principal=principal, access_key_id=row[0],
-                         secret_access_key=row[1], note=row[2])
+                         secret_access_key=row[1], note=row[2], confined=row[3])
 
     def list_static_keys(self) -> "list[StaticKey]":
         with self.catalog.pg_cursor(autocommit=False) as cur:
             ensure_governance_sidecars(cur)
             cur.execute(
-                "SELECT principal, access_key_id, secret_access_key, note "
+                "SELECT principal, access_key_id, secret_access_key, note, confined "
                 "FROM public.duckicelake_static_s3_key ORDER BY principal")
             rows = cur.fetchall()
         return [StaticKey(principal=r[0], access_key_id=r[1],
-                          secret_access_key=r[2], note=r[3]) for r in rows]
+                          secret_access_key=r[2], note=r[3], confined=r[4]) for r in rows]
 
     # -- effective policy view -------------------------------------------
 

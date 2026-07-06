@@ -1343,17 +1343,28 @@ def ducklake_credentials(
             # refs in arbitrary / multi-table queries then resolve to masked
             # views — the whole-namespace analogue of ?table, so the single-node
             # reader (which can't name one table) no longer reads cleartext.
-            # File-layer tables are skipped here; their base bytes stay S3-denied
-            # below (airtight), so omitting their view can't leak.
+            # File-layer tables are routed to their masked EXPORT view here too
+            # (the export is materialized + a confined key can read it) so the
+            # single-node reader gets masked data instead of a base read that
+            # the bucket policy denies; the raw base bytes stay S3-denied
+            # (airtight). A file-layer table whose export can't materialize is
+            # skipped — raw stays denied (fail-closed, not a leak).
             schemas: list[str] = []
             for tbl in governance_store.tables_with_policies(ns[0]):
                 tplan = policy_engine.plan_for(
                     principal=sub, roles=roles, schema=ns[0], table=tbl)
-                if tplan.is_empty() or tplan.file_layer:
+                if tplan.is_empty():
                     continue
-                if masking_view_manager.ensure_view_for_plan(ns, tbl, tplan) is None:
+                exp = None
+                if tplan.file_layer:
+                    exp = (masked_export_manager.ensure_export_for_plan(ns, tbl, tplan)
+                           or masked_export_manager.current_export(
+                               ns, tbl, mask_signature(tplan)))
+                    if exp is None:
+                        continue
+                if masking_view_manager.ensure_view_for_plan(ns, tbl, tplan, export=exp) is None:
                     continue
-                sch = masking_view_manager.ensure_transparent_schema(ns, tbl, tplan)
+                sch = masking_view_manager.ensure_transparent_schema(ns, tbl, tplan, export=exp)
                 if sch and sch not in schemas:
                     schemas.append(sch)
                 masked_cols.extend(tplan.masked_columns)
@@ -1462,11 +1473,31 @@ def ducklake_credentials(
             }
             decision = ("static_key_bucket_policy"
                         if decision == "ok" else decision)
+        elif entry is not None and masked_principal and entry.confined:
+            # Operator-attested confined key: the bucket policy Denies every
+            # file-layer base (raw) prefix + Allows only the current masked-sig
+            # export (kept current by `python -m duckicelake.hetzner_policy`).
+            # Safe to vend — the raw bytes are physically unreadable, so the
+            # masked export is served instead of failing closed. This is what
+            # makes file-layer masking READABLE and airtight in no-STS mode.
+            out["s3"] = {
+                "endpoint": s3.endpoint,
+                "region": s3.region,
+                "path-style-access": s3.path_style,
+                "access-key-id": entry.access_key_id,
+                "secret-access-key": entry.secret_access_key,
+                "session-token": None,
+                "expiration": None,
+                "static-key": True,
+                "enforcement": "bucket-policy-confined",
+            }
+            decision = ("static_key_masked_confined"
+                        if decision == "ok" else decision)
         elif entry is not None and masked_principal:
-            # A static key can only serve a masked principal if the bucket
-            # policy already carves them to the CURRENT masked sig prefix —
-            # unverifiable at vend time, and sig rotation makes it stale.
-            # Fail closed rather than risk base-byte reads.
+            # Unconfined static key: can't guarantee the base bytes are denied,
+            # and sig rotation makes it stale. Fail closed rather than risk
+            # base-byte reads. Register the key `confined=true` (+ keep the
+            # bucket policy current) to serve masked principals instead.
             out["s3"] = None
             decision = "error_no_sts_masked"
             _audit_credentials_denied(ctx, sub, ns, table, decision)

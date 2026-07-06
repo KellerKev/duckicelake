@@ -106,6 +106,10 @@ class StaticS3KeyRequest(BaseModel):
     # project-scoped storage secret. Recommended: omit; clients keep it.
     secret_access_key: str | None = Field(default=None, alias="secret-access-key")
     note: str | None = None
+    # Attests the bucket policy confines this key (Deny base prefixes + Allow
+    # only the masked-sig export) so it can be vended to file-layer-masked
+    # principals instead of failing closed. See StaticKey.confined.
+    confined: bool = False
     model_config = {"populate_by_name": True}
 
 
@@ -312,10 +316,12 @@ def build_governance_router(
     def set_static_s3_key(prefix: str, req: StaticS3KeyRequest, request: Request):
         _check_prefix(prefix)
         store.set_static_key(req.principal, req.access_key_id,
-                             secret=req.secret_access_key, note=req.note)
+                             secret=req.secret_access_key, note=req.note,
+                             confined=req.confined)
         return {"status": "set", "principal": req.principal,
                 "access-key-id": req.access_key_id,
-                "has-secret": req.secret_access_key is not None}
+                "has-secret": req.secret_access_key is not None,
+                "confined": req.confined}
 
     @router.get("/static-s3-keys", status_code=200)
     def list_static_s3_keys(prefix: str):
