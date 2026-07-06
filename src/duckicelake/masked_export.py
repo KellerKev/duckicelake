@@ -217,8 +217,14 @@ class MaskedExportManager:
                 tok = uuid.uuid4().hex[:8]
                 prefix = (f"{s3.masked_sig_prefix(ns[0], table, sig, self.catalog.ref.data_prefix)}"
                           f"snap-{snap}-{tok}/")
+                # Qualify against the catalog the export connection actually
+                # ATTACHes (ref.catalog_name), NOT the global default
+                # settings.catalog_name — governance is authored on the default
+                # catalog but data lives in per-account catalogs, so the export
+                # must read from that one (else "Catalog 'lake' does not exist"
+                # and file-layer silently falls back to cooperative).
                 select = build_masked_export_select(
-                    plan, catalog_name=self.settings.catalog_name,
+                    plan, catalog_name=self.catalog.ref.catalog_name,
                     snapshot_id=snap,
                 )
                 # Iceberg readers map parquet columns by FIELD ID, not name
