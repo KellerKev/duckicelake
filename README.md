@@ -22,8 +22,7 @@ the moment you hand out storage credentials, the catalog is out of the
 loop entirely. With LLM agents joining the query path, "please don't look
 at the PII" is not a security model.
 
-duckicelake closes that hole, and solves two more hard problems while it's
-at it:
+duckicelake closes that hole, along with two related ones:
 
 1. **Masking that survives any engine.** Policies are enforced down to the
    bytes on object storage — an engine that never sends you SQL still
@@ -81,9 +80,9 @@ That means the mask holds even for engines that never execute your SQL:
 - and a DuckLake-direct DuckDB session gets a reader role whose row-level
   security hides the base files entirely.
 
-To our knowledge no other open catalog does this: catalog-level masking
-(view rewriting) is common; **masked physical copies + shadow metadata +
-credential scoping is not.** And the cheap tier is still there — policies
+No other open catalog we've found does this. Catalog-level masking (view
+rewriting) is common; **masked physical copies + shadow metadata +
+credential scoping is not.** The cheap tier is still there — policies
 default to catalog-level (masking views + metadata signals, no extra
 storage) and you opt tables into byte-level per policy.
 
@@ -137,8 +136,8 @@ The no-STS path was **verified against live Hetzner Object Storage
 driving its own `S3V4RestSigner` against the proxy, file-layer masked
 exports materialised on Hetzner with base-byte denial, and the generated
 bucket policy enforced — details in [OPERATIONS.md](OPERATIONS.md) and
-[MISSING.md](MISSING.md). (AWS: same code path, unit-tested, not yet run
-against live AWS — we say so rather than guess.)
+[MISSING.md](MISSING.md). AWS runs the same code path but hasn't been
+exercised against live AWS yet; it's unit-tested only.
 
 ### 3 · `INSERT INTO` your lakehouse
 
@@ -159,9 +158,9 @@ a startup catch-up scan ([`notify.py`](src/duckicelake/notify.py)).
 
 ![architectural proof — same data via Iceberg REST and DuckLake direct](demo_videos/duckicelake-demo_with_code.gif)
 
-The recording ends on the identity check that makes this trustworthy:
-`DuckLake HEAD == Iceberg current-snapshot-id`, deterministically — no
-random snapshot ids, direct correlation for debugging.
+The recording ends on the identity check: `DuckLake HEAD == Iceberg
+current-snapshot-id`, deterministically. Snapshot ids aren't random, so the
+two systems' state lines up directly when you're debugging.
 
 ## What makes it different
 
@@ -171,7 +170,7 @@ random snapshot ids, direct correlation for debugging.
 | Engine that reads Parquet directly | sees cleartext | sees masked copies; base prefix 403s |
 | Storage credentials | static keys or vendor-specific vending | scoped STS, per-request remote signing, or generated bucket policies — backend's choice |
 | Writes | Iceberg commits only | Iceberg commits **and** plain SQL, converging in ~1s |
-| LLM agents | prompt-level "please behave" | masked + audited **by construction**, read-only MCP front door |
+| LLM agents | prompt-level "please behave" | masked and audited at the catalog; read-only MCP front door |
 | Every read audited | rarely | yes — including credential vends, sign requests, and commits |
 
 Every row of that table is backed by a runnable script or test in this
@@ -269,8 +268,8 @@ Claims above, and where they're proven:
 - **Multi-tenant**: one proxy serves many isolated catalogs (own PG
   schema + S3 prefix + reader roles per tenant, account-scoped routing) —
   [docs/REFERENCE.md](docs/REFERENCE.md#multi-catalog-isolated-per-tenant-catalogs).
-- **An honest gap list.** [MISSING.md](MISSING.md) documents what's *not*
-  done — read it before deploying. We think that list is a feature.
+- **Known gaps, written down.** [MISSING.md](MISSING.md) lists what's
+  *not* done — worth reading before you deploy.
 
 ## Quickstart
 
@@ -341,7 +340,7 @@ governed-read walkthrough: [docs/REFERENCE.md](docs/REFERENCE.md#sample-data--qu
 
 ## Current state
 
-Alpha, and honest about it. Shipped and tested today: the full Iceberg
+Alpha. Shipped and tested today: the full Iceberg
 REST surface (v2 + v3), the hybrid write model, tags/RBAC/masking/row
 policies with both enforcement tiers, per-principal reader roles + RLS,
 credential vending across all three backend dialects, multi-catalog
@@ -365,6 +364,6 @@ Known boundaries — the short version (full list in
 | [docs/REFERENCE.md](docs/REFERENCE.md) | the full reference: [requirements](docs/REFERENCE.md#requirements), [what's in the box](docs/REFERENCE.md#whats-in-the-box), [governance internals](docs/REFERENCE.md#governance-reference), [endpoints](docs/REFERENCE.md#endpoint-summary), [configuration](docs/REFERENCE.md#configuration), [layout](docs/REFERENCE.md#layout), [AWS setup](docs/REFERENCE.md#running-against-real-aws-s3--sts) |
 | [OPERATIONS.md](OPERATIONS.md) | production runbook — HA, pg_hba, backups, Hetzner, PromQL |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | design rationale + Iceberg spec coverage |
-| [MISSING.md](MISSING.md) | the honest gap list |
+| [MISSING.md](MISSING.md) | what's not done yet |
 | [docs/multi_catalog_isolation.md](docs/multi_catalog_isolation.md) | multi-tenant isolation design |
 | [github.com/KellerKev/lakesh](https://github.com/KellerKev/lakesh) | the companion SQL shell + MCP server |
