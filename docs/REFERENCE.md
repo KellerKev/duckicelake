@@ -473,7 +473,11 @@ default**: clients see only vended credentials.
 - **Masked principals never reach base bytes.** Vended creds scope to the
   masked-signature prefix only; namespace-level vends add explicit IAM
   *Deny* on every file-layer table's base prefix — derived from the policy,
-  so a table that was authored but never yet exported is still denied.
+  so a table that was authored but never yet exported is still denied. On
+  **no-STS backends** (Hetzner) there is no scoped session token, so masked-
+  principal creds come from a **confined static key** (bucket policy Deny base
+  + Allow only the masked-sig export); a plain static key fails closed. See
+  [file_layer_no_sts.md](file_layer_no_sts.md).
 - **File-layer masking is current-state only — and says so.** The masked
   Parquet export tracks the live snapshot; there is no per-historical-snapshot
   masked export. A time-travel LoadTable (`?snapshot-id=N` for an older N) on

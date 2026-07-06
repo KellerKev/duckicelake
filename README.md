@@ -139,6 +139,12 @@ bucket policy enforced — details in [OPERATIONS.md](OPERATIONS.md) and
 [MISSING.md](MISSING.md). AWS runs the same code path but hasn't been
 exercised against live AWS yet; it's unit-tested only.
 
+For **file-layer masking on a no-STS backend**, a masked reader needs a
+**confined static key** (registered `confined=true`) so the proxy can vend it
+the masked export instead of failing closed — otherwise the masked table reads
+empty. Setup + guarantees in
+[docs/file_layer_no_sts.md](docs/file_layer_no_sts.md).
+
 ### 3 · `INSERT INTO` your lakehouse
 
 Two write paths, one table, no sync job:
