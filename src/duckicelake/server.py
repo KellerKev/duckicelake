@@ -43,10 +43,13 @@ from .masking_views import (
 from .governance_api import build_governance_router
 from .pg_rls import (
     ensure_rls,
+    ensure_writer_group,
     gc_expired_roles,
     provision_principal_role,
+    provision_writer_role,
     rearm_rls_if_needed,
 )
+from .auth import scope_allows
 from .policies import PolicyEngine, _masked_projection, apply_plan_to_metadata, mask_signature
 from .iceberg import build_table_metadata, schema_to_columns_ddl
 from .materialize import materialize_all
@@ -1131,6 +1134,7 @@ def ducklake_credentials(
     table: str | None = None,
     duration_seconds: int = 3600,
     principal: str | None = None,
+    write: bool = False,
     ctx: CatalogContext = Depends(resolve_catalog),
 ) -> dict[str, Any]:
     """Vend everything a DuckLake-direct DuckDB client needs, with the
@@ -1172,7 +1176,7 @@ def ducklake_credentials(
 
     # Credential cache lookup (governance-stamp keyed; see _CRED_CACHE above).
     _now = time.time()
-    _ck = (ctx.catalog_id, sub, namespace, table or "")
+    _ck = (ctx.catalog_id, sub, namespace, table or "", "w" if write else "r")
     try:
         _stamp = governance_store.governance_stamp()
     except Exception:
@@ -1192,6 +1196,79 @@ def ducklake_credentials(
     # AWS additionally REJECTS durations above the role's MaxSessionDuration
     # rather than clamping like MinIO — sts.py retries once at 3600 on that.
     clamped = max(900, min(settings.s3.sts_max_duration, duration_seconds))
+
+    # --- DuckLake-direct WRITE vend (ingestion) --------------------------------
+    # write=1 + a token with write scope on this namespace → a WRITABLE attach
+    # (per-catalog writer PG role, no RLS) + write S3 creds, instead of the
+    # read-only reader. The account writes its own data; masking stays enforced
+    # on reads. Short-circuits the read/masking machinery below.
+    if write:
+        if not scope_allows(claims.get("scope", ""), ns[0], "POST"):
+            _audit_credentials_denied(ctx, sub, ns, table, "error_write_scope")
+            raise HTTPException(
+                status_code=403,
+                detail="token scope does not permit writes on this namespace")
+        try:
+            ensure_writer_group(catalog, settings)
+        except Exception:
+            log.exception("writer-group setup failed for %s", ctx.catalog_id)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=clamped)
+        try:
+            w_role, w_pw = provision_writer_role(catalog, settings, sub, expires_at)
+        except Exception:
+            log.exception("writer-role provisioning failed for %s", sub)
+            _audit_credentials_denied(ctx, sub, ns, table, "error_writer_role_failed")
+            raise HTTPException(
+                status_code=503, detail="could not provision a writer role (fail-closed)")
+        w_dsn = settings.pg_dsn_for(w_role, w_pw)
+        w_out: dict[str, Any] = {
+            "ducklake_dsn": w_dsn,
+            "ducklake_data_path": data_path,
+            "ducklake_attach_sql": (
+                f"ATTACH 'ducklake:postgres:{w_dsn}' AS {alias} "
+                f"(DATA_PATH '{data_path}'{meta_opt}, DATA_INLINING_ROW_LIMIT 0)"),
+            # writable (no READ_ONLY); DATA_INLINING_ROW_LIMIT 0 → rows land as
+            # Parquet in S3 (not inlined PG tables, which would need CREATE).
+            "pg_role": w_role,
+            "pg_valid_until": expires_at.isoformat(),
+            "write": True,
+            "s3": None,
+        }
+        if not settings.s3.sts_disabled:
+            try:
+                creds = vend_credentials(
+                    settings.s3, namespace=ns[0], table=table or "*",
+                    read_only=False, duration_seconds=clamped, principal=sub,
+                    data_prefix=ctx.ref.data_prefix)
+                w_out["s3"] = {
+                    "endpoint": settings.s3.endpoint, "region": settings.s3.region,
+                    "path-style-access": settings.s3.path_style,
+                    "access-key-id": creds.access_key_id,
+                    "secret-access-key": creds.secret_access_key,
+                    "session-token": creds.session_token,
+                    "expiration": creds.expiration_iso}
+            except Exception:
+                log.exception("write STS vend failed for %s", sub)
+        else:
+            entry = None
+            try:
+                entry = governance_store.static_key_for_principal(sub)
+            except Exception:
+                pass
+            if entry is not None:   # Hetzner: a static key the operator bucket-policies to PutObject the prefix
+                w_out["s3"] = {
+                    "endpoint": settings.s3.endpoint, "region": settings.s3.region,
+                    "path-style-access": settings.s3.path_style,
+                    "access-key-id": entry.access_key_id,
+                    "secret-access-key": entry.secret_access_key,
+                    "session-token": None, "expiration": None,
+                    "enforcement": "bucket-policy-write"}
+        try:
+            gc_expired_roles(catalog)
+        except Exception:
+            pass
+        return w_out
+
     out: dict[str, Any] = {
         "ducklake_dsn": settings.pg_dsn,
         "ducklake_data_path": data_path,

@@ -507,6 +507,107 @@ def provision_principal_role(
     return role, password
 
 
+_WRITER_POLICY_NAME = "duckicelake_writer_all"
+
+
+def _writer_group_for(settings: Settings, meta: str) -> str:
+    """Per-catalog WRITER group name (mirror of _group_for). Distinct from the
+    reader group so a write vend joins full-access, and a read vend stays RLS."""
+    base = settings.reader_group_role
+    base = base.replace("reader", "writer") if "reader" in base else base + "_writer"
+    return base + _suffix(meta)
+
+
+def ensure_writer_group(catalog: DuckLakeCatalog, settings: Settings) -> str:
+    """Idempotent: a per-catalog WRITER group with full read+write on THIS
+    catalog's ducklake_* metadata (+ a permissive RLS policy so it isn't
+    filtered by the reader policies). Scoped to this schema → cross-account
+    isolation holds. The account writes its own data; no per-row RLS on writes.
+    Returns the writer group name. Best-effort at the call site — a writer-setup
+    failure must never break the read path."""
+    meta = _meta_schema(catalog)
+    wgroup = _writer_group_for(settings, meta)
+    with catalog.pg_cursor() as cur:
+        with pg_advisory_lock(cur, f"duckicelake:ensure_writer:{meta}"):
+            try:
+                cur.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(
+                    sql.Identifier(wgroup)))
+            except pg_errors.DuplicateObject:
+                pass
+            for sch in {meta, "public"}:
+                cur.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                    sql.Identifier(sch), sql.Identifier(wgroup)))
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = %s AND table_type = 'BASE TABLE'
+                  AND table_name LIKE 'ducklake\\_%%'
+            """, (meta,))
+            tables = [r[0] for r in cur.fetchall()]
+            for name in tables:
+                cur.execute(sql.SQL(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON {}.{} TO {}"
+                ).format(sql.Identifier(meta), sql.Identifier(name),
+                         sql.Identifier(wgroup)))
+            cur.execute(sql.SQL(
+                "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}"
+            ).format(sql.Identifier(meta), sql.Identifier(wgroup)))
+            # Permissive policy on every RLS-enabled table so the writer is not
+            # filtered by the reader SELECT policy (it owns this catalog's data).
+            cur.execute("""
+                SELECT c.relname FROM pg_class c JOIN pg_namespace n
+                  ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relrowsecurity
+            """, (meta,))
+            for (name,) in cur.fetchall():
+                cur.execute(sql.SQL("DROP POLICY IF EXISTS {} ON {}.{}").format(
+                    sql.Identifier(_WRITER_POLICY_NAME), sql.Identifier(meta),
+                    sql.Identifier(name)))
+                cur.execute(sql.SQL(
+                    "CREATE POLICY {} ON {}.{} FOR ALL TO {} "
+                    "USING (true) WITH CHECK (true)"
+                ).format(sql.Identifier(_WRITER_POLICY_NAME), sql.Identifier(meta),
+                         sql.Identifier(name), sql.Identifier(wgroup)))
+    log.info("writer group ensured: %s (%d ducklake_* tables)", wgroup, len(tables))
+    return wgroup
+
+
+def provision_writer_role(
+    catalog: DuckLakeCatalog,
+    settings: Settings,
+    sub: str,
+    expires_at: datetime,
+) -> tuple[str, str]:
+    """Mint a fresh per-vend LOGIN role in the per-catalog WRITER group — full
+    read+write on this catalog's metadata for DuckLake-direct ingestion. Same
+    lifecycle (nonce role, VALID UNTIL, GC) as the reader path; no RLS."""
+    role = principal_role_name(sub, secrets.token_hex(3))
+    password = secrets.token_hex(24)
+    wgroup = _writer_group_for(settings, _meta_schema(catalog))
+    with catalog.pg_cursor() as cur:
+        _ensure_principal_sidecar(cur)
+        try:
+            cur.execute(sql.SQL("CREATE ROLE {} IN ROLE {}").format(
+                sql.Identifier(role), sql.Identifier(wgroup)))
+        except pg_errors.DuplicateObject:
+            pass
+        cur.execute(sql.SQL(
+            "ALTER ROLE {} LOGIN PASSWORD {} VALID UNTIL {}"
+        ).format(sql.Identifier(role), sql.Literal(password),
+                 sql.Literal(expires_at.isoformat())))
+        cur.execute(
+            """
+            INSERT INTO public.duckicelake_pg_principal
+                (pg_role, principal_sub, expires_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (pg_role) DO UPDATE
+              SET principal_sub = EXCLUDED.principal_sub,
+                  expires_at = EXCLUDED.expires_at
+            """,
+            (role, sub, expires_at),
+        )
+    return role, password
+
+
 def gc_expired_roles(
     catalog: DuckLakeCatalog,
     *,
