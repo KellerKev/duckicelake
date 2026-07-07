@@ -78,13 +78,24 @@ That means the mask holds even for engines that never execute your SQL:
 - PyIceberg and raw S3 reads get `al***` because that's what's *in the
   files they're allowed to touch*,
 - and a DuckLake-direct DuckDB session gets a reader role whose row-level
-  security hides the base files entirely.
+  security hides the base files entirely,
+- and **Apache Spark** and **Trino**, connecting via the Iceberg REST
+  catalog with vended credentials (`uri` + `token`, nothing engine-specific),
+  load the shadow metadata + scoped session creds and read masked values —
+  verified end-to-end on real AWS S3 (see [Receipts](#receipts)).
 
 No other open catalog we've found does this. Catalog-level masking (view
 rewriting) is common; **masked physical copies + shadow metadata +
 credential scoping is not.** The cheap tier is still there — policies
 default to catalog-level (masking views + metadata signals, no extra
 storage) and you opt tables into byte-level per policy.
+
+**What this means for the ecosystem:** governance lives in the catalog and
+the object store, *not* the engine. Any Iceberg-REST reader — Spark, Trino,
+DuckDB, PyIceberg, and whatever ships next — gets correct masked results with
+zero engine-side policy code and no trust placed in the engine, across any
+S3-compatible backend (verified on MinIO, Hetzner, and AWS). Governance stops
+being per-engine integration work and becomes a property of the table.
 
 One policy set, per-principal results:
 
@@ -266,6 +277,15 @@ Claims above, and where they're proven:
 - **Hetzner Object Storage: live-verified** full sweep (2026-07-03) —
   remote signing, multipart, byte-level masking on real object storage,
   bucket-policy enforcement.
+- **Real AWS S3 + STS: live-verified** (eu-central-1, 2026-07-07) — the
+  STS path a no-STS backend can't exercise. `AssumeRole` vends per-request
+  session credentials scoped by an inline policy, and **AWS enforces it**:
+  a masked principal's creds read the masked export (200) and get **403 on
+  the raw base Parquet**. Confirmed through *external query engines*, not
+  just DuckDB — **Apache Spark 3.5** and **Trino 446** each read the table
+  via the Iceberg REST catalog with vended credentials and saw only masked
+  values. The same governance ran unchanged across three storage backends
+  (MinIO, Hetzner, AWS); only `[s3]`/`[sts]` config differs.
 - **Iceberg v3, early**: v3 writes end-to-end (via the
   [`pyiceberg_v3`](src/duckicelake/pyiceberg_v3.py) shim), deletion
   vectors written as **spec-correct Puffin files** byte-by-byte
