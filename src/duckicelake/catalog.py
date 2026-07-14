@@ -244,12 +244,29 @@ class DuckLakeCatalog:
             # Isolate this catalog's ducklake_* metadata in its own PG schema.
             opts.append(f"METADATA_SCHEMA '{self._ref.metadata_schema}'")
         opts.append("DATA_INLINING_ROW_LIMIT 0")
-        conn.execute(
-            f"ATTACH '{self.settings.ducklake_uri}' AS {self._cat()} "
-            f"({', '.join(opts)})"
-        )
-        conn.execute(f"USE {self._cat()}")
+        # Single-flight the ATTACH across processes: DuckLake's first ATTACH
+        # creates the shared ducklake_* metadata tables, and concurrent workers
+        # (uvicorn --workers N) racing that DDL collide on Postgres catalog
+        # constraints (pg_type_typname_nsp_index duplicate key), crashing
+        # startup. A PG advisory lock keyed by the metadata schema makes init
+        # single-flight; steady state (tables already present) is uncontended.
+        lock_key = self._attach_lock_key()
+        with psycopg.connect(self._pg_conninfo(), autocommit=True) as _lk:
+            _lk.execute("SELECT pg_advisory_lock(%s)", [lock_key])
+            conn.execute(
+                f"ATTACH '{self.settings.ducklake_uri}' AS {self._cat()} "
+                f"({', '.join(opts)})"
+            )
+            conn.execute(f"USE {self._cat()}")
+        # advisory lock is session-scoped and released when _lk closes above
         return conn
+
+    def _attach_lock_key(self) -> int:
+        """Signed 64-bit PG advisory-lock key for this catalog's metadata
+        schema — shared by every worker attaching the same schema."""
+        schema = self._ref.metadata_schema or "public"
+        digest = hashlib.sha256(f"ducklake-attach:{schema}".encode()).digest()
+        return int.from_bytes(digest[:8], "big", signed=True)
 
     def close(self) -> None:
         if self._conn is not None:
