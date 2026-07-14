@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from .auth import (
     AuthConfig,
     is_admin_scope,
+    is_broker_scope,
     load_auth_config,
     make_bearer_dependency,
     oauth_token_endpoint,
@@ -1134,6 +1135,8 @@ def ducklake_credentials(
     table: str | None = None,
     duration_seconds: int = 3600,
     principal: str | None = None,
+    actor: str | None = None,
+    channel: str | None = None,
     write: bool = False,
     ctx: CatalogContext = Depends(resolve_catalog),
 ) -> dict[str, Any]:
@@ -1149,8 +1152,12 @@ def ducklake_credentials(
         masked view via DuckDB `SET search_path` (`transparent: true`).
 
     GET + namespace-scoped path so read-only `ns:r` tokens (the LLM-agent
-    shape) pass the bearer middleware. `principal` is honored only when
-    auth is off (dev/test; same precedent as governance/effective-policies).
+    shape) pass the bearer middleware. `principal` (and the session context
+    `actor`/`channel`) are honored when auth is off (dev/test) or when the
+    caller is a trusted delegation broker (`is_broker_scope`); a non-broker
+    caller cannot assert another principal or the context. `actor`/`channel`
+    default to `human`/`rest` and are appended to the effective role set as
+    `actor:<v>`/`channel:<v>` tags so policies can bypass or tighten on them.
 
     Fail-open like the LoadTable path: a governance error degrades to
     unmasked vending (audited as error_unmasked), never a 500. The masking
@@ -1171,12 +1178,23 @@ def ducklake_credentials(
 
     claims = claims_from_request(auth_cfg, request)
     sub = claims.get("sub") or "anonymous"
-    if principal and not auth_cfg.enabled:
+    # A trusted broker (or dev/auth-off) may assert the effective end-user
+    # principal and the session context (actor/channel) on behalf of a caller.
+    # Non-broker callers are the direct principal with the default human/rest
+    # context — they can never spoof identity or context.
+    broker = (not auth_cfg.enabled) or is_broker_scope(claims.get("scope", ""))
+    if principal and broker:
         sub = principal
+    actor_tag = ((actor or "human") if broker else "human").strip().lower() or "human"
+    channel_tag = ((channel or "rest") if broker else "rest").strip().lower() or "rest"
+    context_tags = [f"actor:{actor_tag}", f"channel:{channel_tag}"]
 
     # Credential cache lookup (governance-stamp keyed; see _CRED_CACHE above).
+    # The context is part of the key: agent/human (or mcp/rest) sessions can
+    # resolve to different masked plans and must not share a cached response.
     _now = time.time()
-    _ck = (ctx.catalog_id, sub, namespace, table or "", "w" if write else "r")
+    _ck = (ctx.catalog_id, sub, namespace, table or "", "w" if write else "r",
+           actor_tag, channel_tag)
     try:
         _stamp = governance_store.governance_stamp()
     except Exception:
@@ -1203,6 +1221,12 @@ def ducklake_credentials(
     # read-only reader. The account writes its own data; masking stays enforced
     # on reads. Short-circuits the read/masking machinery below.
     if write:
+        # Agent sessions are read-only at the data plane, regardless of token
+        # scope or what the caller requests — authoritative here.
+        if actor_tag == "agent":
+            _audit_credentials_denied(ctx, sub, ns, table, "error_agent_readonly")
+            raise HTTPException(
+                status_code=403, detail="agent sessions are read-only")
         if not scope_allows(claims.get("scope", ""), ns[0], "POST"):
             _audit_credentials_denied(ctx, sub, ns, table, "error_write_scope")
             raise HTTPException(
@@ -1356,6 +1380,7 @@ def ducklake_credentials(
         roles = sorted(
             set(roles)
             | set(governance_store.roles_for_principal(sub))
+            | set(context_tags)
         )
         if table is not None:
             plan = policy_engine.plan_for(
@@ -2419,13 +2444,26 @@ def _build_load_response(
     governance_error = False
     if principal_claims is not None:
         principal_for_creds = principal_claims.get("sub") or "anonymous"
+        # A trusted broker (or dev/auth-off) may assert the effective principal
+        # and session context (actor/channel) via query params; a non-broker
+        # caller is the direct principal with the default human/rest context.
+        _qp = request.query_params if request is not None else {}
+        _broker = (not auth_cfg.enabled) or is_broker_scope(
+            principal_claims.get("scope", ""))
+        if _broker and _qp.get("principal"):
+            principal_for_creds = _qp.get("principal")
+        _actor = ((_qp.get("actor") or "human") if _broker else "human").strip().lower() or "human"
+        _channel = ((_qp.get("channel") or "rest") if _broker else "rest").strip().lower() or "rest"
+        _context_tags = [f"actor:{_actor}", f"channel:{_channel}"]
         try:
             # Roles are the UNION of the JWT claim (operator-configured via
-            # DUCKICELAKE_OAUTH_CLIENTS) and the sidecar role grants — either
-            # source can carry an unmasked-role bypass.
+            # DUCKICELAKE_OAUTH_CLIENTS), the sidecar role grants, and the
+            # session context tags — any source can carry an unmasked-role
+            # bypass (or, inverted, withhold one to tighten for agents).
             roles = sorted(
                 set(principal_claims.get("roles") or [])
                 | set(governance_store.roles_for_principal(principal_for_creds))
+                | set(_context_tags)
             )
             plan = policy_engine.plan_for(
                 principal=principal_for_creds,

@@ -323,6 +323,20 @@ def is_admin_scope(scope: str) -> bool:
     return ("*", "*") in _parse_scope(scope)
 
 
+def is_broker_scope(scope: str) -> bool:
+    """True for a trusted delegation broker.
+
+    A broker is a gateway allowed to assert, per request, the effective
+    `principal` and session context (actor/channel) on behalf of an end user —
+    the standard secure-gateway/impersonation pattern. Granted by the bare
+    `broker` scope token; a superuser (`*`) token implies it. Non-broker tokens
+    can never spoof another principal or the session context.
+    """
+    if is_admin_scope(scope):
+        return True
+    return "broker" in (scope or "").split()
+
+
 def scope_allows(scope: str, namespace: str | None, method: str) -> bool:
     """Does `scope` allow `method` on `namespace`?
 
