@@ -14,13 +14,21 @@ request, the effective `principal` and the session context:
 
 ```
 GET /v1/{catalog}/namespaces/{ns}/ducklake-credentials
-      ?principal=<end-user>&actor=<human|agent>&channel=<rest|mcp>
+      ?delegate=1&principal=<end-user>&actor=<human|agent>&channel=<rest|mcp>
 ```
 
-`is_broker_scope()` gates this. A **non-broker** token can never assert another
-principal or a context — its `principal`/`actor`/`channel` params are ignored and
-it is treated as the direct principal with the default `human`/`rest` context.
-Dev/auth-off keeps honoring `principal` as before.
+Delegation is **explicit opt-in** via `delegate=1`, and only honored for a token
+that passes `is_broker_scope()`. This is deliberate: an existing caller that
+merely passes a `principal` hint (historically ignored under auth-on) is
+unaffected — it keeps governing as its token identity — so turning the feature on
+does not silently flip every caller to per-user enforcement. Without
+`delegate=1`, or from a non-broker token, `principal`/`actor`/`channel` are
+ignored and the caller is the direct token principal with the default
+`human`/`rest` context. Dev/auth-off keeps honoring `principal` as before.
+
+Note: per-user delegation activates per-user RLS, so the asserted principal must
+actually hold the object grants / roles it needs — otherwise it correctly sees
+nothing.
 
 ## 2. Context tags
 

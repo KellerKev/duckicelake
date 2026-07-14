@@ -1137,6 +1137,7 @@ def ducklake_credentials(
     principal: str | None = None,
     actor: str | None = None,
     channel: str | None = None,
+    delegate: bool = False,
     write: bool = False,
     ctx: CatalogContext = Depends(resolve_catalog),
 ) -> dict[str, Any]:
@@ -1178,15 +1179,18 @@ def ducklake_credentials(
 
     claims = claims_from_request(auth_cfg, request)
     sub = claims.get("sub") or "anonymous"
-    # A trusted broker (or dev/auth-off) may assert the effective end-user
-    # principal and the session context (actor/channel) on behalf of a caller.
-    # Non-broker callers are the direct principal with the default human/rest
-    # context — they can never spoof identity or context.
-    broker = (not auth_cfg.enabled) or is_broker_scope(claims.get("scope", ""))
-    if principal and broker:
+    # Delegation is EXPLICIT and opt-in (delegate=1): a trusted broker asserts
+    # the effective end-user principal and session context (actor/channel) on a
+    # caller's behalf. It is opt-in so an existing caller that merely passes a
+    # `principal` hint (historically ignored under auth-on) is unaffected — only
+    # a caller that intends per-user delegation, and holds a broker scope, gets
+    # it. Dev/auth-off keeps honoring `principal` as before. A non-delegating
+    # (or non-broker) call is the direct token principal with human/rest.
+    delegated = (not auth_cfg.enabled) or (delegate and is_broker_scope(claims.get("scope", "")))
+    if principal and delegated:
         sub = principal
-    actor_tag = ((actor or "human") if broker else "human").strip().lower() or "human"
-    channel_tag = ((channel or "rest") if broker else "rest").strip().lower() or "rest"
+    actor_tag = ((actor or "human") if delegated else "human").strip().lower() or "human"
+    channel_tag = ((channel or "rest") if delegated else "rest").strip().lower() or "rest"
     context_tags = [f"actor:{actor_tag}", f"channel:{channel_tag}"]
 
     # Credential cache lookup (governance-stamp keyed; see _CRED_CACHE above).
@@ -2448,12 +2452,13 @@ def _build_load_response(
         # and session context (actor/channel) via query params; a non-broker
         # caller is the direct principal with the default human/rest context.
         _qp = request.query_params if request is not None else {}
-        _broker = (not auth_cfg.enabled) or is_broker_scope(
-            principal_claims.get("scope", ""))
-        if _broker and _qp.get("principal"):
+        _delegated = (not auth_cfg.enabled) or (
+            str(_qp.get("delegate", "")).lower() in ("1", "true", "yes")
+            and is_broker_scope(principal_claims.get("scope", "")))
+        if _delegated and _qp.get("principal"):
             principal_for_creds = _qp.get("principal")
-        _actor = ((_qp.get("actor") or "human") if _broker else "human").strip().lower() or "human"
-        _channel = ((_qp.get("channel") or "rest") if _broker else "rest").strip().lower() or "rest"
+        _actor = ((_qp.get("actor") or "human") if _delegated else "human").strip().lower() or "human"
+        _channel = ((_qp.get("channel") or "rest") if _delegated else "rest").strip().lower() or "rest"
         _context_tags = [f"actor:{_actor}", f"channel:{_channel}"]
         try:
             # Roles are the UNION of the JWT claim (operator-configured via
