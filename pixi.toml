@@ -77,3 +77,4 @@ pytest              = ">=8,<9"
 [pypi-dependencies]
 duckicelake = { path = ".", editable = true }
 pyiceberg = { version = ">=0.10,<1", extras = ["pyarrow"] }
+mcp = ">=1.2"
