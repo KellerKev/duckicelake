@@ -227,6 +227,27 @@ MCP server refuses writes unless you explicitly opt in
 (`LAKESH_MCP_WRITE=1`). **Agents can't see PII by construction, not by
 prompt.**
 
+### Actor-aware sessions — no separate agent token needed
+
+You don't have to mint a distinct agent principal. A trusted **broker** (a
+gateway fronting the proxy for many end users) can assert, per request, both the
+effective `principal` *and* a session **context** — `actor=human|agent`,
+`channel=rest|mcp` — with `delegate=1`. The context rides into the policy engine
+as synthetic `actor:*` / `channel:*` role tags, so the same `unmasked-roles`
+machinery drives it: grant humans the bypass tag, withhold it from agents, and a
+sensitive column masks for an agent while a human sees cleartext — same user,
+same token, decided by *who's driving the session*. Agent sessions are also
+read-only at the data plane (write vends refused). Delegation is opt-in, so
+existing callers are unaffected. See
+[docs/actor_aware_governance.md](docs/actor_aware_governance.md).
+
+duckicelake also ships a **native governed MCP server** (`duckicelake.mcp_server`)
+where connecting *is* the agent signal: every call is stamped `actor=agent,
+channel=mcp`, and its tools (`list_namespaces`, `list_tables`, `describe_table`,
+`query`) execute read-only SQL **server-side and return rows only** — the agent
+never receives the DSN or S3 credentials, so it can't slip past a masked view to
+the base table.
+
 ```bash
 pixi run demo-lakesh      # lakesh: REST read vs the vended masked view
 ```
@@ -392,4 +413,5 @@ Known boundaries — the short version (full list in
 | [ARCHITECTURE.md](ARCHITECTURE.md) | design rationale + Iceberg spec coverage |
 | [MISSING.md](MISSING.md) | what's not done yet |
 | [docs/multi_catalog_isolation.md](docs/multi_catalog_isolation.md) | multi-tenant isolation design |
+| [docs/actor_aware_governance.md](docs/actor_aware_governance.md) | actor-aware sessions — broker delegation, actor/channel context, native MCP |
 | [github.com/KellerKev/lakesh](https://github.com/KellerKev/lakesh) | the companion SQL shell + MCP server |
