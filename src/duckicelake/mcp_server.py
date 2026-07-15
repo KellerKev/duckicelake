@@ -24,6 +24,7 @@ Config (env):
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 import threading
@@ -33,7 +34,14 @@ from typing import Any
 import duckdb
 import httpx
 
+from .auth import load_auth_config, verify_bearer
 from .config import Settings, load_settings
+
+# The end-user principal for the in-flight MCP request, set by the auth
+# middleware from the caller's verified bearer. Delegation flows this principal
+# to the governance core (the server holds a *broker* token separately).
+_CURRENT_PRINCIPAL: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_principal", default=None)
 
 # Only read-only shapes reach the executor; the vended attach is READ_ONLY and
 # the reader role is RLS-scoped, but we refuse writes up front for a clear error.
@@ -162,12 +170,43 @@ def _json_safe(v: Any) -> Any:
     return str(v)
 
 
-def resolve_principal(config: MCPConfig, request_context: Any = None) -> str:
-    """The acting end-user principal for a call. A deployment fronting this
-    server authenticates the caller and supplies their principal (e.g. from a
-    verified bearer/JWT `sub`); until then we use the configured default. Kept
-    as a seam so identity resolution is a deployment choice, not baked in."""
-    return config.default_principal
+def resolve_principal(config: MCPConfig) -> str:
+    """The acting end-user principal for the in-flight call: the `sub` of the
+    caller's verified bearer (set by the auth middleware), else the configured
+    default (dev / auth-off). The server then delegates this principal to the
+    governance core with its own broker token."""
+    return _CURRENT_PRINCIPAL.get() or config.default_principal
+
+
+class _AuthMiddleware:
+    """ASGI middleware: verify the caller's bearer against the governance auth
+    config and pin its `sub` as the request principal. Unauthenticated /
+    unverifiable requests fall through to the configured default principal
+    (so auth-off dev still works); enforcement is delegated to governance."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._auth = load_auth_config()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self._auth.enabled:
+            await self.app(scope, receive, send)
+            return
+        authz = None
+        for k, v in scope.get("headers", []):
+            if k == b"authorization":
+                authz = v.decode()
+                break
+        principal = None
+        try:
+            principal = verify_bearer(self._auth, authz).get("sub")
+        except Exception:
+            principal = None
+        token = _CURRENT_PRINCIPAL.set(principal)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _CURRENT_PRINCIPAL.reset(token)
 
 
 def build_server(config: MCPConfig | None = None):
@@ -208,8 +247,20 @@ def build_server(config: MCPConfig | None = None):
     return mcp
 
 
+def build_app(config: MCPConfig | None = None):
+    """The streamable-HTTP ASGI app with per-caller auth middleware."""
+    from .config import apply_file_config
+    apply_file_config()   # inject [oauth]/etc. from duckicelake.toml/.env into env
+    cfg = config or MCPConfig()
+    app = build_server(cfg).streamable_http_app()
+    app.add_middleware(_AuthMiddleware)
+    return cfg, app
+
+
 def main() -> None:
-    build_server().run(transport="streamable-http")
+    import uvicorn
+    cfg, app = build_app()
+    uvicorn.run(app, host=cfg.host, port=cfg.port)
 
 
 if __name__ == "__main__":
