@@ -134,13 +134,29 @@ run `SLEEP=0 pixi run demo` and read the SQL it prints.
 ### 2 · Credential enforcement on any S3 — with or without STS
 
 Vended credentials are how the byte-level guarantees reach clients, so the
-proxy speaks **three enforcement dialects** and picks per backend:
+proxy speaks **four enforcement dialects** and picks per backend:
 
 | Backend has… | Enforcement | How |
 |---|---|---|
 | STS `AssumeRole` (MinIO, AWS) | per-table/per-export **session policies** | [`sts.py`](src/duckicelake/sts.py) — prefix-scoped creds, Deny carve-outs for masked tables, policy-size degradation handled |
 | No STS (e.g. Hetzner) | **remote signing** — every S3 request authorized against governance, SigV4-signed server-side | [`signer.py`](src/duckicelake/signer.py) — Iceberg REST signer protocol; root keys never leave the proxy; revocation is immediate |
-| No STS, DuckDB-direct clients | static keys scoped by **generated bucket policies** | [`hetzner_policy.py`](src/duckicelake/hetzner_policy.py) — derives Allow/Deny from live governance state, `--apply` puts it on the bucket |
+| No STS, DuckDB-direct clients | **S3 gateway** — short-lived scoped credentials the proxy mints itself, verified + governed + re-signed per request | [`s3_gateway.py`](src/duckicelake/s3_gateway.py) — the STS-equivalent for DuckDB httpfs; the airtight signer guarantees without STS |
+| No STS, DuckDB-direct (fallback) | static keys scoped by **generated bucket policies** | [`hetzner_policy.py`](src/duckicelake/hetzner_policy.py) — derives Allow/Deny from live governance state, `--apply` puts it on the bucket |
+
+The **S3 gateway** closes the last gap in the no-STS story. DuckDB's `httpfs`
+can't remote-sign like PyIceberg, so DuckLake-direct clients historically got a
+long-lived static key + a coarse bucket policy — the one credential in the stack
+that didn't expire and wasn't scoped per request. With the gateway enabled, the
+proxy exposes its own S3-compatible endpoint and vends a **credential it mints
+and controls**: the access-key-id packs the caller's identity + scope + an
+expiry; the secret is `HMAC(gateway_secret, access-key-id)`, so it's stateless
+and unforgeable. DuckDB signs each request with it; the gateway verifies that
+SigV4, runs the *same* `authorize_sign` governance the remote signer does
+(fail-closed, per-object, per-method), re-signs with the root key, and forwards
+to the backend. Result: short-lived, scoped, live-revocable credentials with the
+root key never leaving the proxy — STS-grade security on a backend with no STS.
+Opt-in via `[s3_gateway] enabled = true` (`secret` + `url` required); off by
+default, leaving the static-key tier untouched.
 
 The no-STS path was **verified against live Hetzner Object Storage
 (2026-07-03)**: the full multipart lifecycle through the signer, PyIceberg

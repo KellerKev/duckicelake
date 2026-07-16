@@ -84,6 +84,24 @@ prefix = "data/"
 # Signer authorization cache TTL, seconds (bounds PG load AND revocation lag).
 #signer_cache_ttl = 10.0
 
+# S3 gateway — the no-STS "our-own" short-lived credential tier for
+# DuckLake-direct DuckDB clients (only meaningful with [sts] endpoint = "none").
+# When enabled, ducklake-credentials hands DuckDB an endpoint pointing at this
+# proxy plus a minted, scoped, expiring credential; the gateway verifies the
+# caller's SigV4, applies per-request governance, re-signs with the root key,
+# and forwards to the backend. Off by default (static-key tier stays in place).
+#[s3_gateway]
+#enabled = true
+# The gateway's OWN HMAC key (distinct from the OAuth JWT secret). Required.
+#secret = "change-me-gateway-hmac-key"
+# Endpoint advertised to clients as `s3.endpoint`. Must resolve, from the
+# client's network, to this proxy (path-style S3 rides the same port as the
+# catalog API — e.g. an internal address that reaches uvicorn/socat).
+#url = "http://10.0.0.3:8181"
+# Minted-credential lifetime, seconds (short by design; expiry is the primary
+# lifetime bound, governance revocation is still live per request).
+#ttl = 900
+
 #[oauth]
 #clients = "agent:s3cr3t|ns:analytics:r|agent"
 #clients_file = "/etc/duckicelake/clients.json"

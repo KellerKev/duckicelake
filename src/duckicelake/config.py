@@ -272,6 +272,28 @@ class Settings:
     # TTL (seconds) for the signer's per-worker policy-plan cache. Bounds PG
     # load under ranged-GET storms; also bounds revocation staleness.
     signer_cache_ttl: float = 10.0
+    # ---- S3 gateway (no-STS "our-own" short-lived credential tier) --------
+    # On no-STS backends (Hetzner) the proxy can expose its OWN S3-compatible
+    # endpoint that vends short-lived, scoped credentials WE mint — the
+    # DuckLake-direct equivalent of the remote signer, replacing long-lived
+    # static keys. When enabled, ducklake-credentials hands DuckDB an endpoint
+    # pointing at the gateway; the gateway verifies our SigV4, runs the same
+    # per-request governance as the signer (authorize_sign), re-signs with the
+    # root key, and forwards to the real backend. Off by default: the existing
+    # static-key/bucket-policy tier is unchanged until an operator opts in.
+    s3_gateway_enabled: bool = False
+    # HMAC key the gateway mints/verifies credentials with. Its OWN secret,
+    # distinct from the OAuth JWT secret. Required when the gateway is enabled.
+    s3_gateway_secret: bytes | None = None
+    # Endpoint advertised to DuckLake-direct clients as `s3.endpoint`
+    # (scheme://host[:port]). Must resolve, from the client's network, to this
+    # proxy. Path-style S3 requests (`GET /{bucket}/{key}`) land on the gateway
+    # routes mounted on the same app.
+    s3_gateway_url: str | None = None
+    # Lifetime (seconds) of a minted gateway credential. Short by design — the
+    # credential is stateless (claims packed into the key id), so expiry is the
+    # primary lifetime bound; governance revocation is still live per-request.
+    s3_gateway_ttl: int = 900
     # Password for the owning PG role. Optional: dev uses trust auth and
     # production can use cert/ident, but managed Postgres (RDS, Supabase,
     # Neon, Cloud SQL, a password-protected container) needs scram with a
@@ -340,7 +362,7 @@ def load_settings() -> Settings:
         hetzner_project_id=os.environ.get(
             "DUCKICELAKE_HETZNER_PROJECT_ID", ""),
     )
-    return Settings(
+    settings = Settings(
         pg_host=os.environ.get("DUCKICELAKE_PG_HOST", str(REPO_ROOT / ".pgsock")),
         pg_port=int(os.environ.get("DUCKICELAKE_PG_PORT", "55432")),
         pg_user=os.environ.get("DUCKICELAKE_PG_USER", "ducklake"),
@@ -360,4 +382,28 @@ def load_settings() -> Settings:
         public_url=os.environ.get("DUCKICELAKE_PUBLIC_URL") or None,
         signer_cache_ttl=float(
             os.environ.get("DUCKICELAKE_SIGNER_CACHE_TTL", "10.0")),
+        s3_gateway_enabled=os.environ.get(
+            "DUCKICELAKE_S3_GATEWAY_ENABLED", "0") == "1",
+        s3_gateway_secret=(
+            _gw_secret.encode("utf-8")
+            if (_gw_secret := os.environ.get(
+                "DUCKICELAKE_S3_GATEWAY_SECRET", "").strip())
+            else None),
+        s3_gateway_url=os.environ.get("DUCKICELAKE_S3_GATEWAY_URL") or None,
+        s3_gateway_ttl=int(
+            os.environ.get("DUCKICELAKE_S3_GATEWAY_TTL", "900")),
     )
+    if settings.s3_gateway_enabled:
+        # Fail fast on a half-configured gateway: minting/verifying needs the
+        # secret, and clients need a reachable endpoint to be pointed at.
+        if not settings.s3_gateway_secret:
+            raise RuntimeError(
+                "DUCKICELAKE_S3_GATEWAY_ENABLED=1 requires "
+                "DUCKICELAKE_S3_GATEWAY_SECRET (the gateway's own HMAC key)")
+        if not settings.s3_gateway_url:
+            raise RuntimeError(
+                "DUCKICELAKE_S3_GATEWAY_ENABLED=1 requires "
+                "DUCKICELAKE_S3_GATEWAY_URL (the endpoint advertised to clients)")
+        if settings.s3_gateway_ttl <= 0:
+            raise ValueError("DUCKICELAKE_S3_GATEWAY_TTL must be positive")
+    return settings

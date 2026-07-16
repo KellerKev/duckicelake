@@ -77,6 +77,7 @@ from .observability import (
 )
 from . import signer as signer_mod
 from .signer import S3SignRequest, S3SignResponse
+from .s3_gateway import mint_credentials as gateway_mint, register_gateway_routes
 from .sts import vend_credentials
 
 
@@ -1561,11 +1562,34 @@ def ducklake_credentials(
         # it); enforcement lives in the bucket policy, not a session policy.
         masked_principal = export is not None or file_layer_required
         entry = None
-        try:
-            entry = governance_store.static_key_for_principal(sub)
-        except Exception:
-            log.exception("static-key lookup failed for %s", sub)
-        if entry is not None and not masked_principal:
+        if not settings.s3_gateway_enabled:
+            try:
+                entry = governance_store.static_key_for_principal(sub)
+            except Exception:
+                log.exception("static-key lookup failed for %s", sub)
+        if settings.s3_gateway_enabled:
+            # "Our-own" short-lived credential tier: hand the client an
+            # endpoint pointing at OUR gateway plus a minted, scoped, expiring
+            # credential. The gateway re-verifies identity and runs
+            # authorize_sign per request (the airtight signer logic), so this
+            # is safe for every principal — masked/file-layer included: base
+            # bytes are denied at the gateway, the masked-sig export tree is
+            # allowed. Replaces the long-lived static key entirely.
+            gw = gateway_mint(
+                settings, sub=sub, scope=claims.get("scope") or "*:*:*",
+                roles=roles, catalog_id=ctx.catalog_id)
+            out["s3"] = {
+                "endpoint": settings.s3_gateway_url,
+                "region": s3.region,
+                "path-style-access": s3.path_style,
+                "access-key-id": gw["access_key_id"],
+                "secret-access-key": gw["secret_access_key"],
+                "session-token": None,
+                "expiration": gw["expiration_iso"],
+                "enforcement": "gateway",
+            }
+            decision = ("gateway_scoped" if decision == "ok" else decision)
+        elif entry is not None and not masked_principal:
             out["s3"] = {
                 "endpoint": s3.endpoint,
                 "region": s3.region,
@@ -2679,3 +2703,10 @@ def _build_load_response(
         metadata=metadata,
         config=config_out,
     )
+
+
+# ---- S3 gateway (no-STS "our-own" credential tier) ---------------------
+# Registered LAST so its catch-all `/{bucket}/{key}` routes never shadow an
+# explicit catalog route (Starlette matches in registration order). No-op
+# unless DUCKICELAKE_S3_GATEWAY_ENABLED=1.
+register_gateway_routes(app, settings, registry, auth_cfg)
