@@ -1056,9 +1056,12 @@ class GovernanceStore:
 
     def governance_stamp(self) -> str:
         """Cheap global governance freshness token: max(created_at) across the
-        policy/tag tables. Changes on any policy ADD — so a credential cache
-        keyed on it never serves cleartext for a newly-added mask. A DELETE
-        leaves it unchanged (brief over-masking until TTL/next add — fail-safe)."""
+        policy/tag tables plus the static-S3-key table. Changes on any policy
+        ADD — so a credential cache keyed on it never serves cleartext for a
+        newly-added mask; and a newly-registered static key (no-STS backends)
+        invalidates a principal's cached `s3: None` so the key is vended at once.
+        A DELETE leaves it unchanged (brief over-masking until TTL/next add —
+        fail-safe)."""
         with self.catalog.pg_cursor() as cur:
             cur.execute(
                 """
@@ -1068,6 +1071,7 @@ class GovernanceStore:
                     UNION ALL SELECT created_at FROM public.duckicelake_policy_attachment
                     UNION ALL SELECT created_at FROM public.duckicelake_masking_policy
                     UNION ALL SELECT created_at FROM public.duckicelake_row_access_policy
+                    UNION ALL SELECT created_at FROM public.duckicelake_static_s3_key
                 ) x
                 """
             )
