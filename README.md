@@ -163,8 +163,13 @@ The no-STS path was **verified against live Hetzner Object Storage
 driving its own `S3V4RestSigner` against the proxy, file-layer masked
 exports materialised on Hetzner with base-byte denial, and the generated
 bucket policy enforced — details in [OPERATIONS.md](OPERATIONS.md) and
-[MISSING.md](MISSING.md). AWS runs the same code path but hasn't been
-exercised against live AWS yet; it's unit-tested only.
+[MISSING.md](MISSING.md). The **S3 gateway** was live-verified on the same
+backend (2026-07-16): a DuckDB `httpfs` client reads through the gateway and
+gets rows, while out-of-scope, expired, and wrong-secret credentials are
+denied before any backend call — and its SigV4 verifier interops with
+botocore's own signer by construction (unit-tested against it). AWS runs the
+same code paths but hasn't been exercised against live AWS yet; it's
+unit-tested only.
 
 For **file-layer masking on a no-STS backend**, a masked reader needs a
 **confined static key** (registered `confined=true`) so the proxy can vend it
