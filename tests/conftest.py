@@ -31,6 +31,14 @@ REPO = os.path.dirname(os.path.dirname(__file__))
 PROXY_URL = "http://127.0.0.1:18181"     # distinct from the demo's 8181
 PROXY_PORT = 18181
 
+# Enable the S3 gateway on the main test proxy, pointed at itself. On a no-STS
+# backend this is the credential tier the vend hands DuckLake-direct clients, so
+# credential-dependent tests exercise it end-to-end instead of skipping. On an
+# STS backend the gateway branch is dormant (the vend takes the STS path), so
+# this is a no-op there. The static-key tier is tested by a separate gateway-off
+# proxy (signing_proxy in test_remote_signing.py).
+GATEWAY_SECRET = "integration-suite-gateway-secret"
+
 
 def _wait_ready(url: str, timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
@@ -93,6 +101,12 @@ def _proxy(settings):
             "--log-level", "warning",
         ],
         cwd=REPO,
+        env=dict(
+            os.environ,
+            DUCKICELAKE_S3_GATEWAY_ENABLED="1",
+            DUCKICELAKE_S3_GATEWAY_SECRET=GATEWAY_SECRET,
+            DUCKICELAKE_S3_GATEWAY_URL=PROXY_URL,
+        ),
     )
     try:
         _wait_ready(f"{PROXY_URL}/healthz")

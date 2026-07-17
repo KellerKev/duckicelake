@@ -43,6 +43,10 @@ def signing_proxy():
         os.environ,
         DUCKICELAKE_STS_ENDPOINT="none",
         DUCKICELAKE_PUBLIC_URL=SIGN_URL,
+        # Gateway OFF here: this proxy tests the static-key / fail-closed tier
+        # (test_ducklake_credentials_no_sts_matrix). The gateway is exercised
+        # via the main proxy (conftest).
+        DUCKICELAKE_S3_GATEWAY_ENABLED="0",
     )
     proc = subprocess.Popen(
         ["uvicorn", "duckicelake.server:app",

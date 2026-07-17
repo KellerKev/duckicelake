@@ -259,7 +259,6 @@ def _base_keys(settings, ns: str, table: str = "events") -> list[str]:
     return keys
 
 
-@requires_sts
 def test_file_layer_end_to_end(client, settings):
     """THE Phase-4 proof: bob's vended credentials physically cannot read
     base bytes (403) but read masked bytes; unqualified and by-name queries
@@ -322,7 +321,6 @@ def test_file_layer_end_to_end(client, settings):
     assert any(e["operation"] == "masked_export" for e in audit)
 
 
-@requires_sts
 def test_namespace_vend_denies_file_layer_base(client, settings):
     """Namespace-level vending carves the file-layer table's base prefix
     out of the namespace allow (IAM Deny) for masked principals; an
@@ -363,7 +361,6 @@ def _wait_for(fn, timeout=15.0, interval=0.3):
     return None
 
 
-@requires_sts
 def test_listener_refreshes_export_for_existing_creds(client, settings):
     """A DuckLake-direct write AFTER vending: the elected listener
     re-exports the known sig at the new snapshot and repoints the view —

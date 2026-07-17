@@ -19,7 +19,7 @@ import duckdb
 import psycopg
 import pytest
 
-from conftest import requires_sts
+from conftest import requires_sts, STS_DISABLED
 from duckicelake.catalog import DuckLakeCatalog
 from duckicelake.masking_views import MaskingViewManager, mask_view_name
 from duckicelake.policies import build_plan, mask_signature
@@ -27,6 +27,19 @@ from duckicelake.policies import build_plan, mask_signature
 
 def _ns(suffix: str) -> str:
     return f"gp3_{suffix}_{uuid.uuid4().hex[:6]}"
+
+
+def _assert_creds_vended(s3: dict) -> None:
+    """Backend-agnostic check that usable S3 creds were vended. STS backends
+    vend a session token; the no-STS S3 gateway vends a key+secret only
+    (`enforcement: gateway`, no session token) — both are valid, working creds
+    a DuckLake-direct client reads through."""
+    assert s3 and s3["access-key-id"] and s3["secret-access-key"]
+    if STS_DISABLED:
+        assert s3["session-token"] is None
+        assert s3["enforcement"] == "gateway"
+    else:
+        assert s3["session-token"]
 
 
 SCHEMA_JSON = {
@@ -275,12 +288,18 @@ def _vended_duckdb(settings, vended: dict) -> duckdb.DuckDBPyConnection:
         con.execute(f"INSTALL {ext}")
         con.execute(f"LOAD {ext}")
     host = s3c["endpoint"].rsplit("://", 1)[-1]
+    # Only include SESSION_TOKEN when the vend carried one (STS creds). Gateway /
+    # static-key creds are key+secret only — emitting SESSION_TOKEN 'None' would
+    # send a bogus token and break the read (mirrors the production runner's
+    # levitate_warehouse.runner._install_s3_secret).
+    session_token = s3c.get("session-token")
+    token_clause = f"SESSION_TOKEN '{session_token}'," if session_token else ""
     con.execute(
         f"""
         CREATE OR REPLACE SECRET vended_s3 (
             TYPE S3, KEY_ID '{s3c["access-key-id"]}',
             SECRET '{s3c["secret-access-key"]}',
-            SESSION_TOKEN '{s3c["session-token"]}',
+            {token_clause}
             REGION '{s3c["region"]}', ENDPOINT '{host}',
             USE_SSL {str(s3c["endpoint"].startswith("https")).lower()},
             URL_STYLE '{"path" if s3c["path-style-access"] else "vhost"}'
@@ -302,7 +321,6 @@ def _seed_rows(settings, ns: str) -> None:
     con.close()
 
 
-@requires_sts
 def test_ducklake_credentials_masked_vs_privileged(client, settings):
     """The load-bearing proof: bob (no roles) sees masked rows through the
     vended view — transparently for unqualified queries — while alice
@@ -325,7 +343,7 @@ def test_ducklake_credentials_masked_vs_privileged(client, settings):
     bob = r.json()
     assert bob["masked_view"] == f"{ns}.__mask_events__{bob['mask_signature']}"
     assert bob["transparent"] is True and bob["post_attach_sql"]
-    assert bob["s3"]["session-token"]
+    _assert_creds_vended(bob["s3"])
 
     con = _vended_duckdb(settings, bob)
     # transparent: unqualified query resolves to the masking view
@@ -362,7 +380,9 @@ def test_ducklake_credentials_masked_vs_privileged(client, settings):
     vends = [e for e in audit if e["operation"] == "ducklake_credentials"]
     assert any(e["principal"] == "bob" and e["decision"] == "masked"
                for e in vends)
-    assert any(e["principal"] == "alice" and e["decision"] == "ok"
+    # unmasked vend audits as "ok" (STS) or "gateway_scoped" (no-STS gateway)
+    assert any(e["principal"] == "alice"
+               and e["decision"] in ("ok", "gateway_scoped")
                for e in vends)
 
 
@@ -456,7 +476,6 @@ def test_schema_change_drops_stale_masking_views(client, settings):
     assert _live_view_rows(settings.pg_dsn, ns, new_view) == 1
 
 
-@requires_sts
 def test_ducklake_credentials_namespace_only(client, settings):
     """Without ?table the endpoint vends namespace-prefix creds and no view
     (transparent mode v1 requires a table)."""
@@ -468,11 +487,10 @@ def test_ducklake_credentials_namespace_only(client, settings):
     body = r.json()
     assert body["masked_view"] is None
     assert body["transparent"] is False
-    assert body["s3"]["session-token"]
+    _assert_creds_vended(body["s3"])
     assert "ATTACH" in body["ducklake_attach_sql"]
 
 
-@requires_sts
 def test_fail_open_on_unmaterializable_view(client, settings):
     """A policy whose mask body is invalid SQL produces a plan whose view
     cannot be created (DuckDB binds views at CREATE). Reads must survive:
@@ -594,7 +612,6 @@ def test_rls_vended_dsn_is_reader(client, settings):
             cur.execute("SELECT count(*) FROM public.duckicelake_role_grant")
 
 
-@requires_sts
 def test_rls_object_grant_allowlist(client, settings):
     """An explicit select object-grant flips the table to allowlist:
     ungranted principals can't even see it; granted ones and the owner
@@ -627,7 +644,6 @@ def test_rls_object_grant_allowlist(client, settings):
     con.close()
 
 
-@requires_sts
 def test_rls_file_layer_interlock(client, settings, direct_catalog):
     """The dormant Phase-4 contract: the two table properties hide base
     file rows from non-bypass principals; bypass roles and the owner are
@@ -659,7 +675,6 @@ def test_rls_file_layer_interlock(client, settings, direct_catalog):
     con.close()
 
 
-@requires_sts
 def test_rls_reader_is_readonly(client, settings):
     ns = _ns("rro")
     _make_table(client, ns, "events")
@@ -674,7 +689,6 @@ def test_rls_reader_is_readonly(client, settings):
             cur.execute("INSERT INTO public.ducklake_metadata VALUES ('x','y',1,NULL)")
 
 
-@requires_sts
 def test_rls_revend_mints_independent_roles(client, settings):
     """Each vend mints its own nonce role + password (concurrent vends for
     one principal can't invalidate each other's secret); both map to the
