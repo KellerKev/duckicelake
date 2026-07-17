@@ -1431,7 +1431,12 @@ def ducklake_credentials(
                     out["masked_view"] = f"{ns[0]}.{view}"
                     out["mask_signature"] = mask_signature(plan)
                     out["file_layer"] = export is not None
-                    if export is not None:
+                    if export is not None and not plan.file_layer_forced:
+                        # Skip the global table-level file-layer stamp + RLS
+                        # interlock when file-layer was FORCED for this agent
+                        # session — the agent's creds are already scoped to the
+                        # masked export (base denied); stamping the table would
+                        # flip humans into the interlock too.
                         _ensure_file_layer_properties(ctx, ns, table, plan)
                     if settings.transparent_masking:
                         schema = masking_view_manager.ensure_transparent_schema(
@@ -2531,7 +2536,11 @@ def _build_load_response(
                         shadow = masked_export_manager.shadow_metadata(
                             ns, table, file_layer_export)
                         if shadow is not None:
-                            _ensure_file_layer_properties(ctx, ns, table, plan)
+                            if not plan.file_layer_forced:
+                                # See note at the DuckLake-vend site: don't stamp
+                                # the table file-layer when it was forced for an
+                                # agent session (base is already denied per-vend).
+                                _ensure_file_layer_properties(ctx, ns, table, plan)
                             metadata_location, metadata = shadow
                             metadata = apply_plan_to_metadata(metadata, plan)
                         else:

@@ -65,6 +65,13 @@ class TablePolicyPlan:
     # Phase 4: any applied (non-bypassed) mask policy demands the mask be
     # materialized physically as masked Parquet copies.
     file_layer: bool = False
+    # True when file-layer was FORCED for an AI-agent session (config
+    # agent_file_layer), not authored on the policy. The credential-scoping /
+    # export enforcement still applies (base bytes denied for this agent), but
+    # the global table-level file-layer stamp + RLS interlock is NOT applied —
+    # that would flip the whole table (humans included) to file-layer. So this
+    # stays a per-agent-plan property.
+    file_layer_forced: bool = False
     # Union of unmasked_roles across the applied file-layer policies — the
     # roles RLS should let read base file rows (the interlock bypass).
     # Captured here during build_plan so callers needn't re-fetch the model.
@@ -136,8 +143,14 @@ def build_plan(
     attachments: list[dict],
     masking_bodies: dict[str, dict],
     row_bodies: dict[str, dict],
+    agent_file_layer: bool = True,
 ) -> TablePolicyPlan:
-    """Pure: derive the enforcement plan for one principal + table."""
+    """Pure: derive the enforcement plan for one principal + table.
+
+    `agent_file_layer` (default on): when an `actor:agent` session has ANY mask
+    applied, force file-layer masking so base bytes are denied (airtight) — an
+    agent can't sidestep the masked view with a qualified base-table query.
+    """
     # Reuse the Phase 1 resolver to get the *derived* policy set, then apply
     # the bypass decision to turn "applies" into "actually masks for this
     # principal".
@@ -198,6 +211,17 @@ def build_plan(
             predicates.append(f"({pred})")
     if predicates:
         plan.row_filter = " AND ".join(predicates)
+
+    # Airtight for AI agents: if any masking / row policy applies to an
+    # `actor:agent` session, force file-layer enforcement so base bytes are
+    # physically denied — a qualified base-table query can't sidestep the
+    # masked view (the cooperative gap). Flagged `forced` so the vend scopes
+    # the AGENT's creds to the masked export without stamping the whole table
+    # file-layer (which would pull humans into the RLS interlock too).
+    if agent_file_layer and not plan.file_layer and not plan.is_empty() \
+            and "actor:agent" in roles:
+        plan.file_layer = True
+        plan.file_layer_forced = True
 
     if not plan.is_empty():
         plan.view_sql = build_masked_view_sql(
@@ -334,8 +358,10 @@ def apply_plan_to_metadata(metadata: dict, plan: TablePolicyPlan) -> dict:
 class PolicyEngine:
     """DB-backed front door: fetch the model for a table, build the plan."""
 
-    def __init__(self, store: GovernanceStore) -> None:
+    def __init__(self, store: GovernanceStore,
+                 agent_file_layer: bool = True) -> None:
         self.store = store
+        self.agent_file_layer = agent_file_layer
 
     def plan_for(self, *, principal: str, roles: list[str],
                  schema: str, table: str) -> TablePolicyPlan:
@@ -344,7 +370,7 @@ class PolicyEngine:
             principal=principal, roles=roles, schema=schema, table=table,
             columns=inp["columns"], object_tags=inp["object_tags"],
             attachments=inp["attachments"], masking_bodies=inp["masking_bodies"],
-            row_bodies=inp["row_bodies"],
+            row_bodies=inp["row_bodies"], agent_file_layer=self.agent_file_layer,
         )
 
     @staticmethod

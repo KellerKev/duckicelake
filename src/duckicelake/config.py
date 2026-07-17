@@ -255,6 +255,15 @@ class Settings:
     rls_enabled: bool = True
     # NOLOGIN group role carrying all reader grants + RLS targets.
     reader_group_role: str = "duckicelake_reader"
+    # Force AIRTIGHT (file-layer) masking for AI-agent sessions. When on, any
+    # masking policy that applies to an `actor:agent` session is enforced by
+    # file-layer masking — base bytes are physically denied and the agent reads
+    # the masked Parquet export — so a qualified base-table query can't sidestep
+    # the masked view (the cooperative gap). Opt-out (default ON): turn off to
+    # let agents use cooperative masking (cheaper — no per-plan export
+    # materialisation, but sidesteppable). Independent of how a policy is
+    # authored; `file-layer-masking=true` policies are airtight for everyone.
+    agent_file_layer: bool = True
     # Strict mode: extend the airtight tier's fail-CLOSED posture to the
     # COOPERATIVE tier. When true, a governance error on a governed read
     # path — policy planning threw, or a demanded masking view could not be
@@ -375,6 +384,8 @@ def load_settings() -> Settings:
         transparent_masking=os.environ.get(
             "DUCKICELAKE_TRANSPARENT_MASKING", "1") == "1",
         rls_enabled=os.environ.get("DUCKICELAKE_RLS", "1") == "1",
+        agent_file_layer=os.environ.get(
+            "DUCKICELAKE_AGENT_FILE_LAYER", "1") == "1",
         governance_fail_closed=os.environ.get(
             "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(
