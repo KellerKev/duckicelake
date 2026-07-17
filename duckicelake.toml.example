@@ -35,6 +35,13 @@ transparent_masking = true
 # down with it (default: false).
 #governance_fail_closed = true
 
+# Airtight masking for AI-agent sessions. When any mask applies to an
+# actor:agent session, force file-layer enforcement (base bytes denied) so a
+# qualified base-table query can't sidestep the cooperative masked view. Humans
+# keep cooperative masking. Default: true (opt out with agent_file_layer=false /
+# DUCKICELAKE_AGENT_FILE_LAYER=0).
+#agent_file_layer = true
+
 # File-layer masking (governance Phase 4) tuning.
 #masked_retain_snap_dirs = 2       # snap dirs kept per mask-signature
 #masked_export_ttl_days = 7        # idle sigs stop being eagerly refreshed

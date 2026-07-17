@@ -262,6 +262,16 @@ read-only at the data plane (write vends refused). Delegation is opt-in, so
 existing callers are unaffected. See
 [docs/actor_aware_governance.md](docs/actor_aware_governance.md).
 
+Agent masking is **airtight by construction**. Cooperative masking (below) can be
+sidestepped by a client that names the base table directly — fine for a trusted
+human, not for an LLM agent. So whenever a mask applies to an `actor:agent`
+session, the proxy forces **file-layer** enforcement: the agent's credentials are
+scoped to the masked export only, base bytes are physically denied, and a
+qualified `SELECT … FROM ns.table` gets a 403 instead of cleartext (unqualified
+names still resolve to the masked view). It stays a per-agent property — humans on
+the same table keep cooperative masking. On by default; opt out with
+`DUCKICELAKE_AGENT_FILE_LAYER=0`.
+
 duckicelake also ships a **native governed MCP server** (`duckicelake.mcp_server`)
 where connecting *is* the agent signal: every call is stamped `actor=agent,
 channel=mcp`, and its tools (`list_namespaces`, `list_tables`, `describe_table`,
@@ -285,7 +295,8 @@ Two enforcement tiers, chosen per policy:
   direct sessions get transparent masking via `SET search_path`, so
   unqualified queries hit the masked view without the client changing a
   line. Cheap, no extra storage; a client that names the base table with
-  base credentials can still read raw — right for trusted analysts.
+  base credentials can still read raw — right for trusted analysts. (AI-agent
+  sessions are auto-upgraded to the airtight tier — see *Actor-aware sessions*.)
 - **Airtight (`file-layer-masking: true`).** Pre-masked Parquet + shadow
   metadata + credentials that physically can't reach base bytes + PG
   row-level security hiding the base files (per-principal, per-vend LOGIN
