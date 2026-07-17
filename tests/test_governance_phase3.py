@@ -19,6 +19,7 @@ import duckdb
 import psycopg
 import pytest
 
+from conftest import requires_sts
 from duckicelake.catalog import DuckLakeCatalog
 from duckicelake.masking_views import MaskingViewManager, mask_view_name
 from duckicelake.policies import build_plan, mask_signature
@@ -301,6 +302,7 @@ def _seed_rows(settings, ns: str) -> None:
     con.close()
 
 
+@requires_sts
 def test_ducklake_credentials_masked_vs_privileged(client, settings):
     """The load-bearing proof: bob (no roles) sees masked rows through the
     vended view — transparently for unqualified queries — while alice
@@ -364,6 +366,7 @@ def test_ducklake_credentials_masked_vs_privileged(client, settings):
                for e in vends)
 
 
+@requires_sts
 def test_ducklake_credentials_sts_prefix_scoping(client, settings):
     """Vended creds are table-prefix-scoped: own table readable (including
     files committed AFTER vending — the live-session fix), sibling tables
@@ -453,6 +456,7 @@ def test_schema_change_drops_stale_masking_views(client, settings):
     assert _live_view_rows(settings.pg_dsn, ns, new_view) == 1
 
 
+@requires_sts
 def test_ducklake_credentials_namespace_only(client, settings):
     """Without ?table the endpoint vends namespace-prefix creds and no view
     (transparent mode v1 requires a table)."""
@@ -468,6 +472,7 @@ def test_ducklake_credentials_namespace_only(client, settings):
     assert "ATTACH" in body["ducklake_attach_sql"]
 
 
+@requires_sts
 def test_fail_open_on_unmaterializable_view(client, settings):
     """A policy whose mask body is invalid SQL produces a plan whose view
     cannot be created (DuckDB binds views at CREATE). Reads must survive:
@@ -589,6 +594,7 @@ def test_rls_vended_dsn_is_reader(client, settings):
             cur.execute("SELECT count(*) FROM public.duckicelake_role_grant")
 
 
+@requires_sts
 def test_rls_object_grant_allowlist(client, settings):
     """An explicit select object-grant flips the table to allowlist:
     ungranted principals can't even see it; granted ones and the owner
@@ -621,6 +627,7 @@ def test_rls_object_grant_allowlist(client, settings):
     con.close()
 
 
+@requires_sts
 def test_rls_file_layer_interlock(client, settings, direct_catalog):
     """The dormant Phase-4 contract: the two table properties hide base
     file rows from non-bypass principals; bypass roles and the owner are
@@ -652,6 +659,7 @@ def test_rls_file_layer_interlock(client, settings, direct_catalog):
     con.close()
 
 
+@requires_sts
 def test_rls_reader_is_readonly(client, settings):
     ns = _ns("rro")
     _make_table(client, ns, "events")
@@ -666,6 +674,7 @@ def test_rls_reader_is_readonly(client, settings):
             cur.execute("INSERT INTO public.ducklake_metadata VALUES ('x','y',1,NULL)")
 
 
+@requires_sts
 def test_rls_revend_mints_independent_roles(client, settings):
     """Each vend mints its own nonce role + password (concurrent vends for
     one principal can't invalidate each other's secret); both map to the

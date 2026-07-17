@@ -11,6 +11,7 @@ import uuid
 import duckdb
 import pytest
 
+from conftest import requires_sts
 from duckicelake.catalog import DuckLakeCatalog
 from duckicelake.masked_export import MaskedExportManager
 from duckicelake.policies import build_plan, mask_signature
@@ -105,7 +106,8 @@ def test_export_masks_and_applies_deletes(client, settings, direct_catalog):
     plan = _file_plan(ns, "events")
     export = mgr.ensure_export_for_plan([ns], "events", plan)
     assert export is not None
-    assert export.prefix.startswith(f"data/__masked__/{ns}/events/{export.sig}/snap-")
+    assert export.prefix.startswith(
+        f"{settings.s3.data_prefix}__masked__/{ns}/events/{export.sig}/snap-")
 
     rows = _read_export(settings, export.prefix)
     assert rows == [(1, "al***"), (3, "ca***")]   # masked, deleted row absent
@@ -257,6 +259,7 @@ def _base_keys(settings, ns: str, table: str = "events") -> list[str]:
     return keys
 
 
+@requires_sts
 def test_file_layer_end_to_end(client, settings):
     """THE Phase-4 proof: bob's vended credentials physically cannot read
     base bytes (403) but read masked bytes; unqualified and by-name queries
@@ -319,6 +322,7 @@ def test_file_layer_end_to_end(client, settings):
     assert any(e["operation"] == "masked_export" for e in audit)
 
 
+@requires_sts
 def test_namespace_vend_denies_file_layer_base(client, settings):
     """Namespace-level vending carves the file-layer table's base prefix
     out of the namespace allow (IAM Deny) for masked principals; an
@@ -359,6 +363,7 @@ def _wait_for(fn, timeout=15.0, interval=0.3):
     return None
 
 
+@requires_sts
 def test_listener_refreshes_export_for_existing_creds(client, settings):
     """A DuckLake-direct write AFTER vending: the elected listener
     re-exports the known sig at the new snapshot and repoints the view —
@@ -443,6 +448,7 @@ def test_drop_table_purges_masked_prefix(client, settings, direct_catalog):
 
 # ---- REST shadow Iceberg metadata (stage B5) ---------------------------------
 
+@requires_sts
 def test_rest_shadow_metadata_end_to_end(client, settings):
     """The REST half of Phase 4: LoadTable for a masked principal returns
     SHADOW metadata whose manifests point exclusively at masked Parquet,

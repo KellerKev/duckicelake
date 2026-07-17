@@ -19,6 +19,14 @@ import pytest
 from duckicelake.config import load_settings
 
 
+# Disable the vend credential cache for the whole suite (proxy subprocess
+# inherits this env): tests assert fresh per-vend state — an independent reader
+# role each vend, and a current mask signature immediately after a schema change
+# — which the 30s cache would otherwise serve stale. Set before load_settings /
+# the proxy boots so the server reads it.
+os.environ.setdefault("DUCKICELAKE_CRED_CACHE_TTL", "0")
+
+
 REPO = os.path.dirname(os.path.dirname(__file__))
 PROXY_URL = "http://127.0.0.1:18181"     # distinct from the demo's 8181
 PROXY_PORT = 18181
@@ -120,3 +128,18 @@ def clean_catalog(settings):
 def client():
     with httpx.Client(base_url=PROXY_URL, timeout=30.0) as c:
         yield c
+
+
+# Whether the configured backend has STS. The integration suite assumes an
+# STS-capable main backend (MinIO/AWS) for its credential-vending assertions;
+# on a no-STS backend (Hetzner) the proxy vends no session tokens, so those
+# tests can't run. Such tests are marked `requires_sts` and skip there — the
+# no-STS credential story (remote signing, the S3 gateway, static keys) is
+# covered by its own unit/integration tests.
+STS_DISABLED = load_settings().s3.sts_disabled
+
+requires_sts = pytest.mark.skipif(
+    STS_DISABLED,
+    reason="requires an STS-capable S3 backend that vends session credentials; "
+           "no-STS backends use remote signing / the S3 gateway instead",
+)

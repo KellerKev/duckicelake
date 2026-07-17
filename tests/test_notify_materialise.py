@@ -180,14 +180,17 @@ def test_ducklake_direct_write_triggers_eager_materialisation(client, settings):
                            .paginate(Bucket=s3.bucket, Prefix=metadata_prefix)
             for o in page.get("Contents", [])
         }
-        return after - before
+        # Wait specifically for the vN.metadata.json — the materialisation
+        # writes manifest `.avro` files first, so on an eventually-consistent
+        # backend (Hetzner) a plain "any new key" check races and returns the
+        # manifests before the metadata.json is listed.
+        return {k for k in (after - before) if k.endswith(".metadata.json")}
 
-    diff = _wait_for(_new_metadata, timeout=10.0)
+    diff = _wait_for(_new_metadata, timeout=30.0)
     assert diff, (
         "expected a new vN.metadata.json under "
         f"{metadata_prefix} after DuckLake-direct INSERT; saw none"
     )
-    assert any(k.endswith(".metadata.json") for k in diff)
 
     # And the log row should be 'done'.
     def _log_done():
@@ -202,5 +205,5 @@ def test_ducklake_direct_write_triggers_eager_materialisation(client, settings):
             )
             return cur.fetchone()
 
-    row = _wait_for(_log_done, timeout=10.0)
+    row = _wait_for(_log_done, timeout=30.0)
     assert row is not None, "no 'done' row in duckicelake_materialisation_log"

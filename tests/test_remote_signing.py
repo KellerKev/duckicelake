@@ -21,7 +21,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import PROXY_URL, REPO
+from conftest import PROXY_URL, REPO, requires_sts
 from duckicelake import s3util
 from test_governance_phase3 import (  # noqa: F401  (helpers)
     SCHEMA_JSON,
@@ -138,6 +138,7 @@ def test_load_table_emits_remote_signing_config(sclient, settings):
     assert "s3.signer" not in r3.json()["config"]
 
 
+@requires_sts
 def test_sts_proxy_still_vends_credentials(client, settings):
     """Control: the session proxy (STS mode) still vends session tokens."""
     ns = _ns("stsctl")

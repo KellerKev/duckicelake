@@ -1124,8 +1124,11 @@ def _arm_default_rls() -> bool:
 # role provisioning + masking materialization + audit write when governance is
 # unchanged (keyed on governance_stamp) within a short TTL. Bounds PG load under
 # concurrent query bursts; a policy ADD invalidates it immediately (cleartext-safe).
+# The stamp tracks governance-sidecar writes, not table schema commits, so a bare
+# schema change is served stale until the TTL lapses — set DUCKICELAKE_CRED_CACHE_TTL=0
+# to vend fresh every call (tests that assert per-vend role/signature freshness).
 _CRED_CACHE: dict = {}
-_CRED_TTL = 30.0
+_CRED_TTL = float(os.environ.get("DUCKICELAKE_CRED_CACHE_TTL", "30.0"))
 
 
 @app.get("/v1/{prefix}/namespaces/{namespace}/ducklake-credentials")
