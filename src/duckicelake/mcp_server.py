@@ -122,14 +122,27 @@ class GovernedExecutor:
             con.execute(f"INSTALL {ext}"); con.execute(f"LOAD {ext}")
         s3 = self.settings.s3
         vended = bundle.get("s3") or {}
+        # Point DuckDB at the VENDED endpoint when creds are vended: the S3
+        # gateway (and STS) hand back their own endpoint, and gateway creds only
+        # work against the gateway — using the configured backend host here would
+        # send them to the wrong place. Derive USE_SSL / url-style from the vend
+        # so the http gateway works. Fall back to the backend only for the
+        # root-cred path (no vend).
+        v_ep = vended.get("endpoint")
+        if v_ep:
+            endpoint = v_ep.rsplit("://", 1)[-1]
+            use_ssl = v_ep.startswith("https")
+            url_style = "path" if vended.get("path-style-access", s3.path_style) else "vhost"
+        else:
+            endpoint, use_ssl = s3.host, s3.use_ssl
+            url_style = "path" if s3.path_style else "vhost"
         con.execute(
             "CREATE OR REPLACE SECRET s (TYPE S3, KEY_ID ?, SECRET ?, "
             "REGION ?, ENDPOINT ?, USE_SSL ?, URL_STYLE ?"
             + (", SESSION_TOKEN ?" if vended.get("session-token") else "") + ")",
             [vended.get("access-key-id") or s3.root_access_key,
              vended.get("secret-access-key") or s3.root_secret_key,
-             s3.region, s3.host, s3.use_ssl,
-             "path" if s3.path_style else "vhost"]
+             s3.region, endpoint, use_ssl, url_style]
             + ([vended["session-token"]] if vended.get("session-token") else []),
         )
         con.execute(bundle["ducklake_attach_sql"])
