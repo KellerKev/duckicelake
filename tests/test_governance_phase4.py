@@ -11,7 +11,7 @@ import uuid
 import duckdb
 import pytest
 
-from conftest import requires_sts
+from conftest import STS_DISABLED, PROXY_URL
 from duckicelake.catalog import DuckLakeCatalog
 from duckicelake.masked_export import MaskedExportManager
 from duckicelake.policies import build_plan, mask_signature
@@ -445,7 +445,6 @@ def test_drop_table_purges_masked_prefix(client, settings, direct_catalog):
 
 # ---- REST shadow Iceberg metadata (stage B5) ---------------------------------
 
-@requires_sts
 def test_rest_shadow_metadata_end_to_end(client, settings):
     """The REST half of Phase 4: LoadTable for a masked principal returns
     SHADOW metadata whose manifests point exclusively at masked Parquet,
@@ -473,14 +472,22 @@ def test_rest_shadow_metadata_end_to_end(client, settings):
     assert snap["manifest-list"].startswith(masked_root)
     assert md["properties"]["duckicelake.masked-columns"] == "email"
 
-    # vended creds: masked bytes 200, base bytes 403, and read-only
+    # vended creds: masked bytes 200, base bytes 403, and read-only. Read
+    # through the VENDED endpoint (STS: the real backend; no-STS: the gateway).
     cfg = body["config"]
-    assert cfg.get("s3.session-token"), "expected vended STS creds"
+    assert cfg["s3.remote-signing-enabled"] == "false"
+    assert cfg["s3.access-key-id"] and cfg["s3.secret-access-key"]
+    token = cfg.get("s3.session-token")
+    if STS_DISABLED:
+        assert token is None and cfg["s3.endpoint"] == PROXY_URL
+    else:
+        assert token
+    endpoint = cfg["s3.endpoint"]
     s3c = _s3_client_from({
-        "endpoint": settings.s3.endpoint, "region": settings.s3.region,
+        "endpoint": endpoint, "region": settings.s3.region,
         "access-key-id": cfg["s3.access-key-id"],
         "secret-access-key": cfg["s3.secret-access-key"],
-        "session-token": cfg["s3.session-token"],
+        "session-token": token,
     })
     with pytest.raises(botocore.exceptions.ClientError) as exc:
         s3c.get_object(Bucket=settings.s3.bucket,
@@ -492,13 +499,15 @@ def test_rest_shadow_metadata_end_to_end(client, settings):
     con = duckdb.connect(":memory:")
     for e in ("iceberg", "httpfs"):
         con.execute(f"INSTALL {e}"); con.execute(f"LOAD {e}")
+    token_clause = f"SESSION_TOKEN '{token}'," if token else ""
     con.execute(
         f"""
         CREATE SECRET vend (TYPE S3, KEY_ID '{cfg["s3.access-key-id"]}',
             SECRET '{cfg["s3.secret-access-key"]}',
-            SESSION_TOKEN '{cfg["s3.session-token"]}',
-            REGION '{settings.s3.region}', ENDPOINT '{settings.s3.host}',
-            USE_SSL {str(settings.s3.use_ssl).lower()}, URL_STYLE 'path')
+            {token_clause}
+            REGION '{settings.s3.region}',
+            ENDPOINT '{endpoint.rsplit("://", 1)[-1]}',
+            USE_SSL {str(endpoint.startswith("https")).lower()}, URL_STYLE 'path')
         """
     )
     emails = {r0[0] for r0 in con.execute(

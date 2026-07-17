@@ -1580,7 +1580,8 @@ def ducklake_credentials(
             # allowed. Replaces the long-lived static key entirely.
             gw = gateway_mint(
                 settings, sub=sub, scope=claims.get("scope") or "*:*:*",
-                roles=roles, catalog_id=ctx.catalog_id)
+                roles=roles, catalog_id=ctx.catalog_id,
+                read_prefixes=read_prefixes, deny_prefixes=deny_prefixes)
             out["s3"] = {
                 "endpoint": settings.s3_gateway_url,
                 "region": s3.region,
@@ -2639,14 +2640,43 @@ def _build_load_response(
     config_out: dict[str, str] = _base_s3_config()
     wants_delegation = (_wants_vended_credentials(delegation_header)
                         or _wants_remote_signing(delegation_header))
-    if wants_delegation and settings.s3.sts_disabled:
-        # No STS on this backend (Hetzner): answer BOTH delegation header
-        # values with remote signing. Masked file-layer and normal
-        # principals get the SAME config — per-object authorization lives
-        # in the signer, which re-derives the plan/sig on every request
-        # (and shadow metadata already points masked principals at the
-        # __masked__ prefix). No static keys are emitted; revocation is
-        # immediate.
+    if (wants_delegation and settings.s3.sts_disabled
+            and _wants_vended_credentials(delegation_header)
+            and settings.s3_gateway_enabled):
+        # No STS + gateway on: serve the `vended-credentials` delegation with
+        # gateway creds (endpoint → the gateway), the DuckLake-direct tier
+        # extended to REST clients. The cred is prefix-scoped to the table
+        # (masked file-layer principals: the masked-sig export prefix), and the
+        # gateway re-runs authorize_sign per request — so base bytes are denied
+        # and the masked sig allowed, exactly like the STS masked session
+        # policy. `remote-signing` requests fall through to the signer below.
+        gw_roles = sorted(
+            set((principal_claims or {}).get("roles") or [])
+            | set(governance_store.roles_for_principal(
+                principal_for_creds or "anonymous")))
+        gw_prefixes = (
+            [s3.masked_sig_prefix(ns[0], table, file_layer_export.sig, data_prefix)]
+            if file_layer_export is not None
+            else [s3.table_prefix(ns[0], table, data_prefix)])
+        gw = gateway_mint(
+            settings, sub=principal_for_creds or "anonymous",
+            scope=(principal_claims or {}).get("scope") or "*:*:*",
+            roles=gw_roles, catalog_id=ctx.catalog_id,
+            read_prefixes=gw_prefixes)
+        config_out["s3.endpoint"] = settings.s3_gateway_url
+        config_out.update({
+            "s3.access-key-id": gw["access_key_id"],
+            "s3.secret-access-key": gw["secret_access_key"],
+            "s3.remote-signing-enabled": "false",
+            "s3.credentials-expiration": gw["expiration_iso"],
+        })
+    elif wants_delegation and settings.s3.sts_disabled:
+        # No STS (Hetzner), gateway off (or `remote-signing` requested): answer
+        # with remote signing. Masked file-layer and normal principals get the
+        # SAME config — per-object authorization lives in the signer, which
+        # re-derives the plan/sig on every request (and shadow metadata already
+        # points masked principals at the __masked__ prefix). No static keys are
+        # emitted; revocation is immediate.
         config_out.update(_remote_signing_config(request, ctx))
     elif _wants_vended_credentials(delegation_header) and file_layer_export is not None:
         # Masked file-layer principal: READ-ONLY creds on the masked sig

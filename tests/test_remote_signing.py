@@ -21,7 +21,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import PROXY_URL, REPO, requires_sts
+from conftest import PROXY_URL, REPO, STS_DISABLED
 from duckicelake import s3util
 from test_governance_phase3 import (  # noqa: F401  (helpers)
     SCHEMA_JSON,
@@ -142,16 +142,22 @@ def test_load_table_emits_remote_signing_config(sclient, settings):
     assert "s3.signer" not in r3.json()["config"]
 
 
-@requires_sts
-def test_sts_proxy_still_vends_credentials(client, settings):
-    """Control: the session proxy (STS mode) still vends session tokens."""
+def test_proxy_vends_credentials_for_delegation(client, settings):
+    """The `vended-credentials` delegation returns usable creds (not remote
+    signing): STS session tokens on an STS backend, gateway creds on no-STS."""
     ns = _ns("stsctl")
     _make_table(client, ns, "events")
     r = client.get(f"/v1/lake/namespaces/{ns}/tables/events",
                    headers={"X-Iceberg-Access-Delegation": "vended-credentials"})
     cfg = r.json()["config"]
-    assert "s3.session-token" in cfg
     assert cfg["s3.remote-signing-enabled"] == "false"
+    assert cfg["s3.access-key-id"] and cfg["s3.secret-access-key"]
+    if STS_DISABLED:
+        # gateway creds: key+secret, no session token, endpoint → the gateway
+        assert "s3.session-token" not in cfg
+        assert cfg["s3.endpoint"] == PROXY_URL
+    else:
+        assert cfg["s3.session-token"]
 
 
 # ---- end-to-end signing against MinIO --------------------------------------

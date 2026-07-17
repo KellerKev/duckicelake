@@ -19,7 +19,7 @@ import duckdb
 import psycopg
 import pytest
 
-from conftest import requires_sts, STS_DISABLED
+from conftest import STS_DISABLED
 from duckicelake.catalog import DuckLakeCatalog
 from duckicelake.masking_views import MaskingViewManager, mask_view_name
 from duckicelake.policies import build_plan, mask_signature
@@ -386,7 +386,6 @@ def test_ducklake_credentials_masked_vs_privileged(client, settings):
                for e in vends)
 
 
-@requires_sts
 def test_ducklake_credentials_sts_prefix_scoping(client, settings):
     """Vended creds are table-prefix-scoped: own table readable (including
     files committed AFTER vending — the live-session fix), sibling tables

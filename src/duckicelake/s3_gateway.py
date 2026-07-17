@@ -87,10 +87,18 @@ def _derive_secret(secret_key: bytes, access_key_id: str) -> str:
 
 def mint_credentials(settings: Settings, *, sub: str, scope: str,
                      roles: list[str], catalog_id: str,
+                     read_prefixes: list[str] | None = None,
+                     deny_prefixes: list[str] | None = None,
                      now: int | None = None) -> dict:
     """Mint a short-lived, scoped credential. Returns the `access-key-id`,
     `secret-access-key`, and `expiration` (ISO) to hand a DuckLake-direct
-    client verbatim, plus the packed `claims` (for callers/tests)."""
+    client verbatim, plus the packed `claims` (for callers/tests).
+
+    `read_prefixes` / `deny_prefixes` bake per-vend, least-privilege object
+    scoping into the credential (the STS session-policy equivalent): the
+    gateway serves keys under a read prefix and refuses any under a deny
+    prefix, on top of the per-request governance. Omitted → unscoped (the
+    caller's scope + governance are still enforced)."""
     if not settings.s3_gateway_secret:
         raise RuntimeError("s3 gateway secret is not configured")
     now = int(time.time() if now is None else now)
@@ -102,6 +110,11 @@ def mint_credentials(settings: Settings, *, sub: str, scope: str,
         "cat": catalog_id,
         "exp": exp,
     }
+    # Only pack scoping keys when set — keeps the unscoped key id compact.
+    if read_prefixes:
+        claims["pfx"] = list(read_prefixes)
+    if deny_prefixes:
+        claims["deny"] = list(deny_prefixes)
     payload = _b64u_encode(
         json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
     access_key_id = _PREFIX + payload
@@ -223,6 +236,29 @@ def _relay_response_headers(backend: httpx.Response) -> dict[str, str]:
     }
 
 
+def authorize_prefix(claims: dict, key: str) -> str | None:
+    """Enforce the credential's per-vend object scoping (the STS session-policy
+    equivalent): the key must sit under a `pfx` (read prefix) and under no
+    `deny` prefix. Returns a denial reason, or None when allowed / unscoped."""
+    for d in claims.get("deny") or []:
+        if key.startswith(d):
+            return "gateway_denied_prefix"
+    pfx = claims.get("pfx")
+    if pfx and not any(key.startswith(p) for p in pfx):
+        return "gateway_denied_prefix"
+    return None
+
+
+def _s3_error(code: str, message: str, status: int = 403) -> Response:
+    """An S3-style XML error so boto3/DuckDB surface a normal ClientError
+    (e.g. AccessDenied) instead of choking on a JSON body."""
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Error><Code>{code}</Code><Message>{message}</Message></Error>"
+    )
+    return Response(content=body, status_code=status, media_type="application/xml")
+
+
 def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None:
     """Mount the S3 data-plane routes on the existing app. No-op unless the
     gateway is enabled. Routes ride the same uvicorn/socat exposure as the
@@ -250,7 +286,7 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
         return registry.get(target)
 
     def _deny(ctx, claims: dict, bucket: str, key: str, method: str,
-              reason: str) -> HTTPException:
+              reason: str) -> Response:
         S3_SIGN_TOTAL.labels(decision=reason).inc()
         try:
             ctx.store.audit_load(
@@ -261,20 +297,27 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
                 detail={"method": method})
         except Exception:
             log.exception("audit of gateway denial failed")
-        return HTTPException(status_code=403, detail=f"gateway denied: {reason}")
+        return _s3_error("AccessDenied", f"gateway denied: {reason}")
 
     async def _handle(request: Request, bucket: str, key: str) -> Response:
         method = request.method.upper()
         host = request.headers.get("host", "")
         raw_query = request.url.query
-        # 1) Verify our SigV4 (identity + expiry + integrity).
-        claims = verify_sigv4(
-            settings, method=method, host=host,
-            decoded_path=request.url.path, raw_query=raw_query,
-            headers={k.lower(): v for k, v in request.headers.items()})
+        # 1) Verify our SigV4 (identity + expiry + integrity). Surface a
+        #    verification failure as an S3 error so boto3/DuckDB clients see a
+        #    normal ClientError, not a JSON body.
+        try:
+            claims = verify_sigv4(
+                settings, method=method, host=host,
+                decoded_path=request.url.path, raw_query=raw_query,
+                headers={k.lower(): v for k, v in request.headers.items()})
+        except HTTPException as e:
+            S3_SIGN_TOTAL.labels(decision="gateway_denied_verify").inc()
+            return _s3_error("AccessDenied", str(e.detail), e.status_code)
 
-        # 2) Governance — the exact per-request decision the signer makes.
-        #    Bucket-level LIST (empty key) authorizes against its `prefix`.
+        # 2) Governance — the exact per-request decision the signer makes —
+        #    then the credential's per-vend prefix scoping. Bucket-level LIST
+        #    (empty key) authorizes against its `prefix` query param.
         ctx = _resolve_ctx(claims, key)
         authz_key = key
         if not authz_key:
@@ -282,7 +325,10 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
         decision = signer_mod.authorize_sign(
             ctx, settings, claims, method, bucket, authz_key)
         if not decision.allowed:
-            raise _deny(ctx, claims, bucket, authz_key, method, decision.reason)
+            return _deny(ctx, claims, bucket, authz_key, method, decision.reason)
+        pfx_reason = authorize_prefix(claims, authz_key)
+        if pfx_reason:
+            return _deny(ctx, claims, bucket, authz_key, method, pfx_reason)
         S3_SIGN_TOTAL.labels(decision="gateway_forward").inc()
 
         # 3) Re-sign with the backend ROOT key and forward.
