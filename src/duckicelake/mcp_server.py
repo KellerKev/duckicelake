@@ -59,12 +59,19 @@ class MCPConfig:
 
 
 class GovernedExecutor:
-    """Vends governed credentials (actor=agent, channel=mcp) and runs read-only
-    SQL server-side, returning rows only. One instance is shared across tools."""
+    """Vends governed credentials (actor=agent) and runs read-only SQL
+    server-side, returning rows only. One instance is shared across tools.
 
-    def __init__(self, config: MCPConfig, settings: Settings | None = None) -> None:
+    `channel` is the session-context channel tag stamped on the vend
+    (`channel:<v>`); defaults to `mcp`. The SMCP interface constructs it with
+    `channel="smcp"`. Either way it's an agent session (extra masking + airtight
+    file-layer + read-only)."""
+
+    def __init__(self, config: MCPConfig, settings: Settings | None = None,
+                 channel: str = "mcp") -> None:
         self.cfg = config
         self.settings = settings or load_settings()
+        self.channel = channel
         self._tok: str | None = None
         self._tok_exp = 0.0
         self._lock = threading.Lock()
@@ -99,8 +106,8 @@ class GovernedExecutor:
     def _vend(self, catalog_id: str, namespace: str, principal: str,
               table: str | None) -> dict:
         """Fetch a governed DuckLake-direct credential bundle for an AGENT."""
-        params = {"principal": principal, "actor": "agent", "channel": "mcp",
-                  "delegate": "1"}
+        params = {"principal": principal, "actor": "agent",
+                  "channel": self.channel, "delegate": "1"}
         if table:
             params["table"] = table
         return self.gov_get(

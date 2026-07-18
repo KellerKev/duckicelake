@@ -279,6 +279,18 @@ channel=mcp`, and its tools (`list_namespaces`, `list_tables`, `describe_table`,
 never receives the DSN or S3 credentials, so it can't slip past a masked view to
 the base table.
 
+For agents reaching the catalog **across a network or between agents**, the same
+four tools are also exposed over **SMCP** ([Secure MCP](https://github.com/KellerKev/smcp))
+via `duckicelake.smcp_interface`: MCP's tool model wrapped in `api_key`/JWT auth
+(RS256 so clients can't forge tokens), authenticated per-message encryption, and
+replay protection. An SMCP session vends `actor=agent, channel=smcp`, so it
+inherits the same airtight agent governance (forced file-layer masking, read-only)
+— a qualified base-table query is denied, not leaked. The server binds loopback
+(front it with TLS for the `wss://` edge); the caller's verified `client_id` maps
+to the acting principal. Put the SMCP checkout on `PYTHONPATH`, point
+`DUCKICELAKE_SMCP_CONFIG` at an SMCP TOML (secrets + RS256 keys), and run
+`python -m duckicelake.smcp_interface`.
+
 ```bash
 pixi run demo-lakesh      # lakesh: REST read vs the vended masked view
 ```

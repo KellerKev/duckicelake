@@ -1,0 +1,35 @@
+# SMCP interface config for `python -m duckicelake.smcp_interface`.
+# Point DUCKICELAKE_SMCP_CONFIG at a copy of this (the real one is gitignored —
+# it carries secrets). Generate strong secrets + an RS256 keypair, e.g.:
+#   python -c "import secrets;print(secrets.token_urlsafe(32))"   # each secret
+#   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out keys/smcp_jwt_private.pem
+#   openssl rsa -pubout -in keys/smcp_jwt_private.pem -out keys/smcp_jwt_public.pem
+# SMCPConfig.validate() is fail-closed: it refuses empty/short/placeholder or
+# publicly-known secrets, and the server won't start on an insecure config.
+
+node_id = "duckicelake"
+api_key = "CHANGE_ME_strong_random"          # client auth -> minted JWT session
+secret_key = "CHANGE_ME_min_32_chars_random"  # derives per-message encryption keys
+jwt_secret = "CHANGE_ME_min_32_chars_random"  # HS256 session mint/verify
+kdf_salt = "CHANGE_ME_min_16_chars_random"     # KDF salt for the cipher/MAC keys
+
+[server]
+host = "127.0.0.1"   # loopback; nginx terminates TLS for the wss:// edge
+port = 8791
+
+[security]
+# RS256 (recommended for multi-party): the server mints session JWTs with the
+# private key; clients verify with the public key and cannot forge. Drop this
+# block to run "Simple" HS256 (jwt_secret) instead.
+jwt_algorithm = "RS256"
+jwt_private_key_path = "keys/smcp_jwt_private.pem"
+jwt_public_key_path  = "keys/smcp_jwt_public.pem"
+# For the server to serve wss:// directly (instead of nginx), set:
+# tls_enabled = true
+# tls_cert_path = "certs/server.pem"
+# tls_key_path  = "certs/server.key"
+
+# duckicelake side is env (mirrors the MCP server), not this file:
+#   DUCKICELAKE_URL             gov base url (default http://127.0.0.1:8181)
+#   DUCKICELAKE_MCP_BROKER      "client_id:secret" broker (delegates the caller)
+#   DUCKICELAKE_SMCP_PRINCIPAL  acting principal when the caller asserts none

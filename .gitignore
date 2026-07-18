@@ -23,3 +23,7 @@ __pycache__/
 
 # Local config file (may carry secrets) — commit only the example
 duckicelake.toml
+
+# SMCP interface config (secrets) + RS256/TLS keys — never commit
+smcp.toml
+keys/
