@@ -62,7 +62,8 @@ class CatalogContext:
         self.catalog = DuckLakeCatalog(settings, ref)
         self.store = GovernanceStore(self.catalog)
         self.policy_engine = PolicyEngine(
-            self.store, agent_file_layer=settings.agent_file_layer)
+            self.store, agent_file_layer=settings.agent_file_layer,
+            airtight_channels=settings.airtight_channels)
         self.masking_view_manager = MaskingViewManager(self.catalog, settings)
         self.masked_export_manager = MaskedExportManager(
             self.catalog, settings,

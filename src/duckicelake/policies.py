@@ -141,12 +141,16 @@ def build_plan(
     masking_bodies: dict[str, dict],
     row_bodies: dict[str, dict],
     agent_file_layer: bool = True,
+    airtight_channels: tuple[str, ...] = (),
 ) -> TablePolicyPlan:
     """Pure: derive the enforcement plan for one principal + table.
 
     `agent_file_layer` (default on): when an `actor:agent` session has ANY mask
     applied, force file-layer masking so base bytes are denied (airtight) — an
     agent can't sidestep the masked view with a qualified base-table query.
+    `airtight_channels`: the same for sessions on these channels
+    (`channel:<name>` context role) — any client that runs arbitrary SQL,
+    where a schema-qualified name would otherwise read the base table.
     """
     # Reuse the Phase 1 resolver to get the *derived* policy set, then apply
     # the bypass decision to turn "applies" into "actually masks for this
@@ -215,8 +219,9 @@ def build_plan(
     # masked view (the cooperative gap). Flagged `forced` so the vend scopes
     # the AGENT's creds to the masked export without stamping the whole table
     # file-layer (which would pull humans into the RLS interlock too).
-    if agent_file_layer and not plan.file_layer and not plan.is_empty() \
-            and "actor:agent" in roles:
+    untrusted_sql = (agent_file_layer and "actor:agent" in roles) or any(
+        f"channel:{c}" in roles for c in airtight_channels)
+    if untrusted_sql and not plan.file_layer and not plan.is_empty():
         plan.file_layer = True
         plan.file_layer_forced = True
 
@@ -356,9 +361,11 @@ class PolicyEngine:
     """DB-backed front door: fetch the model for a table, build the plan."""
 
     def __init__(self, store: GovernanceStore,
-                 agent_file_layer: bool = True) -> None:
+                 agent_file_layer: bool = True,
+                 airtight_channels: tuple[str, ...] = ()) -> None:
         self.store = store
         self.agent_file_layer = agent_file_layer
+        self.airtight_channels = tuple(airtight_channels)
 
     def plan_for(self, *, principal: str, roles: list[str],
                  schema: str, table: str) -> TablePolicyPlan:
@@ -368,6 +375,7 @@ class PolicyEngine:
             columns=inp["columns"], object_tags=inp["object_tags"],
             attachments=inp["attachments"], masking_bodies=inp["masking_bodies"],
             row_bodies=inp["row_bodies"], agent_file_layer=self.agent_file_layer,
+            airtight_channels=self.airtight_channels,
         )
 
     @staticmethod

@@ -248,6 +248,13 @@ def _stamped_file_layer(catalog_obj, ns: list[str], table: str | None) -> bool:
         return True
 
 
+def _airtight_session(actor_tag: str, channel_tag: str) -> bool:
+    """Sessions whose masks build_plan forces to the file layer (arbitrary
+    SQL: agents, and channels in settings.airtight_channels)."""
+    return ((actor_tag == "agent" and settings.agent_file_layer)
+            or channel_tag in settings.airtight_channels)
+
+
 def _file_layer_deny_prefixes(ctx: "CatalogContext", ns: list[str], roles: list[str]) -> list[str] | None:
     """For namespace-level vending: base prefixes of file-layer tables the
     principal is masked on (Deny beats the namespace Allow). Enumerates
@@ -1582,11 +1589,13 @@ def ducklake_credentials(
             read_prefixes = [s3.masked_sig_prefix(ns[0], table, export.sig, ctx.ref.data_prefix)]
         else:
             read_prefixes = [s3.table_prefix(ns[0], table, ctx.ref.data_prefix)]
-    elif actor_tag != "agent" and not ctx.policy_engine.store.has_file_layer_policies():
+    elif not _airtight_session(actor_tag, channel_tag) \
+            and not ctx.policy_engine.store.has_file_layer_policies():
         # No specific table AND no file-layer masking anywhere in the catalog
-        # (the common case) AND not an agent — an agent's masks are file-layer
-        # by force (build_plan), even when none is authored file-layer, so it
-        # always takes the carve-out branch below. Here a DuckLake-direct
+        # (the common case) AND not an untrusted-SQL session — an agent's (or
+        # an airtight channel's) masks are file-layer by force (build_plan),
+        # even when none is authored file-layer, so it always takes the
+        # carve-out branch below. Here a DuckLake-direct
         # ATTACH is CATALOG-wide, so scope
         # reads to the whole catalog data prefix. The catalog (account) is the
         # S3 isolation boundary, not the namespace — scoping to one namespace

@@ -114,3 +114,43 @@ def test_channel_can_gate_instead_of_actor():
             row_bodies={})
     assert _plan_channel(["channel:rest"]).masked_columns == []
     assert _plan_channel(["channel:mcp"]).masked_columns == ["host"]
+
+
+def _plan_masked_for_humans(roles, airtight_channels=()):
+    """A column masked for everyone without `pii_reader` (no actor bypass)."""
+    return build_plan(
+        principal="carol", roles=list(roles), schema="main", table="events",
+        columns=["id", "amount"],
+        object_tags=[],
+        attachments=[{"policy_kind": "masking", "policy_name": "mask_amount",
+                      "target_kind": "column", "tag_ns": None, "tag_name": None,
+                      "schema_name": "main", "object_name": "events",
+                      "column_name": "amount", "columns": None}],
+        masking_bodies={"mask_amount": {"signature": "(val DOUBLE)", "body": "0.0",
+                                        "unmasked_roles": ["pii_reader"]}},
+        row_bodies={}, airtight_channels=airtight_channels)
+
+
+def test_untrusted_sql_channels_are_forced_airtight():
+    # A human typing SQL in a console can write `FROM main.events` and skip
+    # the masked view, so console sessions get the airtight tier too.
+    console = _plan_masked_for_humans(["actor:human", "channel:console"], ("console",))
+    assert console.masked_columns == ["amount"]
+    assert console.file_layer is True and console.file_layer_forced is True
+    # other channels stay cooperative; channels are opt-in by config
+    rest = _plan_masked_for_humans(["actor:human", "channel:rest"], ("console",))
+    assert rest.file_layer is False
+    off = _plan_masked_for_humans(["actor:human", "channel:console"], ())
+    assert off.file_layer is False
+    # a bypassing reader has nothing to force
+    reader = _plan_masked_for_humans(["actor:human", "channel:console", "pii_reader"],
+                                     ("console",))
+    assert reader.masked_columns == [] and reader.file_layer is False
+
+
+def test_airtight_channels_default_and_env(monkeypatch):
+    from duckicelake.config import load_settings
+    monkeypatch.delenv("DUCKICELAKE_AIRTIGHT_CHANNELS", raising=False)
+    assert load_settings().airtight_channels == ("console",)
+    monkeypatch.setenv("DUCKICELAKE_AIRTIGHT_CHANNELS", " Console , notebook ,")
+    assert load_settings().airtight_channels == ("console", "notebook")

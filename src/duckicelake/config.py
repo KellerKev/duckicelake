@@ -264,6 +264,11 @@ class Settings:
     # materialisation, but sidesteppable). Independent of how a policy is
     # authored; `file-layer-masking=true` policies are airtight for everyone.
     agent_file_layer: bool = True
+    # Same airtight forcing for sessions a broker tags with one of these
+    # channels: interactive SQL consoles and notebooks run arbitrary SQL, so
+    # the cooperative tier (search_path onto a masked view) is sidestepped by
+    # a schema-qualified name. Comma-separated; empty disables.
+    airtight_channels: tuple[str, ...] = ("console",)
     # Strict mode: extend the airtight tier's fail-CLOSED posture to the
     # COOPERATIVE tier. When true, a governance error on a governed read
     # path — policy planning threw, or a demanded masking view could not be
@@ -386,6 +391,9 @@ def load_settings() -> Settings:
         rls_enabled=os.environ.get("DUCKICELAKE_RLS", "1") == "1",
         agent_file_layer=os.environ.get(
             "DUCKICELAKE_AGENT_FILE_LAYER", "1") == "1",
+        airtight_channels=tuple(
+            c.strip().lower() for c in os.environ.get(
+                "DUCKICELAKE_AIRTIGHT_CHANNELS", "console").split(",") if c.strip()),
         governance_fail_closed=os.environ.get(
             "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(
