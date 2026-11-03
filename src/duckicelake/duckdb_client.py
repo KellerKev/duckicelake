@@ -36,8 +36,20 @@ def hr(title: str) -> None:
 
 
 def _purge_bucket(s3) -> None:
+    """Clear the demo's data prefix (never the whole bucket — it may be shared).
+    Destructive, so it only runs when DUCKICELAKE_DEMO_WIPE=1 (CI sets it)."""
+    if os.environ.get("DUCKICELAKE_DEMO_WIPE") != "1":
+        sys.exit(
+            f"refusing to run: the demo deletes every object under "
+            f"s3://{s3.bucket}/{s3.data_prefix}. Point it at a scratch "
+            f"bucket/prefix and set DUCKICELAKE_DEMO_WIPE=1."
+        )
+    if not s3.data_prefix:
+        sys.exit("refusing to purge: empty s3 data prefix would match the whole bucket")
     c = s3util.s3_client(s3)
-    for p in c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket):
+    for p in c.get_paginator("list_objects_v2").paginate(
+        Bucket=s3.bucket, Prefix=s3.data_prefix
+    ):
         for o in p.get("Contents", []):
             c.delete_object(Bucket=s3.bucket, Key=o["Key"])
 
@@ -45,7 +57,9 @@ def _purge_bucket(s3) -> None:
 def _list_keys(s3) -> list[str]:
     c = s3util.s3_client(s3)
     keys = []
-    for p in c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket):
+    for p in c.get_paginator("list_objects_v2").paginate(
+        Bucket=s3.bucket, Prefix=s3.data_prefix
+    ):
         keys.extend(o["Key"] for o in p.get("Contents", []))
     return keys
 

@@ -6,11 +6,12 @@ import psycopg
 import pytest
 
 from duckicelake.registry import CatalogRegistry, UnknownCatalog
+from conftest import TEST_S3_ROOT
 
 
 CATALOGS = {
-    "acme_reg": ("dl_acme__reg", "acme_reg/main/"),
-    "globex_reg": ("dl_globex__reg", "globex_reg/main/"),
+    "acme_reg": ("dl_acme__reg", f"{TEST_S3_ROOT}acme_reg/main/"),
+    "globex_reg": ("dl_globex__reg", f"{TEST_S3_ROOT}globex_reg/main/"),
 }
 
 

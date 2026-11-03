@@ -13,6 +13,7 @@ import pytest
 
 from duckicelake.catalog import DuckLakeCatalog
 from duckicelake.config import CatalogRef
+from conftest import TEST_S3_ROOT
 
 
 def _s3(settings):
@@ -44,8 +45,8 @@ def _make_catalog(settings, ref: CatalogRef) -> DuckLakeCatalog:
 @pytest.fixture()
 def two_catalogs(settings):
     refs = {
-        "acme": CatalogRef("lake", "acme/main/", "dl_acme__main"),
-        "globex": CatalogRef("lake", "globex/main/", "dl_globex__main"),
+        "acme": CatalogRef("lake", f"{TEST_S3_ROOT}acme/main/", "dl_acme__main"),
+        "globex": CatalogRef("lake", f"{TEST_S3_ROOT}globex/main/", "dl_globex__main"),
     }
     cats = {}
     s3 = _s3(settings)
@@ -110,5 +111,5 @@ def test_data_prefixes_are_disjoint(two_catalogs, settings):
     assert globex_keys, "globex wrote no objects under its prefix"
     # No key belongs to both prefixes.
     assert not (set(acme_keys) & set(globex_keys))
-    assert all(k.startswith("acme/main/") for k in acme_keys)
-    assert all(k.startswith("globex/main/") for k in globex_keys)
+    assert all(k.startswith(refs["acme"].data_prefix) for k in acme_keys)
+    assert all(k.startswith(refs["globex"].data_prefix) for k in globex_keys)

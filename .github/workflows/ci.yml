@@ -32,6 +32,8 @@ jobs:
 
       - name: End-to-end demo assertions
         run: pixi run duckdb-client
+        env:
+          DUCKICELAKE_DEMO_WIPE: "1"   # fresh MinIO bucket; the demo clears its prefix
 
       - name: Stop backends
         if: always()

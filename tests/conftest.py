@@ -26,6 +26,17 @@ from duckicelake.config import load_settings
 # the proxy boots so the server reads it.
 os.environ.setdefault("DUCKICELAKE_CRED_CACHE_TTL", "0")
 
+# Isolation from any live deployment sharing this Postgres cluster / bucket.
+# The suite wipes the `public` schema and purges S3 objects, so it may only
+# ever touch a `*_test` database and keys under TEST_S3_ROOT. Defaults are set
+# before the config file is read (real env > these > duckicelake.toml), and
+# _assert_isolated refuses to run — before any wipe — if something overrode
+# them to point at live state. Tenant-catalog tests root their data prefixes
+# under TEST_S3_ROOT too, so one prefix-scoped purge covers everything.
+TEST_S3_ROOT = "duckicelake-test/"
+os.environ.setdefault("DUCKICELAKE_PG_DATABASE", "ducklake_test")
+os.environ.setdefault("DUCKICELAKE_S3_PREFIX", f"{TEST_S3_ROOT}data/")
+
 
 REPO = os.path.dirname(os.path.dirname(__file__))
 PROXY_URL = "http://127.0.0.1:18181"     # distinct from the demo's 8181
@@ -38,6 +49,19 @@ PROXY_PORT = 18181
 # this is a no-op there. The static-key tier is tested by a separate gateway-off
 # proxy (signing_proxy in test_remote_signing.py).
 GATEWAY_SECRET = "integration-suite-gateway-secret"
+
+# The baseline the suite is written against — auth off (auth tests patch it on
+# per test), no OAuth clients, the gateway pointed at the test proxy — so a box
+# whose duckicelake.toml is a live config still runs the suite as written.
+for _k, _v in {
+    "DUCKICELAKE_REQUIRE_AUTH": "0",
+    "DUCKICELAKE_OAUTH_CLIENTS": "",
+    "DUCKICELAKE_OAUTH_CLIENTS_FILE": "",
+    "DUCKICELAKE_S3_GATEWAY_ENABLED": "1",
+    "DUCKICELAKE_S3_GATEWAY_SECRET": GATEWAY_SECRET,
+    "DUCKICELAKE_S3_GATEWAY_URL": PROXY_URL,
+}.items():
+    os.environ.setdefault(_k, _v)
 
 
 def _wait_ready(url: str, timeout: float = 30.0) -> None:
@@ -53,10 +77,43 @@ def _wait_ready(url: str, timeout: float = 30.0) -> None:
     raise RuntimeError(f"proxy did not become ready at {url} within {timeout}s")
 
 
+def _assert_isolated(settings) -> None:
+    db, prefix = settings.pg_database, settings.s3.data_prefix
+    if not db.endswith("_test") or not prefix.startswith(TEST_S3_ROOT):
+        pytest.exit(
+            f"refusing to run: the suite wipes its database and bucket prefix, "
+            f"but they point at pg_database={db!r}, s3 prefix={prefix!r}. Tests "
+            f"need a '*_test' database and a prefix under {TEST_S3_ROOT!r}.",
+            returncode=2,
+        )
+
+
+def _ensure_test_database(settings) -> None:
+    """Create the (already guard-checked) `*_test` database if it's missing —
+    pg-init only creates the app database."""
+    db = settings.pg_database
+    with psycopg.connect(settings.pg_dsn, dbname="postgres", autocommit=True) as c:
+        if not c.execute("SELECT 1 FROM pg_database WHERE datname = %s", [db]).fetchone():
+            c.execute(psycopg.sql.SQL("CREATE DATABASE {}").format(psycopg.sql.Identifier(db)))
+
+
 def _wipe_postgres(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
+        # Re-checked against the live connection, not the config, so a DSN
+        # built some other way still can't wipe a non-test database.
+        if not c.info.dbname.endswith("_test"):
+            raise RuntimeError(f"refusing to wipe non-test database {c.info.dbname!r}")
         with c.cursor() as cur:
-            cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            # Every user schema, not just public: tenant-catalog metadata
+            # schemas (dl_*) would otherwise carry a stale DATA_PATH into the
+            # next run.
+            cur.execute(
+                "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' "
+                "AND nspname <> 'information_schema'"
+            )
+            for (schema,) in cur.fetchall():
+                cur.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(
+                    psycopg.sql.Identifier(schema)))
             cur.execute("CREATE SCHEMA public")
     # the wipe drops the governance sidecars — forget the process-level
     # "already ensured" flag so the next call re-creates them
@@ -65,15 +122,23 @@ def _wipe_postgres(dsn: str) -> None:
 
 
 def _purge_bucket(s3) -> None:
+    """Delete the suite's own objects — everything under TEST_S3_ROOT and
+    nothing else in the (possibly shared) bucket."""
+    if not s3.data_prefix.startswith(TEST_S3_ROOT):
+        raise RuntimeError(f"refusing to purge non-test prefix {s3.data_prefix!r}")
     c = s3util.s3_client(s3)
-    for p in c.get_paginator("list_objects_v2").paginate(Bucket=s3.bucket):
+    for p in c.get_paginator("list_objects_v2").paginate(
+        Bucket=s3.bucket, Prefix=TEST_S3_ROOT
+    ):
         for o in p.get("Contents", []):
             c.delete_object(Bucket=s3.bucket, Key=o["Key"])
 
 
 @pytest.fixture(scope="session")
 def settings():
-    return load_settings()
+    s = load_settings()
+    _assert_isolated(s)
+    return s
 
 
 @pytest.fixture(scope="session")
@@ -86,6 +151,7 @@ def _proxy(settings):
     """Session-scoped proxy subprocess. Assumes pixi-managed Postgres +
     MinIO are already running (the CI workflow starts them before pytest)."""
     # Clean state before the proxy boots so it sees a fresh catalog.
+    _ensure_test_database(settings)
     _wipe_postgres(settings.pg_dsn)
     _purge_bucket(settings.s3)
     # Bootstrap the default namespace via the same entry point as
@@ -150,7 +216,9 @@ def client():
 # tests can't run. Such tests are marked `requires_sts` and skip there — the
 # no-STS credential story (remote signing, the S3 gateway, static keys) is
 # covered by its own unit/integration tests.
-STS_DISABLED = load_settings().s3.sts_disabled
+_SETTINGS = load_settings()
+_assert_isolated(_SETTINGS)
+STS_DISABLED = _SETTINGS.s3.sts_disabled
 
 requires_sts = pytest.mark.skipif(
     STS_DISABLED,

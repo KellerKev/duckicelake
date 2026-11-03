@@ -9,11 +9,12 @@ from __future__ import annotations
 from duckicelake import s3util
 import psycopg
 import pytest
+from conftest import TEST_S3_ROOT
 
 TENANT = {
     "catalog_id": "tenant_x",
     "metadata_schema": "dl_tenantx__http",
-    "data_prefix": "tenant_x/http/",
+    "data_prefix": f"{TEST_S3_ROOT}tenant_x/http/",
 }
 NS_DEFAULT = "mc_http_default"
 NS_TENANT = "mc_http_tenant"
@@ -210,7 +211,7 @@ def test_account_scoped_catalog_access(monkeypatch, settings):
     from fastapi import HTTPException
 
     cid = f"authz_{_uuid.uuid4().hex[:6]}"
-    srv.registry.provision(cid, f"dl_{cid}__main", f"{cid}/main/", "acme")
+    srv.registry.provision(cid, f"dl_{cid}__main", f"{TEST_S3_ROOT}{cid}/main/", "acme")
     cfg = _enabled_cfg()
     monkeypatch.setattr(srv, "auth_cfg", cfg)
     try:
@@ -276,7 +277,7 @@ def test_provisioning_open_when_auth_disabled(client, settings):
     try:
         r = client.post("/v1/catalogs", json={
             "catalog_id": cid, "metadata_schema": f"dl_{cid}__main",
-            "data_prefix": f"{cid}/main/", "account_id": "acme",
+            "data_prefix": f"{TEST_S3_ROOT}{cid}/main/", "account_id": "acme",
             "create_default_namespace": False})
         assert r.status_code == 201, r.text
         # and with auth off, the account_id does not block access (dev semantics)
