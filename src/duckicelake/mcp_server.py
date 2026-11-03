@@ -19,7 +19,8 @@ deployment concern — see `main()` and `resolve_principal`.
 Config (env):
   DUCKICELAKE_URL             governance base url (default http://127.0.0.1:8181)
   DUCKICELAKE_MCP_BROKER      "client_id:secret" — a broker-scoped OAuth client
-  DUCKICELAKE_MCP_PRINCIPAL   acting principal when none is resolved from auth
+                              (scope `broker *:r`; it needs no admin scope)
+  DUCKICELAKE_MCP_PRINCIPAL   acting principal when auth is off (dev)
   DUCKICELAKE_MCP_HOST/PORT   listener bind (default 127.0.0.1:8790)
 """
 from __future__ import annotations
@@ -38,11 +39,12 @@ from .auth import load_auth_config, verify_bearer
 from .config import Settings, load_settings
 from .sqlsafe import check_no_denied_functions, check_single_select, qi
 
-# The end-user principal for the in-flight MCP request, set by the auth
-# middleware from the caller's verified bearer. Delegation flows this principal
-# to the governance core (the server holds a *broker* token separately).
-_CURRENT_PRINCIPAL: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "mcp_principal", default=None)
+# The end user of the in-flight MCP request — (principal, account) from the
+# caller's verified bearer, set by the auth middleware. Every governance call
+# delegates as this user (the server holds a *broker* token separately); the
+# account is what the governance core checks the catalog's owner against.
+_CURRENT_CALLER: contextvars.ContextVar[tuple[str, str | None] | None] = \
+    contextvars.ContextVar("mcp_caller", default=None)
 
 # Exactly one statement, and only a query: the vended attach is READ_ONLY and
 # the reader role is RLS-scoped, but a second statement (ATTACH, SET, COPY …)
@@ -105,35 +107,42 @@ class GovernedExecutor:
         tok = self._broker_token()
         return {"Authorization": f"Bearer {tok}"} if tok else {}
 
-    def gov_get(self, path: str, params: dict | None = None) -> Any:
-        r = httpx.get(f"{self.cfg.gov_url}{path}", params=params or {},
+    def gov_get(self, path: str, principal: str, account: str | None,
+                params: dict | None = None) -> Any:
+        """GET on the governance core AS the end user: every call is delegated
+        (principal + account + agent session), so the core gates the catalog
+        on the user's account — never on the broker's own identity."""
+        delegation = {"delegate": "1", "principal": principal,
+                      "actor": "agent", "channel": self.channel}
+        if account:
+            delegation["account"] = account
+        r = httpx.get(f"{self.cfg.gov_url}{path}", params={**(params or {}), **delegation},
                       headers=self._headers(), timeout=30.0)
         r.raise_for_status()
         return r.json()
 
     def _vend(self, catalog_id: str, namespace: str, principal: str,
-              table: str | None) -> dict:
+              account: str | None, table: str | None) -> dict:
         """Fetch a governed DuckLake-direct credential bundle for an AGENT."""
-        params = {"principal": principal, "actor": "agent",
-                  "channel": self.channel, "delegate": "1"}
-        if table:
-            params["table"] = table
         return self.gov_get(
             f"/v1/{_seg(catalog_id)}/namespaces/{_seg(namespace)}/ducklake-credentials",
-            params)
+            principal, account, {"table": table} if table else None)
 
-    def list_namespaces(self, catalog_id: str) -> list[str]:
-        out = self.gov_get(f"/v1/{_seg(catalog_id)}/namespaces")
+    def list_namespaces(self, catalog_id: str, principal: str,
+                        account: str | None = None) -> list[str]:
+        out = self.gov_get(f"/v1/{_seg(catalog_id)}/namespaces", principal, account)
         return [".".join(n) for n in out.get("namespaces", [])]
 
-    def list_tables(self, catalog_id: str, namespace: str) -> list[str]:
-        out = self.gov_get(f"/v1/{_seg(catalog_id)}/namespaces/{_seg(namespace)}/tables")
+    def list_tables(self, catalog_id: str, namespace: str, principal: str,
+                    account: str | None = None) -> list[str]:
+        out = self.gov_get(f"/v1/{_seg(catalog_id)}/namespaces/{_seg(namespace)}/tables",
+                           principal, account)
         return [i["name"] for i in out.get("identifiers", [])]
 
     def describe_table(self, catalog_id: str, namespace: str, table: str,
-                       principal: str) -> dict:
+                       principal: str, account: str | None = None) -> dict:
         return self.query(catalog_id, namespace, table,
-                          f"DESCRIBE {qi(namespace)}.{qi(table)}", principal)
+                          f"DESCRIBE {qi(namespace)}.{qi(table)}", principal, account)
 
     def _conn_for(self, bundle: dict, catalog_id: str,
                   namespace: str) -> duckdb.DuckDBPyConnection:
@@ -203,7 +212,7 @@ class GovernedExecutor:
         con.execute("SET lock_configuration = true")
 
     def query(self, catalog_id: str, namespace: str, table: str | None,
-              sql: str, principal: str) -> dict:
+              sql: str, principal: str, account: str | None = None) -> dict:
         try:
             check_single_select(sql or "", "query", allow=_QUERY_TYPES)
             check_no_denied_functions(sql, "query")
@@ -217,7 +226,10 @@ class GovernedExecutor:
         # a table the vend applies row-RLS only. `table` is the query's primary
         # table; multi-table joins fall back to base columns (row-RLS still
         # applies) — prefer one governed table per call for airtight masking.
-        bundle = self._vend(catalog_id, namespace, principal, table=table)
+        try:
+            bundle = self._vend(catalog_id, namespace, principal, account, table=table)
+        except httpx.HTTPStatusError as e:
+            return {"error": f"governance refused the request ({e.response.status_code})"}
         try:
             con = self._conn_for(bundle, catalog_id, namespace)
         except PermissionError as e:
@@ -241,19 +253,23 @@ def _json_safe(v: Any) -> Any:
     return str(v)
 
 
+def resolve_caller(config: MCPConfig) -> tuple[str, str | None]:
+    """(principal, account) of the in-flight call: the `sub` and `account`
+    claims of the caller's verified bearer (set by the auth middleware), else
+    the configured default principal with no account (auth-off dev only —
+    with auth on, the middleware rejects unauthenticated requests)."""
+    return _CURRENT_CALLER.get() or (config.default_principal, None)
+
+
 def resolve_principal(config: MCPConfig) -> str:
-    """The acting end-user principal for the in-flight call: the `sub` of the
-    caller's verified bearer (set by the auth middleware), else the configured
-    default (dev / auth-off). The server then delegates this principal to the
-    governance core with its own broker token."""
-    return _CURRENT_PRINCIPAL.get() or config.default_principal
+    return resolve_caller(config)[0]
 
 
 class _AuthMiddleware:
-    """ASGI middleware: verify the caller's bearer against the governance auth
-    config and pin its `sub` as the request principal. Unauthenticated /
-    unverifiable requests fall through to the configured default principal
-    (so auth-off dev still works); enforcement is delegated to governance."""
+    """ASGI middleware: with auth on, verify the caller's bearer against the
+    governance auth config and pin its (sub, account) as the request's end
+    user; a missing or invalid bearer is a 401 (never a fallback principal).
+    With auth off (dev) requests pass through as the default principal."""
 
     def __init__(self, app) -> None:
         self.app = app
@@ -268,16 +284,27 @@ class _AuthMiddleware:
             if k == b"authorization":
                 authz = v.decode()
                 break
-        principal = None
         try:
-            principal = verify_bearer(self._auth, authz).get("sub")
+            claims = verify_bearer(self._auth, authz)
         except Exception:
-            principal = None
-        token = _CURRENT_PRINCIPAL.set(principal)
+            claims = {}
+        if not claims.get("sub"):
+            await _unauthorized(send)
+            return
+        token = _CURRENT_CALLER.set((claims["sub"], claims.get("account") or None))
         try:
             await self.app(scope, receive, send)
         finally:
-            _CURRENT_PRINCIPAL.reset(token)
+            _CURRENT_CALLER.reset(token)
+
+
+async def _unauthorized(send) -> None:
+    body = b'{"error":"unauthorized"}'
+    await send({"type": "http.response.start", "status": 401,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"www-authenticate", b"Bearer"),
+                            (b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
 
 
 def build_server(config: MCPConfig | None = None):
@@ -291,17 +318,17 @@ def build_server(config: MCPConfig | None = None):
     @mcp.tool()
     def list_namespaces(catalog: str) -> list[str]:
         """List schemas (namespaces) in a catalog."""
-        return ex.list_namespaces(catalog)
+        return ex.list_namespaces(catalog, *resolve_caller(cfg))
 
     @mcp.tool()
     def list_tables(catalog: str, namespace: str) -> list[str]:
         """List tables in a catalog namespace."""
-        return ex.list_tables(catalog, namespace)
+        return ex.list_tables(catalog, namespace, *resolve_caller(cfg))
 
     @mcp.tool()
     def describe_table(catalog: str, namespace: str, table: str) -> dict:
         """Columns + types of a table (governed: reflects the masked view)."""
-        return ex.describe_table(catalog, namespace, table, resolve_principal(cfg))
+        return ex.describe_table(catalog, namespace, table, *resolve_caller(cfg))
 
     @mcp.tool()
     def query(catalog: str, namespace: str, table: str, sql: str) -> dict:
@@ -309,7 +336,7 @@ def build_server(config: MCPConfig | None = None):
         an agent — row-filtered and column-masked — and returned as rows (never
         raw credentials). `table` names the query's primary table so masking is
         routed; write `FROM <table>` unqualified."""
-        return ex.query(catalog, namespace, table, sql, resolve_principal(cfg))
+        return ex.query(catalog, namespace, table, sql, *resolve_caller(cfg))
 
     return mcp
 

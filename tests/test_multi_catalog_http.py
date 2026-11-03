@@ -197,10 +197,11 @@ def _enabled_cfg() -> AuthConfig:
     )
 
 
-def _req_with_token(cfg, *, scope, account="", sub="tester"):
+def _req_with_token(cfg, *, scope, account="", sub="tester", params=None):
     tok = issue_token(cfg, sub, scope=scope,
                       roles="", account=account)["access_token"]
-    return types.SimpleNamespace(headers={"authorization": f"Bearer {tok}"})
+    return types.SimpleNamespace(headers={"authorization": f"Bearer {tok}"},
+                                 query_params=params or {})
 
 
 def test_account_scoped_catalog_access(monkeypatch, settings):
@@ -363,3 +364,43 @@ def test_config_returns_per_catalog_prefix(provisioned, client, settings):
     r = client.get("/v1/config", params={"warehouse": "lakehouse"})
     assert r.status_code == 200, r.text
     assert r.json()["overrides"]["prefix"] == settings.catalog_name
+
+
+def test_delegated_access_is_gated_on_the_asserted_account(monkeypatch, settings):
+    """A broker acting for an end user (delegate=1) reaches only the catalog of
+    the account it asserts for that user — never via its own scope or account,
+    even when the broker token is admin-scope."""
+    import duckicelake.server as srv
+    from fastapi import HTTPException
+
+    cid = f"deleg_{_uuid.uuid4().hex[:6]}"
+    srv.registry.provision(cid, f"dl_{cid}__main", f"{TEST_S3_ROOT}{cid}/main/", "acme")
+    cfg = _enabled_cfg()
+    monkeypatch.setattr(srv, "auth_cfg", cfg)
+
+    def resolve(scope, params, account=""):
+        return srv.resolve_catalog(cid, _req_with_token(
+            cfg, scope=scope, account=account, params=params))
+
+    def denied(scope, params, account=""):
+        try:
+            resolve(scope, params, account)
+        except HTTPException as e:
+            return e.status_code == 404
+        return False
+
+    try:
+        d = {"delegate": "1", "principal": "alice"}
+        for broker in ("broker *:r", "*"):
+            assert resolve(broker, {**d, "account": "acme"}).catalog_id == cid
+            assert denied(broker, {**d, "account": "globex"})
+            assert denied(broker, d)                       # no account asserted
+        # the broker's own account claim doesn't stand in for the user's
+        assert denied("broker *:r", {**d, "account": "globex"}, account="acme")
+        # a non-broker can't use delegate=1 to assert an account
+        assert denied("ns:*:rw", {**d, "account": "acme"}, account="globex")
+        # an admin token's own (non-delegated) call still reaches everything
+        assert resolve("*", {}).catalog_id == cid
+    finally:
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
+            c.execute(f'DROP SCHEMA IF EXISTS "dl_{cid}__main" CASCADE')

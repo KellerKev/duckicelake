@@ -670,14 +670,32 @@ def resolve_catalog(prefix: str, request: Request) -> CatalogContext:
     # per-catalog PG reader roles + disjoint S3 prefixes back it below).
     # Enforced only when auth is on. Unowned catalogs (account_id NULL —
     # incl. the default) stay reachable to every authenticated caller;
-    # admin-scope tokens reach everything.
+    # admin-scope tokens reach everything — for their OWN calls.
+    #
+    # A delegated call (delegate=1 from a broker) acts as the end user, so it
+    # is gated on the account the broker asserts for that user (`account`
+    # query param), never on the broker's own claims: a broker — even an
+    # admin-scope one — must not turn into a cross-tenant pass for whoever it
+    # fronts. No asserted account = no owned catalog.
     if auth_cfg.enabled and ctx.account_id is not None:
         claims = claims_from_request(auth_cfg, request)
-        if (claims.get("account") != ctx.account_id
-                and not is_admin_scope(claims.get("scope", ""))):
+        scope = claims.get("scope", "")
+        if _is_delegated(request, scope):
+            allowed = request.query_params.get("account") == ctx.account_id
+        else:
+            allowed = claims.get("account") == ctx.account_id or is_admin_scope(scope)
+        if not allowed:
             raise HTTPException(
                 status_code=404, detail=f"Unknown catalog prefix '{prefix}'")
     return ctx
+
+
+def _is_delegated(request: Request | None, scope: str) -> bool:
+    """delegate=1 from a broker-scope token: the request acts as the end user
+    the broker names (principal / account / actor / channel query params)."""
+    qp = getattr(request, "query_params", None) or {}
+    return (str(qp.get("delegate", "")).lower() in ("1", "true", "yes")
+            and is_broker_scope(scope))
 
 
 @app.get("/v1/{prefix}/namespaces", response_model=ListNamespacesResponse)

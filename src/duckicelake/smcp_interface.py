@@ -42,6 +42,25 @@ def resolve_principal() -> str:
         "DUCKICELAKE_SMCP_PRINCIPAL", "smcp-guest")
 
 
+def _accounts() -> dict[str, str]:
+    """DUCKICELAKE_SMCP_ACCOUNTS="client_id=account_id,…" — the tenant each
+    SMCP client acts for. SMCP identities carry no account, so this mapping is
+    the only thing that lets a client reach an account-owned catalog."""
+    out = {}
+    for pair in os.environ.get("DUCKICELAKE_SMCP_ACCOUNTS", "").split(","):
+        cid, sep, acct = pair.strip().partition("=")
+        if sep and cid.strip() and acct.strip():
+            out[cid.strip()] = acct.strip()
+    return out
+
+
+def resolve_caller() -> tuple[str, str | None]:
+    """(principal, account) the governed tools delegate as. An unmapped
+    client has no account → reaches unowned catalogs only."""
+    client = _CURRENT_CLIENT.get()
+    return resolve_principal(), (_accounts().get(client) if client else None)
+
+
 def _build_identity_node(cfg):
     """An `SMCPNode` that publishes the verified caller identity into a
     contextvar around the guarded invocation, so governed handlers can delegate
@@ -81,18 +100,18 @@ def build_server(smcp_cfg=None, mcp_cfg: MCPConfig | None = None):
     server.node = _build_identity_node(smcp_cfg)  # drop demo built-ins; ours only
 
     def q(catalog, namespace, table, sql):
-        return ex.query(catalog, namespace, table, sql, resolve_principal())
+        return ex.query(catalog, namespace, table, sql, *resolve_caller())
 
     server.register_tool(
         "list_namespaces", "List schemas (namespaces) in a catalog.",
         {"catalog": {"type": "string"}, "required": ["catalog"]},
-        ex.list_namespaces)
+        lambda catalog: ex.list_namespaces(catalog, *resolve_caller()))
 
     server.register_tool(
         "list_tables", "List tables in a catalog namespace.",
         {"catalog": {"type": "string"}, "namespace": {"type": "string"},
          "required": ["catalog", "namespace"]},
-        ex.list_tables)
+        lambda catalog, namespace: ex.list_tables(catalog, namespace, *resolve_caller()))
 
     server.register_tool(
         "describe_table",
@@ -100,7 +119,7 @@ def build_server(smcp_cfg=None, mcp_cfg: MCPConfig | None = None):
         {"catalog": {"type": "string"}, "namespace": {"type": "string"},
          "table": {"type": "string"}, "required": ["catalog", "namespace", "table"]},
         lambda catalog, namespace, table: ex.describe_table(
-            catalog, namespace, table, resolve_principal()))
+            catalog, namespace, table, *resolve_caller()))
 
     server.register_tool(
         "query",
