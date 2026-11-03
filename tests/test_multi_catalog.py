@@ -63,6 +63,9 @@ def two_catalogs(settings):
         with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
             for ref in refs.values():
                 c.execute(f'DROP SCHEMA IF EXISTS "{ref.metadata_schema}" CASCADE')
+        # the dropped schemas took their governance sidecars with them
+        from duckicelake.governance import reset_sidecar_cache
+        reset_sidecar_cache()
         for ref in refs.values():
             for k in _keys_under(s3, settings.s3.bucket, ref.data_prefix):
                 s3.delete_object(Bucket=settings.s3.bucket, Key=k)

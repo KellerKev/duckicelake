@@ -302,5 +302,5 @@ def test_agent_executor_masks_and_is_locked_down(client, settings, executor):
 def test_hostile_names_in_tool_paths_stay_one_segment(executor):
     # `catalog` can't add path segments / a query string to the gov request
     with pytest.raises(Exception) as e:
-        executor.list_tables("lake/governance/audit?x=", "y")
+        executor.list_tables("lake/governance/audit?x=", "y", "bob")
     assert "404" in str(e.value)

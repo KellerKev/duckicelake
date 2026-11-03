@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .catalog import DuckLakeCatalog, pg_advisory_lock
+from .sqlsafe import qi
 
 log = logging.getLogger("duckicelake.governance")
 
@@ -77,23 +78,28 @@ VALID_ATTACH_TARGETS = {
 
 #: Process-level guard so the ~14 sidecar DDL statements (incl. ALTER TABLE
 #: ADD COLUMN, which takes a brief ACCESS EXCLUSIVE lock even as a no-op)
-#: run once per process instead of on every GovernanceStore call — a single
-#: masked LoadTable would otherwise re-run them 3-4× and serialize concurrent
-#: requests on catalog locks. The proxy's schema is never wiped mid-process;
-#: tests that wipe Postgres call `reset_sidecar_cache()` (via conftest) to
-#: keep the flag honest.
-_SIDECARS_ENSURED = False
+#: run once per process (per catalog schema) instead of on every
+#: GovernanceStore call — a single masked LoadTable would otherwise re-run them
+#: 3-4× and serialize concurrent requests on catalog locks. The proxy's schemas
+#: are never wiped mid-process; tests that wipe Postgres call
+#: `reset_sidecar_cache()` (via conftest) to keep the set honest.
+_SIDECARS_ENSURED: set[str] = set()
 
 
 def reset_sidecar_cache() -> None:
-    """Forget that the governance sidecars were ensured — call after wiping
-    the `public` schema so the next ensure re-creates them."""
-    global _SIDECARS_ENSURED
-    _SIDECARS_ENSURED = False
+    """Forget which schemas' governance sidecars were ensured — call after
+    wiping Postgres so the next ensure re-creates them."""
+    _SIDECARS_ENSURED.clear()
 
 
-def ensure_governance_sidecars(cur) -> None:
-    """Create the Phase 1 governance sidecar tables if absent.
+def ensure_governance_sidecars(cur, schema: str) -> None:
+    """Create the governance sidecar tables in `schema` if absent.
+
+    Governance is PER CATALOG: each catalog's tags, policies, attachments,
+    roles, grants, static keys and audit live in its own sidecar schema (its
+    DuckLake metadata schema; `public` for the default catalog), so one
+    tenant's policy names, role grants or `sales.customers` attachments can
+    never touch another's.
 
     Idempotent and cheap after the first call per process (guarded by
     `_SIDECARS_ENSURED`), matching the catalog's `_ensure_sidecar`
@@ -102,18 +108,18 @@ def ensure_governance_sidecars(cur) -> None:
     serialized ACROSS workers by a blocking advisory lock — the per-process
     flag can't stop N workers racing the same CREATE/ALTER DDL at startup
     (`tuple concurrently updated`)."""
-    global _SIDECARS_ENSURED
-    if _SIDECARS_ENSURED:
+    if schema in _SIDECARS_ENSURED:
         return
-    with pg_advisory_lock(cur, "duckicelake:governance_sidecars"):
-        _ensure_governance_sidecars_ddl(cur)
-    _SIDECARS_ENSURED = True
+    with pg_advisory_lock(cur, f"duckicelake:governance_sidecars:{schema}"):
+        _ensure_governance_sidecars_ddl(cur, qi(schema))
+    _SIDECARS_ENSURED.add(schema)
 
 
-def _ensure_governance_sidecars_ddl(cur) -> None:
+def _ensure_governance_sidecars_ddl(cur, sc: str) -> None:
+    """DDL body; `sc` is the quoted sidecar schema."""
     # --- tag definitions -------------------------------------------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_tag (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_tag (
             tag_ns         VARCHAR NOT NULL,
             tag_name       VARCHAR NOT NULL,
             allowed_values TEXT[],            -- NULL = free-form
@@ -125,8 +131,8 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     # column_name is NOT NULL with an '' sentinel so it can sit in the PK
     # (Postgres PKs reject NULLs). '' means "the object itself", a real
     # name means "that column".
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_object_tag (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_object_tag (
             object_kind  VARCHAR NOT NULL,
             schema_name  VARCHAR NOT NULL,
             object_name  VARCHAR NOT NULL DEFAULT '',
@@ -139,8 +145,8 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
         )
     """)
     # --- masking policies (named UDF-shaped definitions) ----------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_masking_policy (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_masking_policy (
             name          VARCHAR PRIMARY KEY,
             signature_sql VARCHAR NOT NULL,   -- e.g. "(val VARCHAR)"
             body_sql      VARCHAR NOT NULL,    -- e.g. "CASE WHEN ... THEN val ELSE '***' END"
@@ -148,8 +154,8 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
         )
     """)
     # --- row access policies --------------------------------------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_row_access_policy (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_row_access_policy (
             name          VARCHAR PRIMARY KEY,
             signature_sql VARCHAR NOT NULL,   -- e.g. "(region VARCHAR)"
             body_sql      VARCHAR NOT NULL,    -- RETURNS BOOLEAN body
@@ -165,7 +171,7 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     # used to synthesise the view-fallback SQL. NULL/empty = nobody bypasses.
     for _pt in ("duckicelake_masking_policy", "duckicelake_row_access_policy"):
         cur.execute(
-            f"ALTER TABLE public.{_pt} "
+            f"ALTER TABLE {sc}.{_pt} "
             f"ADD COLUMN IF NOT EXISTS unmasked_roles TEXT[]"
         )
     # Phase 4: file-layer masking. When true, the proxy ALSO materializes
@@ -173,15 +179,15 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     # mask-signature) so engines that read Parquet directly get masked
     # bytes. Default false = catalog-level masking only (views + signals).
     cur.execute(
-        "ALTER TABLE public.duckicelake_masking_policy "
+        f"ALTER TABLE {sc}.duckicelake_masking_policy "
         "ADD COLUMN IF NOT EXISTS file_layer_masking BOOLEAN NOT NULL DEFAULT false"
     )
     # --- policy attachments ---------------------------------------------
     # A masking policy attaches to a tag or a single column; a row-access
     # policy attaches to a table on a column-list. `columns` holds the
     # row-access column-list; tag_* / column_name carry the other targets.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_policy_attachment (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_policy_attachment (
             id          BIGSERIAL PRIMARY KEY,
             policy_kind VARCHAR NOT NULL,      -- 'masking' | 'row_access'
             policy_name VARCHAR NOT NULL,
@@ -197,9 +203,9 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     """)
     # A given (policy, target) pair should only attach once. Partial-ish
     # uniqueness via a COALESCE'd expression index over the target columns.
-    cur.execute("""
+    cur.execute(f"""
         CREATE UNIQUE INDEX IF NOT EXISTS duckicelake_policy_attachment_uq
-        ON public.duckicelake_policy_attachment (
+        ON {sc}.duckicelake_policy_attachment (
             policy_kind, policy_name, target_kind,
             COALESCE(tag_ns, ''), COALESCE(tag_name, ''),
             COALESCE(schema_name, ''), COALESCE(object_name, ''),
@@ -207,14 +213,14 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
         )
     """)
     # --- roles + grants --------------------------------------------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_role (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_role (
             role_name  VARCHAR PRIMARY KEY,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_role_grant (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_role_grant (
             role_name     VARCHAR NOT NULL,
             principal_sub VARCHAR NOT NULL,
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -224,12 +230,12 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     # The RLS predicate functions and roles_for_principal look grants up BY
     # PRINCIPAL; the PK leads with role_name, so those lookups scanned. This
     # index runs inside every DuckLake-direct reader's query plan.
-    cur.execute("""
+    cur.execute(f"""
         CREATE INDEX IF NOT EXISTS duckicelake_role_grant_principal_idx
-        ON public.duckicelake_role_grant (principal_sub)
+        ON {sc}.duckicelake_role_grant (principal_sub)
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_object_owner (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_object_owner (
             object_kind VARCHAR NOT NULL,
             schema_name VARCHAR NOT NULL,
             object_name VARCHAR NOT NULL DEFAULT '',
@@ -237,8 +243,8 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
             PRIMARY KEY (object_kind, schema_name, object_name)
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_object_grant (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_object_grant (
             object_kind VARCHAR NOT NULL,
             schema_name VARCHAR NOT NULL,
             object_name VARCHAR NOT NULL DEFAULT '',
@@ -253,8 +259,8 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     # bucket-policy Principal); storing secret_access_key is an operator
     # opt-in for turnkey vending — with it, a governance-DB dump is a full
     # project S3 compromise on Hetzner (keys are project-scoped).
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_static_s3_key (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_static_s3_key (
             principal          VARCHAR PRIMARY KEY,
             access_key_id      VARCHAR NOT NULL,
             secret_access_key  VARCHAR,
@@ -266,12 +272,12 @@ def _ensure_governance_sidecars_ddl(cur) -> None:
     # the masked-sig export — lets a file-layer-masked principal be vended this
     # key instead of failing closed. Default false = pre-existing fail-closed.
     cur.execute(
-        "ALTER TABLE public.duckicelake_static_s3_key "
+        f"ALTER TABLE {sc}.duckicelake_static_s3_key "
         "ADD COLUMN IF NOT EXISTS confined BOOLEAN NOT NULL DEFAULT false"
     )
     # --- audit log -------------------------------------------------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_governance_audit (
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_governance_audit (
             id               BIGSERIAL PRIMARY KEY,
             ts               TIMESTAMPTZ NOT NULL DEFAULT now(),
             principal_sub    VARCHAR,
@@ -415,6 +421,11 @@ class GovernanceStore:
 
     def __init__(self, catalog: DuckLakeCatalog) -> None:
         self.catalog = catalog
+
+    @property
+    def _sc(self) -> str:
+        """This catalog's quoted governance sidecar schema."""
+        return self.catalog.sidecar_sql
         # Read-path audit retention: rows older than this are lazily purged
         # (at most once an hour, piggybacked on audit_load). 0 = keep forever.
         # The audit table otherwise grows one row per governed read.
@@ -440,8 +451,8 @@ class GovernanceStore:
         cursor so it joins the caller's transaction (authoring + its audit
         row commit atomically)."""
         cur.execute(
-            """
-            INSERT INTO public.duckicelake_governance_audit
+            f"""
+            INSERT INTO {self._sc}.duckicelake_governance_audit
                 (principal_sub, operation, object, decision,
                  masked_cols, applied_policies, detail)
             VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
@@ -469,7 +480,7 @@ class GovernanceStore:
         LoadTable shape."""
         try:
             with self.catalog.pg_cursor() as cur:
-                ensure_governance_sidecars(cur)
+                ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
                 self.audit(
                     cur, principal=principal, operation=operation,
                     object_=object_,
@@ -495,19 +506,19 @@ class GovernanceStore:
             return
         self._last_audit_purge = now
         cur.execute(
-            "DELETE FROM public.duckicelake_governance_audit "
+            f"DELETE FROM {self._sc}.duckicelake_governance_audit "
             "WHERE ts < now() - make_interval(days => %s)",
             (self.audit_retention_days,),
         )
 
     def list_audit(self, limit: int = 200) -> list[dict]:
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
+                f"""
                 SELECT id, ts, principal_sub, operation, object, decision,
                        masked_cols, applied_policies, detail
-                FROM public.duckicelake_governance_audit
+                FROM {self._sc}.duckicelake_governance_audit
                 ORDER BY id DESC
                 LIMIT %s
                 """,
@@ -535,8 +546,8 @@ class GovernanceStore:
         scan when there are none (the common case) — one indexed PG read on the
         metadata pool instead of a plan_for per table across every namespace."""
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
-            cur.execute("SELECT EXISTS(SELECT 1 FROM public.duckicelake_masking_policy "
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(f"SELECT EXISTS(SELECT 1 FROM {self._sc}.duckicelake_masking_policy "
                         "WHERE file_layer_masking)")
             return bool(cur.fetchone()[0])
 
@@ -545,10 +556,10 @@ class GovernanceStore:
     def create_tag(self, principal: str, tag_ns: str, tag_name: str,
                    allowed_values: list[str] | None) -> None:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_tag (tag_ns, tag_name, allowed_values)
+                f"""
+                INSERT INTO {self._sc}.duckicelake_tag (tag_ns, tag_name, allowed_values)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (tag_ns, tag_name) DO UPDATE
                   SET allowed_values = EXCLUDED.allowed_values
@@ -565,7 +576,7 @@ class GovernanceStore:
         # If this tag already carries a masking policy, assigning it must not
         # give any newly-tagged column a second mask (one-mask-per-column).
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             tag_masks = self._masking_policies_on_tag(cur, tag_ns, tag_name)
         if tag_masks:
             affected = self._expand_tag_rows(
@@ -573,10 +584,10 @@ class GovernanceStore:
             for p in tag_masks:
                 self._assert_columns_unmasked(affected, p)
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_object_tag
+                f"""
+                INSERT INTO {self._sc}.duckicelake_object_tag
                     (object_kind, schema_name, object_name, column_name,
                      tag_ns, tag_name, tag_value)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -613,12 +624,12 @@ class GovernanceStore:
                        unmasked_roles: list[str] | None,
                        file_layer_masking: bool | None = None) -> None:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             if file_layer_masking is None:
                 # row-access policies have no file_layer column
                 cur.execute(
                     f"""
-                    INSERT INTO public.{table} (name, signature_sql, body_sql, unmasked_roles)
+                    INSERT INTO {self._sc}.{table} (name, signature_sql, body_sql, unmasked_roles)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (name) DO UPDATE
                       SET signature_sql = EXCLUDED.signature_sql,
@@ -630,7 +641,7 @@ class GovernanceStore:
             else:
                 cur.execute(
                     f"""
-                    INSERT INTO public.{table}
+                    INSERT INTO {self._sc}.{table}
                         (name, signature_sql, body_sql, unmasked_roles, file_layer_masking)
                     VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (name) DO UPDATE
@@ -666,10 +677,10 @@ class GovernanceStore:
             if affected:
                 self._assert_columns_unmasked(affected, policy_name)
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_policy_attachment
+                f"""
+                INSERT INTO {self._sc}.duckicelake_policy_attachment
                     (policy_kind, policy_name, target_kind, tag_ns, tag_name,
                      schema_name, object_name, column_name, columns)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -693,9 +704,9 @@ class GovernanceStore:
 
     def create_role(self, principal: str, role_name: str) -> None:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "INSERT INTO public.duckicelake_role (role_name) VALUES (%s) "
+                f"INSERT INTO {self._sc}.duckicelake_role (role_name) VALUES (%s) "
                 "ON CONFLICT (role_name) DO NOTHING",
                 (role_name,),
             )
@@ -704,10 +715,10 @@ class GovernanceStore:
 
     def grant_role(self, principal: str, role_name: str, principal_sub: str) -> None:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_role_grant (role_name, principal_sub)
+                f"""
+                INSERT INTO {self._sc}.duckicelake_role_grant (role_name, principal_sub)
                 VALUES (%s, %s)
                 ON CONFLICT (role_name, principal_sub) DO NOTHING
                 """,
@@ -719,10 +730,10 @@ class GovernanceStore:
     def grant_object(self, principal: str, *, object_kind: str, schema_name: str,
                      object_name: str, privilege: str, role_name: str) -> None:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_object_grant
+                f"""
+                INSERT INTO {self._sc}.duckicelake_object_grant
                     (object_kind, schema_name, object_name, privilege, role_name)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (object_kind, schema_name, object_name, privilege, role_name)
@@ -752,16 +763,16 @@ class GovernanceStore:
     def _delete_policy(self, table: str, kind: str, op: str,
                        principal: str, name: str) -> int:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "SELECT count(*) FROM public.duckicelake_policy_attachment "
+                f"SELECT count(*) FROM {self._sc}.duckicelake_policy_attachment "
                 "WHERE policy_kind = %s AND policy_name = %s", (kind, name))
             attached = cur.fetchone()[0]
             if attached:
                 raise GovernanceConflict(
                     f"policy '{name}' is still attached to {attached} target(s) "
                     f"— detach it before deleting")
-            cur.execute(f"DELETE FROM public.{table} WHERE name = %s", (name,))
+            cur.execute(f"DELETE FROM {self._sc}.{table} WHERE name = %s", (name,))
             deleted = cur.rowcount
             if deleted:
                 self.audit(cur, principal=principal, operation=op, object_=name)
@@ -775,10 +786,10 @@ class GovernanceStore:
         affected = self._attachment_affected_tables(
             target_kind, tag_ns, tag_name, schema_name, object_name)
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                DELETE FROM public.duckicelake_policy_attachment
+                f"""
+                DELETE FROM {self._sc}.duckicelake_policy_attachment
                 WHERE policy_kind = %s AND policy_name = %s AND target_kind = %s
                   AND COALESCE(tag_ns,'')      = COALESCE(%s,'')
                   AND COALESCE(tag_name,'')    = COALESCE(%s,'')
@@ -803,10 +814,10 @@ class GovernanceStore:
         affected = sorted({(s, t) for s, t, _ in self._expand_tag_rows(
             [(object_kind, schema_name, object_name, column_name)])})
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                DELETE FROM public.duckicelake_object_tag
+                f"""
+                DELETE FROM {self._sc}.duckicelake_object_tag
                 WHERE object_kind = %s AND schema_name = %s AND object_name = %s
                   AND column_name = %s AND tag_ns = %s AND tag_name = %s
                 """,
@@ -823,11 +834,11 @@ class GovernanceStore:
 
     def delete_tag(self, principal: str, tag_ns: str, tag_name: str) -> int:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
-            cur.execute("SELECT count(*) FROM public.duckicelake_object_tag "
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(f"SELECT count(*) FROM {self._sc}.duckicelake_object_tag "
                         "WHERE tag_ns = %s AND tag_name = %s", (tag_ns, tag_name))
             uses = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM public.duckicelake_policy_attachment "
+            cur.execute(f"SELECT count(*) FROM {self._sc}.duckicelake_policy_attachment "
                         "WHERE target_kind = 'tag' AND tag_ns = %s AND tag_name = %s",
                         (tag_ns, tag_name))
             atts = cur.fetchone()[0]
@@ -835,7 +846,7 @@ class GovernanceStore:
                 raise GovernanceConflict(
                     f"tag {tag_ns}.{tag_name} is still in use "
                     f"({uses} assignment(s), {atts} attachment(s)) — remove those first")
-            cur.execute("DELETE FROM public.duckicelake_tag "
+            cur.execute(f"DELETE FROM {self._sc}.duckicelake_tag "
                         "WHERE tag_ns = %s AND tag_name = %s", (tag_ns, tag_name))
             deleted = cur.rowcount
             if deleted:
@@ -845,11 +856,11 @@ class GovernanceStore:
 
     def delete_role(self, principal: str, role_name: str) -> int:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
-            cur.execute("SELECT count(*) FROM public.duckicelake_role_grant "
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(f"SELECT count(*) FROM {self._sc}.duckicelake_role_grant "
                         "WHERE role_name = %s", (role_name,))
             grants = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM public.duckicelake_object_grant "
+            cur.execute(f"SELECT count(*) FROM {self._sc}.duckicelake_object_grant "
                         "WHERE role_name = %s", (role_name,))
             ogrants = cur.fetchone()[0]
             if grants or ogrants:
@@ -857,7 +868,7 @@ class GovernanceStore:
                     f"role '{role_name}' is still granted "
                     f"({grants} principal grant(s), {ogrants} object grant(s)) "
                     f"— revoke those first")
-            cur.execute("DELETE FROM public.duckicelake_role WHERE role_name = %s",
+            cur.execute(f"DELETE FROM {self._sc}.duckicelake_role WHERE role_name = %s",
                         (role_name,))
             deleted = cur.rowcount
             if deleted:
@@ -867,8 +878,8 @@ class GovernanceStore:
 
     def revoke_role(self, principal: str, role_name: str, principal_sub: str) -> int:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
-            cur.execute("DELETE FROM public.duckicelake_role_grant "
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(f"DELETE FROM {self._sc}.duckicelake_role_grant "
                         "WHERE role_name = %s AND principal_sub = %s",
                         (role_name, principal_sub))
             deleted = cur.rowcount
@@ -881,9 +892,9 @@ class GovernanceStore:
                             schema_name: str, object_name: str, privilege: str,
                             role_name: str) -> int:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "DELETE FROM public.duckicelake_object_grant "
+                f"DELETE FROM {self._sc}.duckicelake_object_grant "
                 "WHERE object_kind = %s AND schema_name = %s AND object_name = %s "
                 "AND privilege = %s AND role_name = %s",
                 (object_kind, schema_name, object_name, privilege, role_name))
@@ -908,20 +919,20 @@ class GovernanceStore:
         object_name = table; schema-level rows carry object_name = '' and are
         untouched.)"""
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "UPDATE public.duckicelake_object_tag "
+                f"UPDATE {self._sc}.duckicelake_object_tag "
                 "SET schema_name = %s, object_name = %s "
                 "WHERE schema_name = %s AND object_name = %s",
                 (dst_schema, dst_table, src_schema, src_table))
             cur.execute(
-                "UPDATE public.duckicelake_policy_attachment "
+                f"UPDATE {self._sc}.duckicelake_policy_attachment "
                 "SET schema_name = %s, object_name = %s "
                 "WHERE target_kind IN ('table', 'column') "
                 "  AND schema_name = %s AND object_name = %s",
                 (dst_schema, dst_table, src_schema, src_table))
             cur.execute(
-                "UPDATE public.duckicelake_object_grant "
+                f"UPDATE {self._sc}.duckicelake_object_grant "
                 "SET schema_name = %s, object_name = %s "
                 "WHERE schema_name = %s AND object_name = %s",
                 (dst_schema, dst_table, src_schema, src_table))
@@ -939,14 +950,14 @@ class GovernanceStore:
         a LEAK. Tag-target masks ride the tag, not the name, and are untouched
         (the column keeps its tag rows, which move here)."""
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "UPDATE public.duckicelake_object_tag SET column_name = %s "
+                f"UPDATE {self._sc}.duckicelake_object_tag SET column_name = %s "
                 "WHERE object_kind = 'column' AND schema_name = %s "
                 "  AND object_name = %s AND column_name = %s",
                 (new_column, schema, table, old_column))
             cur.execute(
-                "UPDATE public.duckicelake_policy_attachment SET column_name = %s "
+                f"UPDATE {self._sc}.duckicelake_policy_attachment SET column_name = %s "
                 "WHERE target_kind = 'column' AND schema_name = %s "
                 "  AND object_name = %s AND column_name = %s",
                 (new_column, schema, table, old_column))
@@ -962,18 +973,18 @@ class GovernanceStore:
         mask / row-filter / grant. Tag-target attachments (not table-specific)
         are left intact."""
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "DELETE FROM public.duckicelake_object_tag "
+                f"DELETE FROM {self._sc}.duckicelake_object_tag "
                 "WHERE schema_name = %s AND object_name = %s",
                 (schema, table))
             cur.execute(
-                "DELETE FROM public.duckicelake_policy_attachment "
+                f"DELETE FROM {self._sc}.duckicelake_policy_attachment "
                 "WHERE target_kind IN ('table', 'column') "
                 "  AND schema_name = %s AND object_name = %s",
                 (schema, table))
             cur.execute(
-                "DELETE FROM public.duckicelake_object_grant "
+                f"DELETE FROM {self._sc}.duckicelake_object_grant "
                 "WHERE schema_name = %s AND object_name = %s",
                 (schema, table))
             self.audit(cur, principal=principal,
@@ -992,9 +1003,9 @@ class GovernanceStore:
 
     def roles_for_principal(self, principal_sub: str) -> list[str]:
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "SELECT role_name FROM public.duckicelake_role_grant "
+                f"SELECT role_name FROM {self._sc}.duckicelake_role_grant "
                 "WHERE principal_sub = %s ORDER BY role_name",
                 (principal_sub,),
             )
@@ -1006,10 +1017,10 @@ class GovernanceStore:
                        secret: str | None = None,
                        note: str | None = None, confined: bool = False) -> None:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_static_s3_key
+                f"""
+                INSERT INTO {self._sc}.duckicelake_static_s3_key
                     (principal, access_key_id, secret_access_key, note, confined)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (principal) DO UPDATE
@@ -1023,18 +1034,18 @@ class GovernanceStore:
 
     def delete_static_key(self, principal: str) -> bool:
         with self.catalog.pg_cursor() as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
-                "DELETE FROM public.duckicelake_static_s3_key "
+                f"DELETE FROM {self._sc}.duckicelake_static_s3_key "
                 "WHERE principal = %s", (principal,))
             return cur.rowcount > 0
 
     def static_key_for_principal(self, principal: str) -> "StaticKey | None":
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
                 "SELECT access_key_id, secret_access_key, note, confined "
-                "FROM public.duckicelake_static_s3_key WHERE principal = %s",
+                f"FROM {self._sc}.duckicelake_static_s3_key WHERE principal = %s",
                 (principal,))
             row = cur.fetchone()
         if row is None:
@@ -1044,10 +1055,10 @@ class GovernanceStore:
 
     def list_static_keys(self) -> "list[StaticKey]":
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
             cur.execute(
                 "SELECT principal, access_key_id, secret_access_key, note, confined "
-                "FROM public.duckicelake_static_s3_key ORDER BY principal")
+                f"FROM {self._sc}.duckicelake_static_s3_key ORDER BY principal")
             rows = cur.fetchall()
         return [StaticKey(principal=r[0], access_key_id=r[1],
                           secret_access_key=r[2], note=r[3], confined=r[4]) for r in rows]
@@ -1064,14 +1075,14 @@ class GovernanceStore:
         fail-safe)."""
         with self.catalog.pg_cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT COALESCE(max(created_at)::text, '')
                 FROM (
-                    SELECT created_at FROM public.duckicelake_object_tag
-                    UNION ALL SELECT created_at FROM public.duckicelake_policy_attachment
-                    UNION ALL SELECT created_at FROM public.duckicelake_masking_policy
-                    UNION ALL SELECT created_at FROM public.duckicelake_row_access_policy
-                    UNION ALL SELECT created_at FROM public.duckicelake_static_s3_key
+                    SELECT created_at FROM {self._sc}.duckicelake_object_tag
+                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_policy_attachment
+                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_masking_policy
+                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_row_access_policy
+                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_static_s3_key
                 ) x
                 """
             )
@@ -1084,16 +1095,16 @@ class GovernanceStore:
         catalog-wide masking vend scan only these instead of every table."""
         with self.catalog.pg_cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT ot.object_name
-                FROM public.duckicelake_object_tag ot
-                JOIN public.duckicelake_policy_attachment pa
+                FROM {self._sc}.duckicelake_object_tag ot
+                JOIN {self._sc}.duckicelake_policy_attachment pa
                   ON pa.target_kind = 'tag'
                  AND pa.tag_ns = ot.tag_ns AND pa.tag_name = ot.tag_name
                 WHERE ot.schema_name = %s AND COALESCE(ot.object_name, '') <> ''
                 UNION
                 SELECT pa.object_name
-                FROM public.duckicelake_policy_attachment pa
+                FROM {self._sc}.duckicelake_policy_attachment pa
                 WHERE pa.schema_name = %s
                   AND COALESCE(pa.object_name, '') <> ''
                   AND pa.target_kind IN ('column', 'table')
@@ -1115,14 +1126,14 @@ class GovernanceStore:
         )
 
     @staticmethod
-    def _fetch_object_tags(cur, schema: str, table: str) -> list[dict]:
+    def _fetch_object_tags(cur, sc: str, schema: str, table: str) -> list[dict]:
         # Schema-level (cascades to all its tables), plus everything scoped
         # to this exact table (table-level + column-level rows).
         cur.execute(
-            """
+            f"""
             SELECT object_kind, schema_name, object_name, column_name,
                    tag_ns, tag_name, tag_value
-            FROM public.duckicelake_object_tag
+            FROM {sc}.duckicelake_object_tag
             WHERE schema_name = %s
               AND (object_kind = 'schema' OR object_name = %s)
             ORDER BY object_kind, object_name, column_name, tag_ns, tag_name
@@ -1134,7 +1145,7 @@ class GovernanceStore:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     @staticmethod
-    def _fetch_attachments(cur, schema: str, table: str) -> list[dict]:
+    def _fetch_attachments(cur, sc: str, schema: str, table: str) -> list[dict]:
         # Only rows that can possibly reach THIS table: tag-target
         # attachments (a tag may sit on any of its columns / the table / the
         # schema — the resolver intersects with the object's tag set) plus
@@ -1142,10 +1153,10 @@ class GovernanceStore:
         # the predicate every masked read scanned the whole catalog's
         # attachments and filtered in Python — O(total governance model).
         cur.execute(
-            """
+            f"""
             SELECT policy_kind, policy_name, target_kind, tag_ns, tag_name,
                    schema_name, object_name, column_name, columns
-            FROM public.duckicelake_policy_attachment
+            FROM {sc}.duckicelake_policy_attachment
             WHERE target_kind = 'tag'
                OR (target_kind IN ('column', 'table')
                    AND schema_name = %s AND object_name = %s)
@@ -1159,11 +1170,11 @@ class GovernanceStore:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     @staticmethod
-    def _fetch_policy_bodies(cur, table: str) -> dict[str, dict]:
+    def _fetch_policy_bodies(cur, sc: str, table: str) -> dict[str, dict]:
         if table == "duckicelake_masking_policy":
             cur.execute(
                 f"SELECT name, signature_sql, body_sql, unmasked_roles, "
-                f"file_layer_masking FROM public.{table}"
+                f"file_layer_masking FROM {sc}.{table}"
             )
             return {
                 r[0]: {"signature": r[1], "body": r[2],
@@ -1172,7 +1183,7 @@ class GovernanceStore:
                 for r in cur.fetchall()
             }
         cur.execute(
-            f"SELECT name, signature_sql, body_sql, unmasked_roles FROM public.{table}"
+            f"SELECT name, signature_sql, body_sql, unmasked_roles FROM {sc}.{table}"
         )
         return {
             r[0]: {"signature": r[1], "body": r[2], "unmasked_roles": r[3] or []}
@@ -1187,11 +1198,11 @@ class GovernanceStore:
         """
         columns = [c.name for c in self.catalog.get_columns([schema], table)]
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            ensure_governance_sidecars(cur)
-            object_tags = self._fetch_object_tags(cur, schema, table)
-            attachments = self._fetch_attachments(cur, schema, table)
-            masking_bodies = self._fetch_policy_bodies(cur, "duckicelake_masking_policy")
-            row_bodies = self._fetch_policy_bodies(cur, "duckicelake_row_access_policy")
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            object_tags = self._fetch_object_tags(cur, self._sc, schema, table)
+            attachments = self._fetch_attachments(cur, self._sc, schema, table)
+            masking_bodies = self._fetch_policy_bodies(cur, self._sc, "duckicelake_masking_policy")
+            row_bodies = self._fetch_policy_bodies(cur, self._sc, "duckicelake_row_access_policy")
         return {
             "columns": columns,
             "object_tags": object_tags,
@@ -1246,7 +1257,7 @@ class GovernanceStore:
         schema/table-level assignments to their columns."""
         cur.execute(
             "SELECT object_kind, schema_name, object_name, column_name "
-            "FROM public.duckicelake_object_tag "
+            f"FROM {self._sc}.duckicelake_object_tag "
             "WHERE tag_ns = %s AND tag_name = %s",
             (tag_ns, tag_name),
         )
@@ -1266,7 +1277,7 @@ class GovernanceStore:
 
     def _masking_policies_on_tag(self, cur, tag_ns: str, tag_name: str) -> list[str]:
         cur.execute(
-            "SELECT policy_name FROM public.duckicelake_policy_attachment "
+            f"SELECT policy_name FROM {self._sc}.duckicelake_policy_attachment "
             "WHERE policy_kind = 'masking' AND target_kind = 'tag' "
             "AND tag_ns = %s AND tag_name = %s",
             (tag_ns, tag_name),

@@ -142,9 +142,10 @@ def _ensure_functions(cur, meta_schema: str) -> None:
     owned by the proxy's (owning) role so readers never need SELECT on the
     governance sidecars and the lookups bypass RLS (no recursion).
 
-    The ducklake_* metadata tables are read from `meta_schema`; the governance
-    sidecars (object_grant / role_grant / table_property / pg_principal) stay
-    in public (cross-catalog). Function names are per-schema (see `_fn_names`)
+    The ducklake_* metadata tables AND this catalog's governance sidecars
+    (object_grant / role_grant / table_property) are read from `meta_schema`
+    — governance is per catalog; only pg_principal (the vended-role →
+    principal map) is in public. Function names are per-schema (see `_fn_names`)
     so each catalog gets its own hidden-set predicates.
 
     Visibility is expressed as a *hidden-set* SRF rather than a per-row
@@ -168,7 +169,7 @@ def _ensure_functions(cur, meta_schema: str) -> None:
             JOIN {m}.ducklake_schema s USING (schema_id)
             WHERE t.end_snapshot IS NULL
               AND EXISTS (
-                SELECT 1 FROM public.duckicelake_object_grant og
+                SELECT 1 FROM {m}.duckicelake_object_grant og
                 WHERE lower(og.privilege) = 'select'
                   AND ((og.object_kind = 'table'
                         AND og.schema_name = s.schema_name
@@ -176,8 +177,8 @@ def _ensure_functions(cur, meta_schema: str) -> None:
                        OR (og.object_kind = 'schema'
                            AND og.schema_name = s.schema_name)))
               AND NOT EXISTS (
-                SELECT 1 FROM public.duckicelake_object_grant og
-                JOIN public.duckicelake_role_grant rg ON rg.role_name = og.role_name
+                SELECT 1 FROM {m}.duckicelake_object_grant og
+                JOIN {m}.duckicelake_role_grant rg ON rg.role_name = og.role_name
                 WHERE lower(og.privilege) = 'select'
                   AND rg.principal_sub = public.duckicelake_session_principal()
                   AND ((og.object_kind = 'table'
@@ -201,7 +202,7 @@ def _ensure_functions(cur, meta_schema: str) -> None:
             SELECT t.table_id
             FROM {m}.ducklake_table t
             JOIN {m}.ducklake_schema s USING (schema_id)
-            JOIN public.duckicelake_table_property p
+            JOIN {m}.duckicelake_table_property p
               ON p.schema_name = s.schema_name
              AND p.table_name = t.table_name
              AND p.key = 'duckicelake.file-layer-masking'
@@ -209,9 +210,9 @@ def _ensure_functions(cur, meta_schema: str) -> None:
             WHERE t.end_snapshot IS NULL
               AND NOT EXISTS (
                 SELECT 1
-                FROM public.duckicelake_table_property bp
+                FROM {m}.duckicelake_table_property bp
                 CROSS JOIN unnest(string_to_array(bp.value, ',')) AS r(role_name)
-                JOIN public.duckicelake_role_grant rg
+                JOIN {m}.duckicelake_role_grant rg
                   ON rg.role_name = trim(r.role_name)
                 WHERE bp.schema_name = s.schema_name
                   AND bp.table_name = t.table_name
@@ -302,8 +303,8 @@ def _ensure_rls_locked(catalog: DuckLakeCatalog, cur, meta: str, group: str,
     """The DDL body of ensure_rls — caller holds the advisory lock."""
     _preflight_ownership(cur, meta)
     # Sidecars the predicate functions reference must exist before any
-    # reader query can invoke them (always in public, cross-catalog).
-    ensure_governance_sidecars(cur)
+    # reader query can invoke them (this catalog's, in its metadata schema).
+    ensure_governance_sidecars(cur, meta)
     catalog._ensure_sidecar(cur)
     _ensure_principal_sidecar(cur)
 

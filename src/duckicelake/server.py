@@ -445,12 +445,6 @@ def _resync_table_governance(ctx: "CatalogContext", ns: list[str], table: str) -
         log.exception("resync: property clear failed for %s.%s", ns[0], table)
 
 
-# The governance router is bound to the default catalog (per-catalog governance
-# authoring lands with the account-scoped decision API); its resync callback
-# operates on the default context.
-app.include_router(build_governance_router(
-    catalog, settings, auth_cfg,
-    on_table_policy_change=lambda ns, table: _resync_table_governance(_default_ctx, ns, table)))
 
 
 # ---- error handling ---------------------------------------------------
@@ -696,6 +690,14 @@ def _is_delegated(request: Request | None, scope: str) -> bool:
     qp = getattr(request, "query_params", None) or {}
     return (str(qp.get("delegate", "")).lower() in ("1", "true", "yes")
             and is_broker_scope(scope))
+
+
+# Governance authoring for every catalog, each against its own sidecars, gated
+# by the same account check as the Iceberg REST routes; resync runs on the
+# catalog the change was made in.
+app.include_router(build_governance_router(
+    resolve_catalog, auth_cfg,
+    on_table_policy_change=_resync_table_governance))
 
 
 @app.get("/v1/{prefix}/namespaces", response_model=ListNamespacesResponse)

@@ -81,9 +81,11 @@ class MaskedExport:
     prefix: str          # S3 key prefix of the live snap dir, ends with "/"
 
 
-def _ensure_export_sidecar(cur) -> None:
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.duckicelake_masked_export (
+def _ensure_export_sidecar(cur, sc: str) -> None:
+    """`sc`: the catalog's quoted sidecar schema (export pointers are per
+    catalog — two catalogs' `sales.customers` share names, never data)."""
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_masked_export (
             schema_name       VARCHAR NOT NULL,
             table_name        VARCHAR NOT NULL,
             sig               VARCHAR NOT NULL,
@@ -99,8 +101,8 @@ def _ensure_export_sidecar(cur) -> None:
     """)
 
 
-def _lock_key(ns: str, table: str, sig: str) -> int:
-    digest = hashlib.sha256(f"{ns}.{table}.{sig}".encode()).digest()
+def _lock_key(scope: str, ns: str, table: str, sig: str) -> int:
+    digest = hashlib.sha256(f"{scope}:{ns}.{table}.{sig}".encode()).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
@@ -112,6 +114,7 @@ class MaskedExportManager:
         self.catalog = catalog
         self.settings = settings
         self.store = store                  # GovernanceStore, for audit (optional)
+        self._sc = catalog.sidecar_sql      # this catalog's sidecar schema
         self.view_manager = view_manager    # MaskingViewManager: repoint views
         #                                     to the fresh snap dir after export
         self.retain_snap_dirs = int(os.environ.get(
@@ -133,11 +136,11 @@ class MaskedExportManager:
     def current_export(self, ns: list[str], table: str,
                        sig: str) -> MaskedExport | None:
         with self.catalog.pg_cursor(autocommit=False) as cur:
-            _ensure_export_sidecar(cur)
+            _ensure_export_sidecar(cur, self._sc)
             cur.execute(
-                """
+                f"""
                 SELECT current_snapshot, current_prefix
-                FROM public.duckicelake_masked_export
+                FROM {self._sc}.duckicelake_masked_export
                 WHERE schema_name = %s AND table_name = %s AND sig = %s
                   AND current_prefix IS NOT NULL
                 """,
@@ -153,10 +156,10 @@ class MaskedExportManager:
         """Mark the sig as recently requested (drives refresh TTL)."""
         try:
             with self.catalog.pg_cursor() as cur:
-                _ensure_export_sidecar(cur)
+                _ensure_export_sidecar(cur, self._sc)
                 cur.execute(
-                    """
-                    UPDATE public.duckicelake_masked_export
+                    f"""
+                    UPDATE {self._sc}.duckicelake_masked_export
                     SET last_requested_at = now()
                     WHERE schema_name = %s AND table_name = %s AND sig = %s
                     """,
@@ -203,7 +206,7 @@ class MaskedExportManager:
         started = datetime.now(timezone.utc)
         with self.catalog.pg_cursor() as lock_cur:
             got = lock_cur.execute(
-                "SELECT pg_try_advisory_lock(%s)", (_lock_key(ns[0], table, sig),)
+                "SELECT pg_try_advisory_lock(%s)", (_lock_key(self._sc, ns[0], table, sig),)
             ).fetchone()[0]
             if not got:
                 # someone else is exporting this sig right now — serve
@@ -250,10 +253,10 @@ class MaskedExportManager:
                     )
                 files = self.list_export_files(prefix)
                 with self.catalog.pg_cursor() as cur:
-                    _ensure_export_sidecar(cur)
+                    _ensure_export_sidecar(cur, self._sc)
                     cur.execute(
-                        """
-                        INSERT INTO public.duckicelake_masked_export
+                        f"""
+                        INSERT INTO {self._sc}.duckicelake_masked_export
                             (schema_name, table_name, sig, masks_json,
                              row_filter, columns_json, current_snapshot,
                              current_prefix, updated_at, last_requested_at)
@@ -290,7 +293,7 @@ class MaskedExportManager:
                 return export
             finally:
                 lock_cur.execute("SELECT pg_advisory_unlock(%s)",
-                                 (_lock_key(ns[0], table, sig),))
+                                 (_lock_key(self._sc, ns[0], table, sig),))
 
     # ---- eager refresh -----------------------------------------------------
 
@@ -304,11 +307,11 @@ class MaskedExportManager:
             ttl = timedelta(days=self.export_ttl_days)
         try:
             with self.catalog.pg_cursor(autocommit=False) as cur:
-                _ensure_export_sidecar(cur)
+                _ensure_export_sidecar(cur, self._sc)
                 cur.execute(
-                    """
+                    f"""
                     SELECT sig, masks_json, row_filter, columns_json
-                    FROM public.duckicelake_masked_export
+                    FROM {self._sc}.duckicelake_masked_export
                     WHERE schema_name = %s AND table_name = %s
                       AND last_requested_at > %s
                     """,
@@ -381,9 +384,9 @@ class MaskedExportManager:
         dropped = 0
         try:
             with self.catalog.pg_cursor(autocommit=False) as cur:
-                _ensure_export_sidecar(cur)
+                _ensure_export_sidecar(cur, self._sc)
                 cur.execute(
-                    "SELECT sig FROM public.duckicelake_masked_export "
+                    f"SELECT sig FROM {self._sc}.duckicelake_masked_export "
                     "WHERE schema_name = %s AND table_name = %s",
                     (ns[0], table),
                 )
@@ -399,7 +402,7 @@ class MaskedExportManager:
                     self.settings.s3.masked_sig_prefix(ns[0], table, sig, self.catalog.ref.data_prefix))
                 with self.catalog.pg_cursor() as cur:
                     cur.execute(
-                        "DELETE FROM public.duckicelake_masked_export "
+                        f"DELETE FROM {self._sc}.duckicelake_masked_export "
                         "WHERE schema_name = %s AND table_name = %s AND sig = %s",
                         (ns[0], table, sig),
                     )

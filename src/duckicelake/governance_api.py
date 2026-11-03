@@ -18,8 +18,6 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .auth import AuthConfig, claims_from_request
-from .catalog import DuckLakeCatalog
-from .config import Settings
 from .sqlsafe import check_single_select
 from .governance import (
     ATTACH_TARGETS,
@@ -27,9 +25,7 @@ from .governance import (
     POLICY_KINDS,
     VALID_ATTACH_TARGETS,
     GovernanceConflict,
-    GovernanceStore,
 )
-from .policies import PolicyEngine
 
 
 # ---- request models ---------------------------------------------------
@@ -115,43 +111,45 @@ class StaticS3KeyRequest(BaseModel):
 
 
 def build_governance_router(
-    catalog: DuckLakeCatalog,
-    settings: Settings,
+    resolve_catalog,
     auth_cfg: AuthConfig,
     on_table_policy_change=None,
 ) -> APIRouter:
-    """`on_table_policy_change(ns: list[str], table: str)` (optional) is
+    """Governance authoring for ANY catalog, each against its own store.
+
+    `resolve_catalog(prefix, request)` maps the URL prefix to the catalog
+    context — the same account-gated resolver as the Iceberg REST routes
+    (404 for an unknown or another account's catalog).
+    `on_table_policy_change(ctx, ns: list[str], table: str)` (optional) is
     invoked for each table whose effective policy set changed via a
     detach/untag, so the server can resync masking views / exports / props."""
     router = APIRouter(prefix="/v1/{prefix}/governance", tags=["governance"])
-    store = GovernanceStore(catalog)
-    engine = PolicyEngine(store)
 
-    def _resync(affected: list[tuple[str, str]]) -> None:
+    def _resolve(prefix: str, request: Request):
+        ctx = resolve_catalog(prefix, request)
+        return ctx.store, ctx.policy_engine, ctx
+
+    def _resync(ctx, affected: list[tuple[str, str]]) -> None:
         if not on_table_policy_change:
             return
         for sch, tbl in affected:
             try:
-                on_table_policy_change([sch], tbl)
+                on_table_policy_change(ctx, [sch], tbl)
             except Exception:
                 pass   # best-effort; next read recreates artifacts anyway
-
-    def _check_prefix(prefix: str) -> None:
-        if prefix != settings.catalog_name:
-            raise HTTPException(status_code=404, detail=f"Unknown catalog prefix '{prefix}'")
 
     def _principal(request: Request) -> str:
         return claims_from_request(auth_cfg, request).get("sub") or "anonymous"
 
     @router.post("/tags", status_code=200)
     def create_tag(prefix: str, req: CreateTagRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         store.create_tag(_principal(request), req.tag_ns, req.tag_name, req.allowed_values)
         return {"status": "created", "tag": f"{req.tag_ns}.{req.tag_name}"}
 
     @router.post("/object-tags", status_code=200)
     def assign_object_tag(prefix: str, req: AssignObjectTagRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         if req.object_kind not in OBJECT_KINDS:
             raise HTTPException(400, f"object-kind must be one of {sorted(OBJECT_KINDS)}")
         try:
@@ -175,7 +173,7 @@ def build_governance_router(
 
     @router.post("/masking-policies", status_code=200)
     def create_masking_policy(prefix: str, req: CreatePolicyRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         _check_body(f"SELECT ({req.body_sql}) AS masked", "masking policy body")
         store.create_masking_policy(_principal(request), req.name, req.signature_sql,
                                     req.body_sql, req.unmasked_roles,
@@ -184,7 +182,7 @@ def build_governance_router(
 
     @router.post("/row-access-policies", status_code=200)
     def create_row_access_policy(prefix: str, req: CreatePolicyRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         _check_body(f"SELECT 1 WHERE ({req.body_sql})", "row access policy body")
         store.create_row_access_policy(_principal(request), req.name, req.signature_sql,
                                        req.body_sql, req.unmasked_roles)
@@ -192,7 +190,7 @@ def build_governance_router(
 
     @router.post("/policy-attachments", status_code=200)
     def attach_policy(prefix: str, req: AttachPolicyRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         if req.policy_kind not in POLICY_KINDS:
             raise HTTPException(400, f"policy-kind must be one of {sorted(POLICY_KINDS)}")
         if req.target_kind not in ATTACH_TARGETS:
@@ -218,19 +216,19 @@ def build_governance_router(
 
     @router.post("/roles", status_code=200)
     def create_role(prefix: str, req: CreateRoleRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         store.create_role(_principal(request), req.role_name)
         return {"status": "created", "role": req.role_name}
 
     @router.post("/role-grants", status_code=200)
     def grant_role(prefix: str, req: RoleGrantRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         store.grant_role(_principal(request), req.role_name, req.principal_sub)
         return {"status": "granted", "role": req.role_name, "principal": req.principal_sub}
 
     @router.post("/object-grants", status_code=200)
     def grant_object(prefix: str, req: ObjectGrantRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         if req.object_kind not in OBJECT_KINDS:
             raise HTTPException(400, f"object-kind must be one of {sorted(OBJECT_KINDS)}")
         store.grant_object(
@@ -243,7 +241,7 @@ def build_governance_router(
 
     @router.delete("/masking-policies/{name}", status_code=200)
     def delete_masking_policy(prefix: str, name: str, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         try:
             if not store.delete_masking_policy(_principal(request), name):
                 raise HTTPException(404, f"masking policy '{name}' not found")
@@ -253,7 +251,7 @@ def build_governance_router(
 
     @router.delete("/row-access-policies/{name}", status_code=200)
     def delete_row_access_policy(prefix: str, name: str, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         try:
             if not store.delete_row_access_policy(_principal(request), name):
                 raise HTTPException(404, f"row-access policy '{name}' not found")
@@ -263,19 +261,19 @@ def build_governance_router(
 
     @router.delete("/policy-attachments", status_code=200)
     def detach_policy(prefix: str, req: AttachPolicyRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         affected = store.detach_policy(
             _principal(request), policy_kind=req.policy_kind,
             policy_name=req.policy_name, target_kind=req.target_kind,
             tag_ns=req.tag_ns, tag_name=req.tag_name, schema_name=req.schema_name,
             object_name=req.object_name, column_name=req.column_name,
         )
-        _resync(affected)
+        _resync(ctx, affected)
         return {"status": "detached", "resynced_tables": affected}
 
     @router.delete("/tags/{tag_ns}/{tag_name}", status_code=200)
     def delete_tag(prefix: str, tag_ns: str, tag_name: str, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         try:
             if not store.delete_tag(_principal(request), tag_ns, tag_name):
                 raise HTTPException(404, f"tag {tag_ns}.{tag_name} not found")
@@ -285,18 +283,18 @@ def build_governance_router(
 
     @router.delete("/object-tags", status_code=200)
     def remove_object_tag(prefix: str, req: AssignObjectTagRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         affected = store.remove_object_tag(
             _principal(request), object_kind=req.object_kind,
             schema_name=req.schema_name, object_name=req.object_name,
             column_name=req.column_name, tag_ns=req.tag_ns, tag_name=req.tag_name,
         )
-        _resync(affected)
+        _resync(ctx, affected)
         return {"status": "removed", "resynced_tables": affected}
 
     @router.delete("/roles/{name}", status_code=200)
     def delete_role(prefix: str, name: str, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         try:
             if not store.delete_role(_principal(request), name):
                 raise HTTPException(404, f"role '{name}' not found")
@@ -306,14 +304,14 @@ def build_governance_router(
 
     @router.delete("/role-grants", status_code=200)
     def revoke_role(prefix: str, req: RoleGrantRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         store.revoke_role(_principal(request), req.role_name, req.principal_sub)
         return {"status": "revoked", "role": req.role_name,
                 "principal": req.principal_sub}
 
     @router.delete("/object-grants", status_code=200)
     def revoke_object_grant(prefix: str, req: ObjectGrantRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         store.revoke_object_grant(
             _principal(request), object_kind=req.object_kind,
             schema_name=req.schema_name, object_name=req.object_name,
@@ -325,7 +323,7 @@ def build_governance_router(
 
     @router.post("/static-s3-keys", status_code=200)
     def set_static_s3_key(prefix: str, req: StaticS3KeyRequest, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         store.set_static_key(req.principal, req.access_key_id,
                              secret=req.secret_access_key, note=req.note,
                              confined=req.confined)
@@ -335,8 +333,8 @@ def build_governance_router(
                 "confined": req.confined}
 
     @router.get("/static-s3-keys", status_code=200)
-    def list_static_s3_keys(prefix: str):
-        _check_prefix(prefix)
+    def list_static_s3_keys(prefix: str, request: Request):
+        store, engine, ctx = _resolve(prefix, request)
         # Never echo stored secrets — key ids + a has-secret flag only.
         return {"keys": [
             {"principal": k.principal, "access-key-id": k.access_key_id,
@@ -346,14 +344,15 @@ def build_governance_router(
 
     @router.delete("/static-s3-keys/{principal}", status_code=200)
     def delete_static_s3_key(prefix: str, principal: str, request: Request):
-        _check_prefix(prefix)
+        store, engine, ctx = _resolve(prefix, request)
         if not store.delete_static_key(principal):
             raise HTTPException(404, f"no static key for principal '{principal}'")
         return {"status": "deleted", "principal": principal}
 
     @router.get("/effective-policies", status_code=200)
-    def effective_policies(prefix: str, table: str, principal: str | None = None):
-        _check_prefix(prefix)
+    def effective_policies(prefix: str, table: str, request: Request,
+                           principal: str | None = None):
+        store, engine, ctx = _resolve(prefix, request)
         if "." not in table:
             raise HTTPException(400, "table must be 'schema.table'")
         schema, tbl = table.split(".", 1)
@@ -375,8 +374,8 @@ def build_governance_router(
         return derived
 
     @router.get("/audit", status_code=200)
-    def audit(prefix: str, limit: int = 200):
-        _check_prefix(prefix)
+    def audit(prefix: str, request: Request, limit: int = 200):
+        store, engine, ctx = _resolve(prefix, request)
         return {"entries": store.list_audit(limit=limit)}
 
     return router

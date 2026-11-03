@@ -348,6 +348,24 @@ class DuckLakeCatalog:
                 self._export_conn = self._build_duckdb_conn()
             yield self._export_conn
 
+    @property
+    def sidecar_schema(self) -> str:
+        """Postgres schema holding THIS catalog's duckicelake_* sidecars
+        (governance, table properties/refs, NaN counts, materialisation log,
+        masked-export pointers): its DuckLake metadata schema, or `public` for
+        the default catalog. Never shared between catalogs — their object
+        names, snapshot ids and file ids all overlap."""
+        return self._ref.metadata_schema or "public"
+
+    @property
+    def sidecar_sql(self) -> str:
+        """`sidecar_schema`, quoted for SQL."""
+        return qi(self.sidecar_schema)
+
+    @property
+    def _sc(self) -> str:
+        return self.sidecar_sql
+
     @contextmanager
     def pg_cursor(self, *, autocommit: bool = True) -> Iterator[psycopg.Cursor]:
         """Postgres cursor from the pool. Auto-commits on exit by default.
@@ -936,8 +954,8 @@ class DuckLakeCatalog:
     # `duckicelake_` prefix to make the origin obvious. Created on demand.
 
     def _ensure_sidecar(self, cur) -> None:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.duckicelake_table_property (
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._sc}.duckicelake_table_property (
                 schema_name VARCHAR NOT NULL,
                 table_name VARCHAR NOT NULL,
                 key VARCHAR NOT NULL,
@@ -947,8 +965,8 @@ class DuckLakeCatalog:
         """)
         # Named-ref sidecar — serves both Iceberg tags and our synthesized
         # read-only branches. `ref_type` defaults to 'tag' for back-compat.
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.duckicelake_table_tag (
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._sc}.duckicelake_table_tag (
                 schema_name VARCHAR NOT NULL,
                 table_name VARCHAR NOT NULL,
                 tag_name VARCHAR NOT NULL,
@@ -958,16 +976,16 @@ class DuckLakeCatalog:
             )
         """)
         # Add the ref_type column if an older sidecar exists without it.
-        cur.execute("""
-            ALTER TABLE public.duckicelake_table_tag
+        cur.execute(f"""
+            ALTER TABLE {self._sc}.duckicelake_table_tag
             ADD COLUMN IF NOT EXISTS ref_type VARCHAR NOT NULL DEFAULT 'tag'
         """)
         # Per-file per-column exact NaN counts, populated lazily by
         # materialize_all when DuckLake's `contains_nan=true` flag
         # indicates a float column has NaNs. Iceberg expects an exact
         # count in nan_value_counts; DuckLake only tracks presence.
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.duckicelake_file_nan_count (
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._sc}.duckicelake_file_nan_count (
                 data_file_id BIGINT NOT NULL,
                 column_id BIGINT NOT NULL,
                 count BIGINT NOT NULL,
@@ -980,8 +998,8 @@ class DuckLakeCatalog:
         # keep the full spec here for emission. For native-only specs this
         # sidecar is empty and materialize falls back to DuckLake's own
         # `ducklake_partition_column`.
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.duckicelake_table_partition_field (
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._sc}.duckicelake_table_partition_field (
                 schema_name VARCHAR NOT NULL,
                 table_name VARCHAR NOT NULL,
                 field_id INT NOT NULL,
@@ -1012,8 +1030,8 @@ class DuckLakeCatalog:
             self._ensure_materialisation_sidecar_ddl(cur)
 
     def _ensure_materialisation_sidecar_ddl(self, cur) -> None:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.duckicelake_materialisation_log (
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._sc}.duckicelake_materialisation_log (
                 ducklake_snapshot_id  BIGINT PRIMARY KEY,
                 status                TEXT NOT NULL,
                 iceberg_snapshot_id   BIGINT,
@@ -1095,8 +1113,8 @@ class DuckLakeCatalog:
         with self.pg_cursor() as cur:
             self._ensure_materialisation_sidecar(cur)
             cur.execute(
-                """
-                INSERT INTO public.duckicelake_materialisation_log
+                f"""
+                INSERT INTO {self._sc}.duckicelake_materialisation_log
                     (ducklake_snapshot_id, status, iceberg_snapshot_id,
                      error, materialised_at)
                 VALUES (%s, %s, %s, %s, now())
@@ -1118,10 +1136,10 @@ class DuckLakeCatalog:
         with self.pg_cursor() as cur:
             self._ensure_materialisation_sidecar(cur)
             cur.execute(
-                """
+                f"""
                 SELECT s.snapshot_id
                 FROM ducklake_snapshot s
-                LEFT JOIN public.duckicelake_materialisation_log l
+                LEFT JOIN {self._sc}.duckicelake_materialisation_log l
                   ON l.ducklake_snapshot_id = s.snapshot_id
                   AND l.status = 'done'
                 WHERE s.snapshot_id IS NOT NULL
@@ -1150,8 +1168,8 @@ class DuckLakeCatalog:
                 self._ensure_sidecar(cur)
                 for k, v in (set_map or {}).items():
                     cur.execute(
-                        """
-                        INSERT INTO public.duckicelake_table_property
+                        f"""
+                        INSERT INTO {self._sc}.duckicelake_table_property
                             (schema_name, table_name, key, value)
                         VALUES (%s, %s, %s, %s)
                         ON CONFLICT (schema_name, table_name, key) DO UPDATE
@@ -1161,8 +1179,8 @@ class DuckLakeCatalog:
                     )
                 for k in (remove or []):
                     cur.execute(
-                        """
-                        DELETE FROM public.duckicelake_table_property
+                        f"""
+                        DELETE FROM {self._sc}.duckicelake_table_property
                         WHERE schema_name = %s AND table_name = %s AND key = %s
                         """,
                         (ns[0], name, k),
@@ -1172,8 +1190,8 @@ class DuckLakeCatalog:
         with self.pg_cursor(autocommit=False) as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    """
-                    SELECT key, value FROM public.duckicelake_table_property
+                    f"""
+                    SELECT key, value FROM {self._sc}.duckicelake_table_property
                     WHERE schema_name = %s AND table_name = %s
                     """,
                     (ns[0], name),
@@ -1187,8 +1205,8 @@ class DuckLakeCatalog:
         with self.pg_cursor() as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    """
-                    INSERT INTO public.duckicelake_table_tag
+                    f"""
+                    INSERT INTO {self._sc}.duckicelake_table_tag
                         (schema_name, table_name, tag_name, snapshot_id, ref_type)
                     VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (schema_name, table_name, tag_name) DO UPDATE
@@ -1202,8 +1220,8 @@ class DuckLakeCatalog:
         with self.pg_cursor() as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    """
-                    DELETE FROM public.duckicelake_table_tag
+                    f"""
+                    DELETE FROM {self._sc}.duckicelake_table_tag
                     WHERE schema_name = %s AND table_name = %s AND tag_name = %s
                     """,
                     (ns[0], name, tag),
@@ -1215,9 +1233,9 @@ class DuckLakeCatalog:
         with self.pg_cursor(autocommit=False) as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    """
+                    f"""
                     SELECT tag_name, snapshot_id, ref_type
-                    FROM public.duckicelake_table_tag
+                    FROM {self._sc}.duckicelake_table_tag
                     WHERE schema_name = %s AND table_name = %s
                     """,
                     (ns[0], name),
@@ -1230,7 +1248,7 @@ class DuckLakeCatalog:
         with self.pg_cursor(autocommit=False) as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    "SELECT ref_type FROM public.duckicelake_table_tag "
+                    f"SELECT ref_type FROM {self._sc}.duckicelake_table_tag "
                     "WHERE schema_name=%s AND table_name=%s AND tag_name=%s",
                     (ns[0], name, ref),
                 )
@@ -1246,8 +1264,8 @@ class DuckLakeCatalog:
         with self.pg_cursor() as cur:
                 self._ensure_sidecar(cur)
                 cur.executemany(
-                    """
-                    INSERT INTO public.duckicelake_file_nan_count
+                    f"""
+                    INSERT INTO {self._sc}.duckicelake_file_nan_count
                         (data_file_id, column_id, count)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (data_file_id, column_id) DO UPDATE
@@ -1263,9 +1281,9 @@ class DuckLakeCatalog:
         with self.pg_cursor(autocommit=False) as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    """
+                    f"""
                     SELECT data_file_id, column_id, count
-                    FROM public.duckicelake_file_nan_count
+                    FROM {self._sc}.duckicelake_file_nan_count
                     WHERE data_file_id = ANY(%s)
                     """,
                     (data_file_ids,),
@@ -1323,14 +1341,14 @@ class DuckLakeCatalog:
         with self.pg_cursor() as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    "DELETE FROM public.duckicelake_table_partition_field "
+                    f"DELETE FROM {self._sc}.duckicelake_table_partition_field "
                     "WHERE schema_name = %s AND table_name = %s",
                     (ns[0], name),
                 )
                 for f in fields:
                     cur.execute(
-                        """
-                        INSERT INTO public.duckicelake_table_partition_field
+                        f"""
+                        INSERT INTO {self._sc}.duckicelake_table_partition_field
                             (schema_name, table_name, field_id, source_field_id,
                              transform, name, position, ducklake_key_index)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -1353,10 +1371,10 @@ class DuckLakeCatalog:
         with self.pg_cursor(autocommit=False) as cur:
                 self._ensure_sidecar(cur)
                 cur.execute(
-                    """
+                    f"""
                     SELECT field_id, source_field_id, transform, name,
                            position, ducklake_key_index
-                    FROM public.duckicelake_table_partition_field
+                    FROM {self._sc}.duckicelake_table_partition_field
                     WHERE schema_name = %s AND table_name = %s
                     ORDER BY position
                     """,
