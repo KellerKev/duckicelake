@@ -81,11 +81,24 @@ def _read_s3(client, uri: str) -> bytes:
         ) from e
 
 
+def check_under_prefix(uri: str, allowed_prefix: str, what: str) -> str:
+    """Require `uri` to live under `allowed_prefix` (an `s3://bucket/key/`
+    prefix ending in `/`). Dot segments are refused outright rather than
+    normalized, so `<prefix>../other-table/` can't pass a string match."""
+    if not uri.startswith(allowed_prefix):
+        raise ValueError(f"{what} {uri!r} is outside the table location {allowed_prefix!r}")
+    rest = uri[len(allowed_prefix):]
+    if any(seg in (".", "..") for seg in rest.split("/")) or "//" in rest:
+        raise ValueError(f"{what} {uri!r} contains '.'/'..'/empty path segments")
+    return uri
+
+
 def extract_commit_changes(
     manifest_list_uri: str,
     s3: S3Settings,
     *,
     snapshot_id: int,
+    allowed_prefix: str | None = None,
 ) -> CommitChanges:
     """Walk a client manifest-list → triage into adds, removes, and delete-file specs.
 
@@ -93,9 +106,17 @@ def extract_commit_changes(
     so we only act on manifests new in this commit. Manifests inherited
     from prior snapshots reference files we've already registered with
     DuckLake; touching them would double-register / double-tombstone.
+
+    The proxy reads these files with its root credentials and registers the
+    paths into the table, so with `allowed_prefix` set every manifest it
+    reads and every file it returns must sit under the table's own location
+    — otherwise a writer could pull another table's (or tenant's) objects in.
     """
+    def _ok(uri: str, what: str) -> str:
+        return check_under_prefix(uri, allowed_prefix, what) if allowed_prefix else uri
+
     client = _s3_client(s3)
-    ml_bytes = _read_s3(client, manifest_list_uri)
+    ml_bytes = _read_s3(client, _ok(manifest_list_uri, "manifest-list"))
 
     added: list[str] = []
     removed: list[str] = []
@@ -108,7 +129,7 @@ def extract_commit_changes(
 
         manifest_path = manifest_file["manifest_path"]
         manifest_content = manifest_file.get("content", 0)
-        m_bytes = _read_s3(client, manifest_path)
+        m_bytes = _read_s3(client, _ok(manifest_path, "manifest"))
 
         for entry in reader(io.BytesIO(m_bytes)):
             # ManifestEntry.status: 0=EXISTING (carry-over), 1=ADDED, 2=DELETED
@@ -118,6 +139,7 @@ def extract_commit_changes(
             path = df.get("file_path")
             if not path:
                 continue
+            _ok(path, "data/delete file")
 
             if manifest_content == 0 and df_content == 0:
                 # Data manifest, data file
@@ -142,7 +164,7 @@ def extract_commit_changes(
                     )
                 pos_deletes.append(PositionDeleteSpec(
                     path=path,
-                    target_data_file=target,
+                    target_data_file=_ok(target, "referenced data file"),
                     delete_count=int(df.get("record_count", 0)),
                     file_size_bytes=int(df.get("file_size_in_bytes", 0)),
                 ))

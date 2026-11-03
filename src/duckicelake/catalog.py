@@ -26,6 +26,7 @@ from psycopg_pool import ConnectionPool
 
 from . import s3util
 from .config import CatalogRef, Settings
+from .sqlsafe import check_single_select, literal, qi, ql
 
 
 # Active commit-scoped cursor. When set (via `commit_transaction()`),
@@ -239,7 +240,7 @@ class DuckLakeCatalog:
             ],
         )
 
-        opts = [f"DATA_PATH '{self.settings.data_path_for(self._ref)}'"]
+        opts = [f"DATA_PATH {ql(self.settings.data_path_for(self._ref))}"]
         if self._ref.metadata_schema:
             # Isolate this catalog's ducklake_* metadata in its own PG schema.
             opts.append(f"METADATA_SCHEMA '{self._ref.metadata_schema}'")
@@ -295,8 +296,7 @@ class DuckLakeCatalog:
         return self._ref
 
     def _cat(self) -> str:
-        # Catalog name is trusted from settings (not user input), so simple quoting is fine.
-        return f'"{self._ref.catalog_name}"'
+        return qi(self._ref.catalog_name)
 
     @property
     def s3_client(self):
@@ -483,13 +483,13 @@ class DuckLakeCatalog:
         if len(ns) != 1:
             raise ValueError("Nested namespaces are not supported by DuckLake")
         with self.cursor() as c:
-            c.execute(f'CREATE SCHEMA {self._cat()}."{ns[0]}"')
+            c.execute(f'CREATE SCHEMA {self._cat()}.{qi(ns[0])}')
 
     def drop_namespace(self, ns: list[str]) -> None:
         if len(ns) != 1:
             raise ValueError("Nested namespaces are not supported by DuckLake")
         with self.cursor() as c:
-            c.execute(f'DROP SCHEMA {self._cat()}."{ns[0]}"')
+            c.execute(f'DROP SCHEMA {self._cat()}.{qi(ns[0])}')
 
     # ---- tables --------------------------------------------------------
 
@@ -585,13 +585,13 @@ class DuckLakeCatalog:
         `"a" INTEGER, "b" VARCHAR`. Callers translate Iceberg schemas into this."""
         if len(ns) != 1:
             raise ValueError("Nested namespaces are not supported by DuckLake")
-        stmt = f'CREATE TABLE {self._cat()}."{ns[0]}"."{name}" ({columns_ddl})'
+        stmt = f'CREATE TABLE {self._cat()}.{qi(ns[0])}.{qi(name)} ({columns_ddl})'
         with self.cursor() as c:
             c.execute(stmt)
 
     def drop_table(self, ns: list[str], name: str) -> None:
         with self.cursor() as c:
-            c.execute(f'DROP TABLE {self._cat()}."{ns[0]}"."{name}"')
+            c.execute(f'DROP TABLE {self._cat()}.{qi(ns[0])}.{qi(name)}')
 
     def purge_table_objects(self, ns: list[str], name: str) -> int:
         """Delete every S3 object under the table's prefix.
@@ -657,7 +657,7 @@ class DuckLakeCatalog:
             # table-ref argument resolves correctly — fully-qualified
             # "schema.table" triggered a DuckLake catalog-lookup bug in
             # 1.0.x. Resetting USE in `finally` keeps us idempotent.
-            c.execute(f'USE {self._cat()}."{ns[0]}"')
+            c.execute(f'USE {self._cat()}.{qi(ns[0])}')
             try:
                 try:
                     c.execute(
@@ -919,7 +919,7 @@ class DuckLakeCatalog:
             # ducklake_add_data_files resolves the table name in the current
             # schema; USE scopes the search. Catalog + table are both bound
             # positionally to the procedure.
-            c.execute(f'USE {self._cat()}."{ns[0]}"')
+            c.execute(f'USE {self._cat()}.{qi(ns[0])}')
             try:
                 c.execute(
                     "CALL ducklake_add_data_files(?, ?, ?)",
@@ -1299,12 +1299,12 @@ class DuckLakeCatalog:
                     continue
                 # Build a single SELECT that emits one column per field-id.
                 select_parts = [
-                    f"COUNT(*) FILTER (WHERE isnan(\"{cname}\")) AS c_{cid}"
+                    f"COUNT(*) FILTER (WHERE isnan({qi(cname)})) AS c_{cid}"
                     for cid, cname in cols.items()
                 ]
                 sql = (
                     f"SELECT {', '.join(select_parts)} "
-                    f"FROM read_parquet('{df.file_path}')"
+                    f"FROM read_parquet({ql(df.file_path)})"
                 )
                 row = c.execute(sql).fetchone()
                 for (cid, _), count in zip(cols.items(), row):
@@ -1401,7 +1401,7 @@ class DuckLakeCatalog:
         """
         if not equality_column_names:
             raise ValueError("equality-delete requires equality_column_names")
-        quoted_cols = ", ".join(f'"{c}"' for c in equality_column_names)
+        quoted_cols = ", ".join(qi(c) for c in equality_column_names)
 
         snap = self.current_ducklake_snapshot(ns, name)
         if snap is None:
@@ -1425,9 +1425,9 @@ class DuckLakeCatalog:
         def _process_file(df: DuckLakeDataFile) -> dict | None:
             with self.read_cursor() as c:
                 count_sql = (
-                    f"SELECT COUNT(*) FROM read_parquet('{df.file_path}') d "
+                    f"SELECT COUNT(*) FROM read_parquet({ql(df.file_path)}) d "
                     f"WHERE ({quoted_cols}) IN (SELECT {quoted_cols} "
-                    f"FROM read_parquet('{delete_file_s3_uri}'))"
+                    f"FROM read_parquet({ql(delete_file_s3_uri)}))"
                 )
                 (n_hits,) = c.execute(count_sql).fetchone()
                 if not n_hits:
@@ -1440,11 +1440,11 @@ class DuckLakeCatalog:
                 pos_uri = f"s3://{s3.bucket}/{pos_key}"
                 copy_sql = (
                     f"COPY ("
-                    f"  SELECT '{df.file_path}' AS file_path, "
+                    f"  SELECT {ql(df.file_path)} AS file_path, "
                     f"         file_row_number AS pos "
-                    f"  FROM read_parquet('{df.file_path}', file_row_number=true) d "
+                    f"  FROM read_parquet({ql(df.file_path)}, file_row_number=true) d "
                     f"  WHERE ({quoted_cols}) IN (SELECT {quoted_cols} "
-                    f"         FROM read_parquet('{delete_file_s3_uri}'))"
+                    f"         FROM read_parquet({ql(delete_file_s3_uri)}))"
                     f") TO '{pos_uri}' (FORMAT PARQUET)"
                 )
                 c.execute(copy_sql)
@@ -1509,7 +1509,7 @@ class DuckLakeCatalog:
         with self.cursor() as c:
             arr_literal = "[" + ",".join(f"{int(s)}::UBIGINT" for s in snapshot_ids) + "]"
             c.execute(
-                f"CALL ducklake_expire_snapshots('{self._ref.catalog_name}', "
+                f"CALL ducklake_expire_snapshots({ql(self._ref.catalog_name)}, "
                 f"versions := {arr_literal})"
             )
 
@@ -1526,14 +1526,14 @@ class DuckLakeCatalog:
         if len(ns) != 1:
             raise ValueError("Nested namespaces not supported by DuckLake")
         with self.cursor() as c:
-            c.execute(f'USE {self._cat()}."{ns[0]}"')
+            c.execute(f'USE {self._cat()}.{qi(ns[0])}')
             try:
                 if partition_clause:
                     c.execute(
-                        f'ALTER TABLE "{name}" SET PARTITIONED BY ({partition_clause})'
+                        f'ALTER TABLE {qi(name)} SET PARTITIONED BY ({partition_clause})'
                     )
                 else:
-                    c.execute(f'ALTER TABLE "{name}" RESET PARTITIONED BY')
+                    c.execute(f'ALTER TABLE {qi(name)} RESET PARTITIONED BY')
             finally:
                 c.execute(f"USE {self._cat()}")
 
@@ -1724,7 +1724,7 @@ class DuckLakeCatalog:
                                  dialect, sort_direction, null_order)
                             VALUES (%s, %s, %s, 'duckdb', %s, %s)
                             """,
-                            (sort_id, idx, f'"{col_name}"', f.direction, null_order),
+                            (sort_id, idx, qi(col_name), f.direction, null_order),
                         )
 
                 cur.execute(
@@ -1761,12 +1761,15 @@ class DuckLakeCatalog:
                 return [(r[1], r[2], r[3]) for r in cur.fetchall()]
 
     def add_column(self, ns: list[str], name: str, col_name: str, col_type_ddl: str,
-                   nullable: bool = True, default_value: str | None = None) -> None:
+                   nullable: bool = True, default_value: Any = None) -> None:
+        """`default_value` is the raw JSON scalar (Iceberg write/initial
+        default); it's rendered as a typed literal, never spliced as SQL."""
         null_clause = "" if nullable else " NOT NULL"
-        default_clause = f" DEFAULT {default_value}" if default_value is not None else ""
+        default_clause = (f" DEFAULT {literal(default_value)}"
+                          if default_value is not None else "")
         stmt = (
-            f'ALTER TABLE {self._cat()}."{ns[0]}"."{name}" '
-            f'ADD COLUMN "{col_name}" {col_type_ddl}{null_clause}{default_clause}'
+            f'ALTER TABLE {self._cat()}.{qi(ns[0])}.{qi(name)} '
+            f'ADD COLUMN {qi(col_name)} {col_type_ddl}{null_clause}{default_clause}'
         )
         with self.cursor() as c:
             c.execute(stmt)
@@ -1774,15 +1777,15 @@ class DuckLakeCatalog:
     def drop_column(self, ns: list[str], name: str, col_name: str) -> None:
         with self.cursor() as c:
             c.execute(
-                f'ALTER TABLE {self._cat()}."{ns[0]}"."{name}" DROP COLUMN "{col_name}"'
+                f'ALTER TABLE {self._cat()}.{qi(ns[0])}.{qi(name)} DROP COLUMN {qi(col_name)}'
             )
 
     def rename_column(self, ns: list[str], name: str, old_col: str,
                       new_col: str) -> None:
         with self.cursor() as c:
             c.execute(
-                f'ALTER TABLE {self._cat()}."{ns[0]}"."{name}" '
-                f'RENAME COLUMN "{old_col}" TO "{new_col}"'
+                f'ALTER TABLE {self._cat()}.{qi(ns[0])}.{qi(name)} '
+                f'RENAME COLUMN {qi(old_col)} TO {qi(new_col)}'
             )
 
     # ---- views ---------------------------------------------------------
@@ -1838,14 +1841,18 @@ class DuckLakeCatalog:
 
     def create_view(self, ns: list[str], name: str, sql: str, replace: bool = False) -> None:
         keyword = "CREATE OR REPLACE VIEW" if replace else "CREATE VIEW"
+        # The body runs on the owner connection; one SELECT only, so a client
+        # view (or a masking view built from policy bodies) can't append
+        # statements of its own.
+        check_single_select(sql, "view body")
         with self.cursor() as c:
             c.execute(
-                f'{keyword} {self._cat()}."{ns[0]}"."{name}" AS {sql}'
+                f'{keyword} {self._cat()}.{qi(ns[0])}.{qi(name)} AS {sql}'
             )
 
     def drop_view(self, ns: list[str], name: str) -> None:
         with self.cursor() as c:
-            c.execute(f'DROP VIEW {self._cat()}."{ns[0]}"."{name}"')
+            c.execute(f'DROP VIEW {self._cat()}.{qi(ns[0])}.{qi(name)}')
 
     def rename_table(
         self, src_ns: list[str], src_name: str, dst_ns: list[str], dst_name: str
@@ -1854,8 +1861,8 @@ class DuckLakeCatalog:
             raise ValueError("Cross-namespace rename not supported")
         with self.cursor() as c:
             c.execute(
-                f'ALTER TABLE {self._cat()}."{src_ns[0]}"."{src_name}" '
-                f'RENAME TO "{dst_name}"'
+                f'ALTER TABLE {self._cat()}.{qi(src_ns[0])}.{qi(src_name)} '
+                f'RENAME TO {qi(dst_name)}'
             )
 
     # ---- identity -----------------------------------------------------

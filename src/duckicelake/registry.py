@@ -14,6 +14,7 @@ single-catalog deployments need no registry rows.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from collections import OrderedDict
 
@@ -25,6 +26,7 @@ from .governance import GovernanceStore
 from .masked_export import MaskedExportManager
 from .masking_views import MaskingViewManager
 from .policies import PolicyEngine
+from .sqlsafe import qi
 
 
 def ensure_catalog_registry_table(cur) -> None:
@@ -85,6 +87,27 @@ class CatalogContext:
 
 class UnknownCatalog(KeyError):
     """Raised when a catalog id has no registry entry (→ 404 at the edge)."""
+
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,63}$")
+_PREFIX_SEG_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _check_catalog_names(catalog_id: str, metadata_schema: str, data_prefix: str) -> None:
+    """Catalog id + metadata schema end up in ATTACH strings, a libpq
+    `-c search_path` option and PG DDL; the data prefix scopes every
+    credential vended for the catalog. Keep all three to a strict shape so
+    none of them can carry quoting, option or path tricks."""
+    for value, what in ((catalog_id, "catalog_id"), (metadata_schema, "metadata_schema")):
+        if not _NAME_RE.match(value or ""):
+            raise ValueError(f"{what} must match {_NAME_RE.pattern}")
+    segs = (data_prefix or "").split("/")
+    if (not data_prefix.endswith("/") or segs[-1] != ""
+            or not all(_PREFIX_SEG_RE.match(x) and x not in (".", "..") for x in segs[:-1])
+            or segs[0].startswith("__masked")):
+        raise ValueError(
+            "data_prefix must be '/'-separated segments of [A-Za-z0-9_.-] "
+            "ending in '/', with no '.'/'..' segments")
 
 
 class CatalogRegistry:
@@ -193,9 +216,10 @@ class CatalogRegistry:
     ) -> CatalogContext:
         """Create the Postgres metadata schema + register the catalog, then
         return its (connected) context. Idempotent on catalog_id."""
+        _check_catalog_names(catalog_id, metadata_schema, data_prefix)
         with self._pg() as c, c.cursor() as cur:
             ensure_catalog_registry_table(cur)
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{metadata_schema}"')
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS {qi(metadata_schema)}')
             cur.execute(
                 "INSERT INTO public.duckicelake_catalog "
                 "(catalog_id, metadata_schema, data_prefix, account_id) "

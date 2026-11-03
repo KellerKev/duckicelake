@@ -22,6 +22,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .sqlsafe import qi
+
 
 _BUCKET_RE = re.compile(r"^bucket\[(\d+)\]$")
 _TRUNCATE_RE = re.compile(r"^truncate\[(\d+)\]$")
@@ -71,13 +73,13 @@ def iceberg_transform_to_ducklake_sql(
     t = transform.strip().lower()
 
     if t == "identity":
-        return f'"{column_name}"'
+        return qi(column_name)
     if t in {"year", "month", "day", "hour"}:
-        return f'{t}("{column_name}")'
+        return f'{t}({qi(column_name)})'
 
     m = _BUCKET_RE.match(t)
     if m:
-        return f'bucket({int(m.group(1))}, "{column_name}")'
+        return f'bucket({int(m.group(1))}, {qi(column_name)})'
 
     m = _TRUNCATE_RE.match(t)
     if m:

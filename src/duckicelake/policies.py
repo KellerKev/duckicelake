@@ -36,6 +36,7 @@ import re
 from dataclasses import dataclass, field
 
 from .governance import GovernanceStore, resolve_effective_policies
+from .sqlsafe import ql, qi
 
 log = logging.getLogger("duckicelake.policies")
 
@@ -96,15 +97,8 @@ def _bypasses(roles: list[str], unmasked_roles: list[str] | None) -> bool:
     return bool(set(roles) & set(unmasked_roles))
 
 
-def _qi(name: str) -> str:
-    """Quote a SQL identifier, escaping any embedded double-quote so a
-    column/table name like `a"b` can't break out of the quoting."""
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _ql(value: str) -> str:
-    """Quote a SQL string literal, escaping embedded single-quotes."""
-    return "'" + value.replace("'", "''") + "'"
+_qi = qi
+_ql = ql
 
 
 def _masked_projection(columns: list[str], masks: dict[str, str]) -> str:
@@ -129,7 +123,10 @@ def _qualify_expr(body_sql: str, column: str) -> str:
     reference. Bodies with no `val`
     (e.g. `'***'`, `NULL`) are constant masks and pass through unchanged.
     """
-    return _VAL_TOKEN.sub(f'"{column}"', body_sql)
+    # A function replacement: the quoted name is inserted verbatim, so a
+    # backslash in a column name can't act as a regex group reference.
+    quoted = _qi(column)
+    return _VAL_TOKEN.sub(lambda _m: quoted, body_sql)
 
 
 def build_plan(

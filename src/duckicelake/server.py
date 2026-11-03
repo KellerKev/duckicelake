@@ -32,6 +32,7 @@ from .auth import (
 )
 from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
+from .sqlsafe import check_identifier, literal
 from .registry import CatalogContext, CatalogRegistry, UnknownCatalog
 from .config import apply_file_config, load_settings, redact_password
 from .governance import GovernanceStore
@@ -155,11 +156,29 @@ _rls_ready = False
 _RESERVED_PROPERTY_PREFIX = "duckicelake."
 
 
-def _reject_reserved_table_name(name: str) -> None:
+def _check_name(name, what: str, *, reserved: bool = True) -> None:
+    """Client-supplied identifiers: quoting makes them SQL-safe; this rejects
+    the ones that are unsafe as S3 key segments or reserved for governance."""
+    try:
+        check_identifier(name, what, reserved=reserved)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _reject_reserved_table_name(name: str, ns: list[str] | None = None) -> None:
     """Tables/views named like a masking view (`__mask_*`) collide with
     governance plumbing: they'd be hidden from REST listings and swept by
     gc_orphans as 'stale masking views'. Reject at every creation/rename
-    entry point."""
+    entry point — as well as names that aren't valid path segments, and any
+    target inside a governance masking schema (`__masked_<sig>`), where a
+    table would shadow the masking views on a session's search_path."""
+    _check_name(name, "table")
+    if ns and ns[0].startswith(MASK_SCHEMA_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Namespaces starting with '{MASK_SCHEMA_PREFIX}' are "
+                   "reserved for governance masking schemas",
+        )
     if name.startswith(MASK_VIEW_PREFIX):
         raise HTTPException(
             status_code=400,
@@ -619,9 +638,12 @@ class CatalogInfo(BaseModel):
 @app.post("/v1/catalogs", response_model=CatalogInfo, status_code=201)
 def provision_catalog(req: ProvisionCatalogRequest, request: Request) -> CatalogInfo:
     _require_admin(request)
-    ctx = registry.provision(
-        req.catalog_id, req.metadata_schema, req.data_prefix, req.account_id
-    )
+    try:
+        ctx = registry.provision(
+            req.catalog_id, req.metadata_schema, req.data_prefix, req.account_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if req.create_default_namespace and not ctx.catalog.namespace_exists(["default"]):
         ctx.catalog.create_namespace(["default"])
     return CatalogInfo(
@@ -684,6 +706,8 @@ def create_namespace(
     ctx: CatalogContext = Depends(resolve_catalog),
 ) -> CreateNamespaceResponse:
     catalog = ctx.catalog
+    for part in req.namespace:
+        _check_name(part, "namespace")
     if req.namespace and req.namespace[0].startswith(MASK_SCHEMA_PREFIX):
         raise HTTPException(
             status_code=400,
@@ -773,7 +797,7 @@ def create_table(
     ns = _parse_namespace(namespace)
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
-    _reject_reserved_table_name(req.name)
+    _reject_reserved_table_name(req.name, ns)
     if catalog.table_exists(ns, req.name):
         raise HTTPException(
             status_code=409,
@@ -782,7 +806,10 @@ def create_table(
     if req.stage_create:
         raise HTTPException(status_code=501, detail="stage-create is not supported")
 
-    ddl, _last_id = schema_to_columns_ddl(req.schema_)
+    try:
+        ddl, _last_id = schema_to_columns_ddl(req.schema_)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     catalog.create_table(ns, req.name, ddl)
     # RLS rearm covers new ducklake_* tables for the default catalog. Per-catalog
     # RLS is armed by the credentials path (P1c-B); skip here for non-default.
@@ -931,6 +958,7 @@ def create_view(
     if not catalog.namespace_exists(ns):
         raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
     name = body["name"]
+    _reject_reserved_table_name(name, ns)
     if name.startswith(MASK_VIEW_PREFIX):
         raise HTTPException(
             status_code=400,
@@ -944,7 +972,10 @@ def create_view(
         raise HTTPException(status_code=400, detail="view requires a sql representation")
     if catalog.view_exists(ns, name):
         raise HTTPException(status_code=409, detail=f"View already exists: {ns}.{name}")
-    catalog.create_view(ns, name, sqls[0])
+    try:
+        catalog.create_view(ns, name, sqls[0])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return _build_view_response(ns, name, ctx)
 
 
@@ -1533,9 +1564,12 @@ def ducklake_credentials(
             read_prefixes = [s3.masked_sig_prefix(ns[0], table, export.sig, ctx.ref.data_prefix)]
         else:
             read_prefixes = [s3.table_prefix(ns[0], table, ctx.ref.data_prefix)]
-    elif not ctx.policy_engine.store.has_file_layer_policies():
+    elif actor_tag != "agent" and not ctx.policy_engine.store.has_file_layer_policies():
         # No specific table AND no file-layer masking anywhere in the catalog
-        # (the common case): a DuckLake-direct ATTACH is CATALOG-wide, so scope
+        # (the common case) AND not an agent — an agent's masks are file-layer
+        # by force (build_plan), even when none is authored file-layer, so it
+        # always takes the carve-out branch below. Here a DuckLake-direct
+        # ATTACH is CATALOG-wide, so scope
         # reads to the whole catalog data prefix. The catalog (account) is the
         # S3 isolation boundary, not the namespace — scoping to one namespace
         # silently 403s any query whose tables live in a different schema
@@ -1734,7 +1768,7 @@ def rename_table(
     ctx: CatalogContext = Depends(resolve_catalog),
 ):
     catalog = ctx.catalog
-    _reject_reserved_table_name(req.destination.name)
+    _reject_reserved_table_name(req.destination.name, req.destination.namespace)
     if not catalog.table_exists(req.source.namespace, req.source.name):
         raise HTTPException(
             status_code=404,
@@ -1953,10 +1987,16 @@ def commit_table(
                     detail="add-snapshot requires snapshot.manifest-list and snapshot-id",
                 )
             from .read_manifest import extract_commit_changes
-            changes = extract_commit_changes(
-                manifest_list, settings.s3,
-                snapshot_id=int(client_snapshot_id),
-            )
+            table_loc = (f"s3://{settings.s3.bucket}/"
+                         f"{settings.s3.table_prefix(ns[0], table, ctx.ref.data_prefix)}")
+            try:
+                changes = extract_commit_changes(
+                    manifest_list, settings.s3,
+                    snapshot_id=int(client_snapshot_id),
+                    allowed_prefix=table_loc,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             pending_add_paths.extend(changes.added_data_paths)
             pending_remove_paths.extend(changes.removed_data_paths)
             pending_pos_deletes.extend(changes.position_deletes)
@@ -2305,6 +2345,7 @@ def _apply_schema_diff(ctx: "CatalogContext", ns: list[str], table: str,
             # the column's governance rows (tags / column-target masks) to the
             # new name; otherwise the mask silently detaches (a LEAK).
             if cur.column_name != f["name"]:
+                _check_name(f["name"], "column", reserved=False)
                 catalog.rename_column(ns, table, cur.column_name, f["name"])
                 governance_store.rename_column_governance(
                     None, schema=ns[0], table=table,
@@ -2313,10 +2354,16 @@ def _apply_schema_diff(ctx: "CatalogContext", ns: list[str], table: str,
         # New column.
         ddl_type = iceberg_type_to_duckdb(f["type"])
         default = f.get("write-default") or f.get("initial-default")
+        _check_name(f["name"], "column", reserved=False)
+        if default is not None:
+            try:
+                literal(default)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"column {f['name']!r}: {e}")
         catalog.add_column(
             ns, table, f["name"], ddl_type,
             nullable=not bool(f.get("required", False)),
-            default_value=repr(default) if isinstance(default, str) else default,
+            default_value=default,
         )
 
     for fid, cur in current_by_id.items():

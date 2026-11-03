@@ -32,6 +32,7 @@ from .catalog import (
     DuckLakeCatalog,
 )
 from .config import S3Settings
+from .sqlsafe import ql
 from .manifest import (
     DataFileInfo,
     DataFileStats,
@@ -570,7 +571,7 @@ def materialize_all(
                     if target is None:
                         continue
                     rows = rc.execute(
-                        f"SELECT pos FROM read_parquet('{ddf.file_path}')"
+                        f"SELECT pos FROM read_parquet({ql(ddf.file_path)})"
                     ).fetchall()
                     bucket_set = positions_by_data_file.setdefault(target, set())
                     for (p,) in rows:

@@ -26,16 +26,17 @@ from __future__ import annotations
 
 import contextvars
 import os
-import re
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 
 import duckdb
 import httpx
 
 from .auth import load_auth_config, verify_bearer
 from .config import Settings, load_settings
+from .sqlsafe import check_single_select, qi
 
 # The end-user principal for the in-flight MCP request, set by the auth
 # middleware from the caller's verified bearer. Delegation flows this principal
@@ -43,10 +44,17 @@ from .config import Settings, load_settings
 _CURRENT_PRINCIPAL: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mcp_principal", default=None)
 
-# Only read-only shapes reach the executor; the vended attach is READ_ONLY and
-# the reader role is RLS-scoped, but we refuse writes up front for a clear error.
-_READ_ONLY = re.compile(r"^\s*(select|with|describe|desc|show|explain|pragma|values)\b", re.I)
+# Exactly one statement, and only a query: the vended attach is READ_ONLY and
+# the reader role is RLS-scoped, but a second statement (ATTACH, SET, COPY …)
+# must never reach the connection. DESCRIBE/SHOW/PRAGMA/VALUES parse as SELECT.
+_QUERY_TYPES = (duckdb.StatementType.SELECT, duckdb.StatementType.EXPLAIN)
 _MAX_ROWS = 500
+
+
+def _seg(value: str) -> str:
+    """One URL path segment: a catalog/namespace/table name can't add
+    segments, a query string or dot-segments to the gov request path."""
+    return quote(value, safe="")
 
 
 class MCPConfig:
@@ -111,24 +119,56 @@ class GovernedExecutor:
         if table:
             params["table"] = table
         return self.gov_get(
-            f"/v1/{catalog_id}/namespaces/{namespace}/ducklake-credentials",
+            f"/v1/{_seg(catalog_id)}/namespaces/{_seg(namespace)}/ducklake-credentials",
             params)
+
+    def list_namespaces(self, catalog_id: str) -> list[str]:
+        out = self.gov_get(f"/v1/{_seg(catalog_id)}/namespaces")
+        return [".".join(n) for n in out.get("namespaces", [])]
+
+    def list_tables(self, catalog_id: str, namespace: str) -> list[str]:
+        out = self.gov_get(f"/v1/{_seg(catalog_id)}/namespaces/{_seg(namespace)}/tables")
+        return [i["name"] for i in out.get("identifiers", [])]
+
+    def describe_table(self, catalog_id: str, namespace: str, table: str,
+                       principal: str) -> dict:
+        return self.query(catalog_id, namespace, table,
+                          f"DESCRIBE {qi(namespace)}.{qi(table)}", principal)
 
     def _conn_for(self, bundle: dict, catalog_id: str,
                   namespace: str) -> duckdb.DuckDBPyConnection:
         """A DuckDB connection ATTACHed to the vended (RLS reader, READ_ONLY)
-        DuckLake catalog. S3 reads use the vended STS creds when present, else
-        the proxy's own root creds (this process is trusted server-side; only
-        governed rows ever leave). When the vend carries a masking route
+        DuckLake catalog, reading S3 only with the vended (scoped) credentials
+        — never the proxy's own. When the vend carries a masking route
         (`post_attach_sql`), unqualified names resolve to the masked view;
         otherwise we default the search path to the namespace so plain
         `FROM <table>` resolves. Row-level RLS is always enforced by the reader
-        role regardless."""
+        role regardless.
+
+        After setup the connection is locked down: file/network access only
+        under the catalog's data path, no further configuration changes — so
+        agent SQL can't read local files (the process env, config, keys) or
+        other objects in the bucket."""
+        vended = bundle.get("s3") or {}
+        if not vended.get("access-key-id"):
+            # Fail closed: the vend had no scoped credential to give (e.g. no
+            # STS / gateway, nothing registered). Falling back to the proxy's
+            # root keys would read base bytes the governance tier just refused.
+            raise PermissionError(
+                f"no scoped S3 credentials were vended ({bundle.get('vend_status') or 'none'})")
         con = duckdb.connect(":memory:")
+        try:
+            self._setup(con, bundle, vended, catalog_id, namespace)
+        except BaseException:
+            con.close()
+            raise
+        return con
+
+    def _setup(self, con: duckdb.DuckDBPyConnection, bundle: dict, vended: dict,
+               catalog_id: str, namespace: str) -> None:
         for ext in ("ducklake", "postgres", "httpfs"):
             con.execute(f"INSTALL {ext}"); con.execute(f"LOAD {ext}")
         s3 = self.settings.s3
-        vended = bundle.get("s3") or {}
         # Point DuckDB at the VENDED endpoint when creds are vended: the S3
         # gateway (and STS) hand back their own endpoint, and gateway creds only
         # work against the gateway — using the configured backend host here would
@@ -147,8 +187,7 @@ class GovernedExecutor:
             "CREATE OR REPLACE SECRET s (TYPE S3, KEY_ID ?, SECRET ?, "
             "REGION ?, ENDPOINT ?, USE_SSL ?, URL_STYLE ?"
             + (", SESSION_TOKEN ?" if vended.get("session-token") else "") + ")",
-            [vended.get("access-key-id") or s3.root_access_key,
-             vended.get("secret-access-key") or s3.root_secret_key,
+            [vended["access-key-id"], vended.get("secret-access-key"),
              s3.region, endpoint, use_ssl, url_style]
             + ([vended["session-token"]] if vended.get("session-token") else []),
         )
@@ -158,19 +197,30 @@ class GovernedExecutor:
             for stmt in post:            # masked-view route (column masking)
                 con.execute(stmt)
         else:                            # no masking policy: default to the ns
-            con.execute(f'USE "{catalog_id}"."{namespace}"')
-        return con
+            con.execute(f"USE {qi(catalog_id)}.{qi(namespace)}")
+        con.execute("SET allowed_directories = ?", [[bundle["ducklake_data_path"]]])
+        con.execute("SET enable_external_access = false")
+        con.execute("SET lock_configuration = true")
 
     def query(self, catalog_id: str, namespace: str, table: str | None,
               sql: str, principal: str) -> dict:
-        if not _READ_ONLY.match(sql or ""):
-            return {"error": "only read-only SELECT/DESCRIBE/SHOW is allowed"}
+        try:
+            check_single_select(sql or "", "query", allow=_QUERY_TYPES)
+        except ValueError as e:
+            return {"error": f"{e} (read-only SELECT/DESCRIBE/SHOW/EXPLAIN only)"}
+        if not table:
+            # A namespace-wide agent vend isn't table-routed, so it can't carry
+            # the per-table masked view; require the primary table.
+            return {"error": "`table` (the query's primary table) is required"}
         # Vend per-table so column masking (the masked view) is routed; without
         # a table the vend applies row-RLS only. `table` is the query's primary
         # table; multi-table joins fall back to base columns (row-RLS still
         # applies) — prefer one governed table per call for airtight masking.
         bundle = self._vend(catalog_id, namespace, principal, table=table)
-        con = self._conn_for(bundle, catalog_id, namespace)
+        try:
+            con = self._conn_for(bundle, catalog_id, namespace)
+        except PermissionError as e:
+            return {"error": str(e)}
         try:
             cur = con.execute(sql)
             cols = [d[0] for d in (cur.description or [])]
@@ -240,21 +290,17 @@ def build_server(config: MCPConfig | None = None):
     @mcp.tool()
     def list_namespaces(catalog: str) -> list[str]:
         """List schemas (namespaces) in a catalog."""
-        out = ex.gov_get(f"/v1/{catalog}/namespaces")
-        return [".".join(n) for n in out.get("namespaces", [])]
+        return ex.list_namespaces(catalog)
 
     @mcp.tool()
     def list_tables(catalog: str, namespace: str) -> list[str]:
         """List tables in a catalog namespace."""
-        out = ex.gov_get(f"/v1/{catalog}/namespaces/{namespace}/tables")
-        return [i["name"] for i in out.get("identifiers", [])]
+        return ex.list_tables(catalog, namespace)
 
     @mcp.tool()
     def describe_table(catalog: str, namespace: str, table: str) -> dict:
         """Columns + types of a table (governed: reflects the masked view)."""
-        return ex.query(catalog, namespace, table,
-                        f'DESCRIBE "{namespace}"."{table}"',
-                        resolve_principal(cfg))
+        return ex.describe_table(catalog, namespace, table, resolve_principal(cfg))
 
     @mcp.tool()
     def query(catalog: str, namespace: str, table: str, sql: str) -> dict:

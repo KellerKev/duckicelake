@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from .auth import AuthConfig, claims_from_request
 from .catalog import DuckLakeCatalog
 from .config import Settings
+from .sqlsafe import check_single_select
 from .governance import (
     ATTACH_TARGETS,
     OBJECT_KINDS,
@@ -164,9 +165,18 @@ def build_governance_router(
             raise HTTPException(409, str(e))
         return {"status": "assigned"}
 
+    def _check_body(sql: str, what: str) -> None:
+        # Bodies are spliced into masking-view / export SQL that runs on the
+        # owner connection; reject anything that isn't a single expression.
+        try:
+            check_single_select(sql, what)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
     @router.post("/masking-policies", status_code=200)
     def create_masking_policy(prefix: str, req: CreatePolicyRequest, request: Request):
         _check_prefix(prefix)
+        _check_body(f"SELECT ({req.body_sql}) AS masked", "masking policy body")
         store.create_masking_policy(_principal(request), req.name, req.signature_sql,
                                     req.body_sql, req.unmasked_roles,
                                     file_layer_masking=req.file_layer_masking)
@@ -175,6 +185,7 @@ def build_governance_router(
     @router.post("/row-access-policies", status_code=200)
     def create_row_access_policy(prefix: str, req: CreatePolicyRequest, request: Request):
         _check_prefix(prefix)
+        _check_body(f"SELECT 1 WHERE ({req.body_sql})", "row access policy body")
         store.create_row_access_policy(_principal(request), req.name, req.signature_sql,
                                        req.body_sql, req.unmasked_roles)
         return {"status": "created", "policy": req.name}

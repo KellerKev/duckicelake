@@ -84,6 +84,7 @@ def schema_to_columns_ddl(schema: dict[str, Any]) -> tuple[str, int]:
 
     Returns (ddl, last_column_id).
     """
+    from .sqlsafe import check_identifier, qi
     from .types import iceberg_type_to_duckdb
 
     fields = schema.get("fields", [])
@@ -94,6 +95,6 @@ def schema_to_columns_ddl(schema: dict[str, Any]) -> tuple[str, int]:
         col_type = iceberg_type_to_duckdb(f["type"])
         required = bool(f.get("required", False))
         null_clause = " NOT NULL" if required else ""
-        parts.append(f'"{col_name}" {col_type}{null_clause}')
+        parts.append(f'{qi(check_identifier(col_name, "column"))} {col_type}{null_clause}')
         last_id = max(last_id, int(f.get("id", 0)))
     return ", ".join(parts), last_id

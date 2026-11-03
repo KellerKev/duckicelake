@@ -86,23 +86,21 @@ def build_server(smcp_cfg=None, mcp_cfg: MCPConfig | None = None):
     server.register_tool(
         "list_namespaces", "List schemas (namespaces) in a catalog.",
         {"catalog": {"type": "string"}, "required": ["catalog"]},
-        lambda catalog: [".".join(n) for n in ex.gov_get(
-            f"/v1/{catalog}/namespaces").get("namespaces", [])])
+        ex.list_namespaces)
 
     server.register_tool(
         "list_tables", "List tables in a catalog namespace.",
         {"catalog": {"type": "string"}, "namespace": {"type": "string"},
          "required": ["catalog", "namespace"]},
-        lambda catalog, namespace: [i["name"] for i in ex.gov_get(
-            f"/v1/{catalog}/namespaces/{namespace}/tables").get("identifiers", [])])
+        ex.list_tables)
 
     server.register_tool(
         "describe_table",
         "Columns + types of a table (governed: reflects the masked view).",
         {"catalog": {"type": "string"}, "namespace": {"type": "string"},
          "table": {"type": "string"}, "required": ["catalog", "namespace", "table"]},
-        lambda catalog, namespace, table: q(
-            catalog, namespace, table, f'DESCRIBE "{namespace}"."{table}"'))
+        lambda catalog, namespace, table: ex.describe_table(
+            catalog, namespace, table, resolve_principal()))
 
     server.register_tool(
         "query",

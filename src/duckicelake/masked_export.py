@@ -47,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 
 from .catalog import DuckLakeCatalog
 from .config import Settings
+from .sqlsafe import check_single_select
 from .policies import (
     MaskDecision,
     TablePolicyPlan,
@@ -236,6 +237,9 @@ class MaskedExportManager:
                 field_ids = ", ".join(
                     f'{_qi(c)}: {i}' for i, c in enumerate(plan.columns, start=1)
                 )
+                # Runs with root S3 creds: one SELECT only, so a policy body
+                # can't close the COPY and append statements.
+                check_single_select(select, "masked export select")
                 copy_target = _ql(f"s3://{s3.bucket}/{prefix.rstrip('/')}")
                 with self.catalog.export_cursor() as con:
                     con.execute(
