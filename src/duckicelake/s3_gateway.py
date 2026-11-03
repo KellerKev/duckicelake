@@ -33,12 +33,19 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import re
 import time
 from datetime import datetime, timezone
+from xml.sax.saxutils import escape as _xml_escape
 
 import httpx
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
 from fastapi import HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import signer as signer_mod
 from .config import Settings
@@ -64,6 +71,68 @@ _HOP_BY_HOP = {
 _RESERVED_BUCKETS = {
     "v1", "docs", "redoc", "openapi.json", "healthz", "readyz", "metrics",
 }
+
+#: SigV4 replay window: `x-amz-date` must be this close to now (AWS: 15 min).
+MAX_CLOCK_SKEW = 15 * 60
+#: Largest request body the gateway buffers (PUT / multipart part / POST).
+MAX_BODY_BYTES = int(os.environ.get("DUCKICELAKE_S3_GATEWAY_MAX_BODY", str(256 << 20)))
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def key_is_canonical(key: str) -> bool:
+    """Object keys (and LIST prefixes) are authorized as plain strings with
+    `startswith`, so refuse anything a backend or HTTP stack might resolve
+    differently: `.`/`..` segments, empty inner segments (`a//b`), and
+    backslashes. A trailing `/` (directory marker / LIST prefix) is fine."""
+    if "\\" in key:
+        return False
+    segs = key.split("/")
+    if segs and segs[-1] == "":
+        segs = segs[:-1]
+    return all(seg not in ("", ".", "..") for seg in segs)
+
+
+def _amz_date_ok(amz_date: str, now: int) -> bool:
+    try:
+        ts = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return abs(ts.timestamp() - now) <= MAX_CLOCK_SKEW
+
+
+def payload_hash_ok(declared: str | None, body: bytes) -> bool:
+    """The client's SigV4 covers `x-amz-content-sha256`, not the body, so
+    bind the two: a hex digest must match the body we forward. Unsigned
+    payloads are the client's choice; streaming (aws-chunked) payloads
+    aren't supported by the gateway."""
+    if declared is None:
+        return not body
+    if declared == "UNSIGNED-PAYLOAD":
+        return True
+    if _HEX64.match(declared):
+        return hmac.compare_digest(hashlib.sha256(body).hexdigest(), declared)
+    return False
+
+
+_BACKEND: httpx.AsyncClient | None = None
+
+
+def _backend_client() -> httpx.AsyncClient:
+    """One pooled client per worker: keep-alive TLS to the backend instead
+    of a fresh handshake per ranged GET."""
+    global _BACKEND
+    if _BACKEND is None or _BACKEND.is_closed:
+        _BACKEND = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50))
+    return _BACKEND
+
+
+async def close_backend_client() -> None:
+    global _BACKEND
+    if _BACKEND is not None:
+        await _BACKEND.aclose()
+        _BACKEND = None
 
 
 # ---- stateless credential mint / verify ------------------------------------
@@ -180,10 +249,6 @@ def verify_sigv4(settings: Settings, *, method: str, host: str,
     bit-for-bit what a botocore/DuckDB client produced when signing —
     reusing the reference implementation rather than re-deriving the spec.
     """
-    from botocore.auth import S3SigV4Auth
-    from botocore.awsrequest import AWSRequest
-    from botocore.credentials import Credentials
-
     auth_header = headers.get("authorization")
     if not auth_header:
         raise HTTPException(status_code=403, detail="unsigned request")
@@ -200,6 +265,8 @@ def verify_sigv4(settings: Settings, *, method: str, host: str,
     amz_date = headers.get("x-amz-date")
     if not amz_date:
         raise HTTPException(status_code=403, detail="missing x-amz-date")
+    if not _amz_date_ok(amz_date, now):
+        raise HTTPException(status_code=403, detail="request time too skewed")
 
     secret = _derive_secret(settings.s3_gateway_secret, access_key_id)
 
@@ -254,7 +321,8 @@ def _s3_error(code: str, message: str, status: int = 403) -> Response:
     (e.g. AccessDenied) instead of choking on a JSON body."""
     body = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        f"<Error><Code>{code}</Code><Message>{message}</Message></Error>"
+        f"<Error><Code>{_xml_escape(code)}</Code>"
+        f"<Message>{_xml_escape(message)}</Message></Error>"
     )
     return Response(content=body, status_code=status, media_type="application/xml")
 
@@ -273,10 +341,13 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
         match, then the default catalog — mirroring the bare signer route."""
         cat = claims.get("cat")
         if cat:
+            # We minted this credential for exactly this catalog: if it no
+            # longer resolves, deny — never govern it under another one.
             try:
                 return registry.get(cat)
             except Exception:
                 log.warning("gateway cred names unknown catalog %r", cat)
+                return None
         target = registry.settings.catalog_name
         best = ""
         for cid, ref in registry.list_refs():
@@ -317,18 +388,43 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
 
         # 2) Governance — the exact per-request decision the signer makes —
         #    then the credential's per-vend prefix scoping. Bucket-level LIST
-        #    (empty key) authorizes against its `prefix` query param.
-        ctx = _resolve_ctx(claims, key)
+        #    (empty key) authorizes against its `prefix` query param. The
+        #    governance store is synchronous (Postgres): keep it off the loop.
         authz_key = key
         if not authz_key:
             authz_key = request.query_params.get("prefix", "")
-        decision = signer_mod.authorize_sign(
-            ctx, settings, claims, method, bucket, authz_key)
+        if not key_is_canonical(authz_key):
+            S3_SIGN_TOTAL.labels(decision="gateway_denied_key").inc()
+            return _s3_error("AccessDenied", "gateway denied: non-canonical key")
+        ctx = await run_in_threadpool(_resolve_ctx, claims, key)
+        if ctx is None:
+            S3_SIGN_TOTAL.labels(decision="gateway_denied_catalog").inc()
+            return _s3_error("AccessDenied", "gateway denied: unknown catalog")
+        decision = await run_in_threadpool(
+            signer_mod.authorize_sign, ctx, settings, claims, method, bucket, authz_key)
         if not decision.allowed:
-            return _deny(ctx, claims, bucket, authz_key, method, decision.reason)
+            return await run_in_threadpool(
+                _deny, ctx, claims, bucket, authz_key, method, decision.reason)
         pfx_reason = authorize_prefix(claims, authz_key)
         if pfx_reason:
-            return _deny(ctx, claims, bucket, authz_key, method, pfx_reason)
+            return await run_in_threadpool(
+                _deny, ctx, claims, bucket, authz_key, method, pfx_reason)
+
+        # Body: bounded, and bound to the hash the client signed.
+        declared_len = request.headers.get("content-length")
+        if declared_len and declared_len.isdigit() and int(declared_len) > MAX_BODY_BYTES:
+            return _s3_error("EntityTooLarge", "request body too large", 400)
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_BODY_BYTES:
+                return _s3_error("EntityTooLarge", "request body too large", 400)
+            chunks.append(chunk)
+        body = b"".join(chunks)
+        if not payload_hash_ok(request.headers.get("x-amz-content-sha256"), body):
+            S3_SIGN_TOTAL.labels(decision="gateway_denied_payload").inc()
+            return _s3_error("XAmzContentSHA256Mismatch",
+                             "body does not match x-amz-content-sha256", 400)
         S3_SIGN_TOTAL.labels(decision="gateway_forward").inc()
 
         # 3) Re-sign with the backend ROOT key and forward.
@@ -352,15 +448,13 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
         signed = signer_mod.sign_v4(s3, method, real_uri, fwd)
         out_headers = {k: ", ".join(v) for k, v in signed.headers.items()}
 
-        body = await request.body()  # reads have none; bounded for writes
-        client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+        client = _backend_client()
         try:
             backend_req = client.build_request(
                 method, real_uri, headers=out_headers,
                 content=body if body else None)
             backend = await client.send(backend_req, stream=True)
         except Exception:
-            await client.aclose()
             log.exception("gateway forward to backend failed")
             raise HTTPException(status_code=502, detail="backend unreachable")
 
@@ -368,7 +462,6 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
         if method == "HEAD":
             # No streamed body on HEAD; close and return headers/status.
             await backend.aclose()
-            await client.aclose()
             return Response(status_code=backend.status_code, headers=relay)
 
         async def _stream():
@@ -377,7 +470,6 @@ def register_gateway_routes(app, settings: Settings, registry, auth_cfg) -> None
                     yield chunk
             finally:
                 await backend.aclose()
-                await client.aclose()
 
         return StreamingResponse(
             _stream(), status_code=backend.status_code, headers=relay)

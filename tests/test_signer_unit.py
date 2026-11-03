@@ -74,8 +74,14 @@ class _StubEngine:
                                schema=schema, table=table)
 
 
+_STUB_IDS = __import__("itertools").count()
+
+
 class _StubRef:
     data_prefix = "data/"
+
+    def __init__(self):
+        self.catalog_name = f"cat_{next(_STUB_IDS)}"   # caches are keyed per catalog
 
 
 class _StubCtx:
@@ -101,13 +107,15 @@ def _file_layer_plan(ns="ns", table="t") -> TablePolicyPlan:
 @pytest.fixture(autouse=True)
 def _fresh_cache():
     signer._plan_cache.clear()
+    signer._roles_cache.clear()
     yield
     signer._plan_cache.clear()
+    signer._roles_cache.clear()
 
 
 def _auth(ctx, method, key, claims=None, settings=None):
     return signer.authorize_sign(
-        ctx, settings or _settings(), claims or {"sub": "alice"},
+        ctx, settings or _settings(), claims or {"sub": "alice", "scope": "*:*:*"},
         method, "lakehouse", key)
 
 
@@ -239,3 +247,32 @@ def test_sign_v4_uses_server_region_not_client_region():
     assert "/fsn1/s3/aws4_request" in auth
     # Host reconstructed from the URI when the client omitted it
     assert resp.headers.get("Host") == ["fsn1.your-objectstorage.com"]
+
+
+def test_roles_are_cached_with_the_plan():
+    ctx = _StubCtx(roles=["analyst"])
+    n = []
+    orig = ctx.store.roles_for_principal
+    ctx.store.roles_for_principal = lambda sub: (n.append(1), orig(sub))[1]
+    for k in ("a", "b", "c"):
+        assert _auth(ctx, "GET", f"data/ns/t/{k}.parquet").allowed
+    assert len(n) == 1        # one Postgres round trip, not one per request
+
+
+def test_empty_data_prefix_denies_everything():
+    ctx = _StubCtx()
+    ctx.ref.data_prefix = ""
+    d = _auth(ctx, "GET", "anything/ns/t/a.parquet")
+    assert not d.allowed and d.reason == "sign_denied_prefix"
+
+
+def test_rebuilt_context_does_not_inherit_another_catalogs_plan():
+    a = _StubCtx(plan=_file_layer_plan())
+    assert not _auth(a, "GET", "data/ns/t/a.parquet").allowed     # file-layer: base denied
+    b = _StubCtx()                                                 # different catalog
+    assert _auth(b, "GET", "data/ns/t/a.parquet").allowed
+
+
+def test_token_without_scope_signs_nothing():
+    d = _auth(_StubCtx(), "GET", "data/ns/t/a.parquet", claims={"sub": "alice"})
+    assert not d.allowed and d.reason == "sign_denied_token_scope"

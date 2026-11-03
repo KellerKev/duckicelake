@@ -185,3 +185,52 @@ def test_verify_rejects_path_swap():
     with pytest.raises(HTTPException) as e:
         _verify(s, headers, path="/fineupp/levitate/ns/t/SECRET.parquet")
     assert e.value.status_code == 403 and "mismatch" in e.value.detail
+
+
+# ---- request hardening -------------------------------------------------------
+
+def test_verify_rejects_a_stale_or_future_signature():
+    import time as _t
+    s = _settings()
+    now = int(_t.time())
+    cred = gw.mint_credentials(s, sub="alice", scope="*:*:*", roles=[],
+                               catalog_id="lake", now=now)
+    headers = _client_sign(cred["access_key_id"], cred["secret_access_key"],
+                           "GET", "/fineupp/levitate/ns/t/a.parquet")
+    assert _verify(s, headers, now=now)["sub"] == "alice"
+    for shift in (gw.MAX_CLOCK_SKEW + 5, -(gw.MAX_CLOCK_SKEW + 5)):
+        with pytest.raises(HTTPException) as e:
+            _verify(s, headers, now=now + shift)
+        assert "skewed" in e.value.detail or "expired" in e.value.detail
+
+
+@pytest.mark.parametrize("key,ok", [
+    ("levitate/ns/t/a.parquet", True),
+    ("levitate/ns/t/", True),                  # LIST prefix / dir marker
+    ("", True),                                # bucket root
+    ("levitate/ns/../other/t/a.parquet", False),
+    ("levitate/./ns/t/a.parquet", False),
+    ("levitate//ns/t/a.parquet", False),
+    ("levitate/ns/t/..", False),
+    ("levitate\\ns/t/a.parquet", False),
+])
+def test_key_must_be_canonical(key, ok):
+    assert gw.key_is_canonical(key) is ok
+
+
+def test_payload_hash_binds_the_body():
+    import hashlib
+    body = b"parquet-bytes"
+    good = hashlib.sha256(body).hexdigest()
+    assert gw.payload_hash_ok(good, body)
+    assert not gw.payload_hash_ok(good, b"other-bytes")
+    assert gw.payload_hash_ok("UNSIGNED-PAYLOAD", body)
+    assert gw.payload_hash_ok(hashlib.sha256(b"").hexdigest(), b"")
+    assert gw.payload_hash_ok(None, b"")
+    assert not gw.payload_hash_ok(None, body)
+    assert not gw.payload_hash_ok("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", body)
+
+
+def test_error_xml_is_escaped():
+    r = gw._s3_error("AccessDenied", "bad <key> & co")
+    assert b"bad &lt;key&gt; &amp; co" in r.body

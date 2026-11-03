@@ -29,6 +29,9 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
 from pydantic import BaseModel, Field
 
 from .auth import scope_allows
@@ -98,24 +101,53 @@ def parse_s3_uri(uri: str, s3: S3Settings) -> tuple[str, str] | None:
 # ---- per-worker plan cache -------------------------------------------------
 
 _plan_cache: dict[tuple, tuple[float, object]] = {}
+_roles_cache: dict[tuple, tuple[float, tuple[str, ...]]] = {}
+_CACHE_MAX = 4096
+
+
+def _put(cache: dict, key: tuple, value, ttl: float) -> None:
+    now = time.monotonic()
+    if len(cache) >= _CACHE_MAX:   # drop expired first; only then everything
+        for k in [k for k, (exp, _) in cache.items() if exp <= now]:
+            cache.pop(k, None)
+        if len(cache) >= _CACHE_MAX:
+            cache.clear()
+    cache[key] = (now + ttl, value)
+
+
+def _get(cache: dict, key: tuple):
+    hit = cache.get(key)
+    if hit is not None and hit[0] > time.monotonic():
+        return hit[1]
+    return None
+
+
+def _cached_roles(ctx, settings: Settings, sub: str) -> tuple[str, ...]:
+    """roles_for_principal with the plan cache's TTL. Roles are part of the
+    plan-cache key, so without this every sign/gateway request paid a
+    Postgres round trip even on a plan-cache hit."""
+    key = (ctx.ref.catalog_name, sub)
+    roles = _get(_roles_cache, key)
+    if roles is None:
+        roles = tuple(ctx.store.roles_for_principal(sub))
+        _put(_roles_cache, key, roles, settings.signer_cache_ttl)
+    return roles
 
 
 def _cached_plan(ctx, settings: Settings, sub: str, roles: list[str],
                  schema: str, table: str):
     """policy_engine.plan_for with a TTL cache. The cache bounds PG load
     under ranged-GET storms and equally bounds revocation staleness
-    (settings.signer_cache_ttl seconds). Errors are NOT cached — a failing
-    governance store keeps failing closed per request."""
-    key = (id(ctx), sub, tuple(roles), schema, table)
-    now = time.monotonic()
-    hit = _plan_cache.get(key)
-    if hit is not None and hit[0] > now:
-        return hit[1]
-    plan = ctx.policy_engine.plan_for(
-        principal=sub, roles=roles, schema=schema, table=table)
-    if len(_plan_cache) > 4096:  # bound worker memory under principal churn
-        _plan_cache.clear()
-    _plan_cache[key] = (now + settings.signer_cache_ttl, plan)
+    (settings.signer_cache_ttl seconds). Keyed on the catalog's name, not
+    the context object's id() (which a rebuilt context can reuse). Errors
+    are NOT cached — a failing governance store keeps failing closed per
+    request."""
+    key = (ctx.ref.catalog_name, sub, tuple(roles), schema, table)
+    plan = _get(_plan_cache, key)
+    if plan is None:
+        plan = ctx.policy_engine.plan_for(
+            principal=sub, roles=roles, schema=schema, table=table)
+        _put(_plan_cache, key, plan, settings.signer_cache_ttl)
     return plan
 
 
@@ -144,21 +176,20 @@ def authorize_sign(ctx, settings: Settings, claims: dict,
     if bucket != settings.s3.bucket:
         return SignDecision(False, "sign_denied_bucket")
     dp = ctx.ref.data_prefix
-    if not key.startswith(dp):
+    if not dp or not key.startswith(dp):   # an empty prefix would match every key
         return SignDecision(False, "sign_denied_prefix")
     rel = key[len(dp):]
 
     sub = claims.get("sub") or "anonymous"
-    # Scope claim: only enforced when auth is on (claims carry a scope).
-    # With auth off there is no token to scope — same posture as the REST
-    # routes, where the middleware is a no-op.
-    scope = claims.get("scope") or "*:*:*"
+    # Scope claim. With auth off, claims_from_request's stub carries `*:*:*`
+    # (same posture as the REST routes); a real token without one gets nothing.
+    scope = claims.get("scope") or ""
 
     def _roles() -> list[str]:
         # Same union as the LoadTable path: JWT roles claim + sidecar grants.
         return sorted(
             set(claims.get("roles") or [])
-            | set(ctx.store.roles_for_principal(sub)))
+            | set(_cached_roles(ctx, settings, sub)))
 
     if rel.startswith("__masked__/"):
         # Masked export tree: `__masked__/{ns}/{table}/{sig}/...`. Readable
@@ -205,6 +236,17 @@ def authorize_sign(ctx, settings: Settings, claims: dict,
     return SignDecision(True, "signed")
 
 
+class _UnsignedPayloadAuth(S3SigV4Auth):
+    # The client signs nothing and we never see its body, so the canonical
+    # request MUST carry UNSIGNED-PAYLOAD. The base class would hash the
+    # (empty) body for http:// URLs — a signature that breaks the moment the
+    # client attaches a real PUT body. (It also overwrites any forwarded
+    # x-amz-content-sha256 header with this value, so what we send matches
+    # what we signed.)
+    def payload(self, request):  # noqa: D102
+        return "UNSIGNED-PAYLOAD"
+
+
 def sign_v4(s3: S3Settings, method: str, uri: str,
             headers: dict[str, list[str]]) -> S3SignResponse:
     """SigV4-sign the request with the proxy's root keys and return the
@@ -212,18 +254,6 @@ def sign_v4(s3: S3Settings, method: str, uri: str,
     UNSIGNED-PAYLOAD — remote-signing clients disable their own SigV4 and
     never send us the body (forced explicitly: botocore's https-only
     payload heuristic must not decide this on http dev stacks)."""
-    from botocore.auth import S3SigV4Auth
-    from botocore.awsrequest import AWSRequest
-    from botocore.credentials import Credentials
-
-    class _UnsignedPayloadAuth(S3SigV4Auth):
-        # The client signs nothing and we never see its body, so the
-        # canonical request MUST carry UNSIGNED-PAYLOAD. The base class
-        # would hash the (empty) body for http:// URLs — a signature that
-        # breaks the moment the client attaches a real PUT body.
-        def payload(self, request):  # noqa: D102
-            return "UNSIGNED-PAYLOAD"
-
     flat: dict[str, str] = {}
     for k, values in headers.items():
         lk = k.lower()
