@@ -304,3 +304,35 @@ def test_hostile_names_in_tool_paths_stay_one_segment(executor):
     with pytest.raises(Exception) as e:
         executor.list_tables("lake/governance/audit?x=", "y", "bob")
     assert "404" in str(e.value)
+
+
+@pytest.mark.parametrize("ctx", [{"actor": "agent"}, {"actor": "human", "channel": "console"}])
+def test_untrusted_sql_namespace_vend_reads_export_not_base(client, settings, ctx):
+    """Agents and console sessions (arbitrary SQL) get the airtight tier on a
+    namespace-wide vend: the table's base bytes are denied, but the masked
+    export their masked view reads — which lives under `__masked__/`, outside
+    the namespace prefix — must stay readable, or the masked view fails."""
+    ns = _seeded_masked_table(client, settings, "ucon")
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"principal": "bob", "delegate": "1", **ctx})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    v = body["s3"]
+    s3 = settings.s3
+    gw = boto3.client("s3", endpoint_url=v["endpoint"], region_name=s3.region,
+                      aws_access_key_id=v["access-key-id"],
+                      aws_secret_access_key=v["secret-access-key"],
+                      aws_session_token=v.get("session-token"),
+                      config=s3util.boto_config(s3))
+    root = s3util.s3_client(s3)
+
+    def parquet_under(prefix):
+        return [o["Key"] for o in root.list_objects_v2(Bucket=s3.bucket, Prefix=prefix)
+                .get("Contents", []) if o["Key"].endswith(".parquet")]
+    base = parquet_under(s3.table_prefix(ns, "events"))
+    exported = parquet_under(s3.masked_table_prefix(ns, "events"))
+    assert base and exported, (base, exported)
+    with pytest.raises(Exception) as e:
+        gw.get_object(Bucket=s3.bucket, Key=base[0])["Body"].read()
+    assert "403" in str(e.value) or "AccessDenied" in str(e.value)
+    assert gw.get_object(Bucket=s3.bucket, Key=exported[0])["Body"].read()

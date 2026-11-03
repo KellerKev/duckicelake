@@ -1435,6 +1435,10 @@ def ducklake_credentials(
 
     decision = "ok"
     masked_cols: list[str] = []
+    # Masked-export trees this session reads on a namespace-wide vend (its
+    # file-layer tables): they sit under `__masked__/`, outside the
+    # namespace prefix, so the credential must name them explicitly.
+    export_read_prefixes: list[str] = []
     applied: list[str] = []
     row_filtered = False
     export = None
@@ -1533,6 +1537,8 @@ def ducklake_credentials(
                                ns, tbl, mask_signature(tplan)))
                     if exp is None:
                         continue
+                    export_read_prefixes.append(settings.s3.masked_sig_prefix(
+                        ns[0], tbl, exp.sig, ctx.ref.data_prefix))
                 if masking_view_manager.ensure_view_for_plan(ns, tbl, tplan, export=exp) is None:
                     continue
                 sch = masking_view_manager.ensure_transparent_schema(ns, tbl, tplan, export=exp)
@@ -1610,7 +1616,7 @@ def ducklake_credentials(
         # via a catalog-wide grant. Carve out the file-layer-masked tables in
         # THIS namespace (fail-closed). Cross-namespace reads here require
         # vending for the right namespace (or ?table=).
-        read_prefixes = [f"{ctx.ref.data_prefix}{ns[0]}/"]
+        read_prefixes = [f"{ctx.ref.data_prefix}{ns[0]}/"] + export_read_prefixes
         try:
             deny_prefixes = _file_layer_deny_prefixes(ctx, ns, roles)
         except Exception:
