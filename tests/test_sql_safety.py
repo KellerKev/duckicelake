@@ -23,7 +23,8 @@ from duckicelake.mcp_server import GovernedExecutor, MCPConfig
 from duckicelake.policies import _qualify_expr
 from duckicelake.read_manifest import check_under_prefix
 from duckicelake.registry import _check_catalog_names
-from duckicelake.sqlsafe import check_identifier, check_single_select, literal, qi
+from duckicelake.sqlsafe import (check_identifier, check_no_denied_functions,
+                                 check_single_select, literal, qi)
 
 from conftest import PROXY_URL
 from test_governance_phase3 import SCHEMA_JSON, _make_table, _root_duckdb
@@ -62,6 +63,18 @@ def test_check_single_select():
                 "ATTACH 'x'", "SELECT (", ""):
         with pytest.raises(ValueError):
             check_single_select(bad)
+
+
+def test_denied_functions_found_anywhere_in_the_tree():
+    check_no_denied_functions("SELECT upper(email) FROM events WHERE id > 1")
+    check_no_denied_functions('DESCRIBE "ns"."t"')
+    for bad in ("SELECT * FROM \"POSTGRES_SCAN\"/**/('h', 'public', 't')",
+                "SELECT (SELECT max(x) FROM postgres_query('db', 'select 1')) AS z",
+                "WITH a AS (SELECT * FROM query('SELECT 1')) SELECT * FROM a",
+                "SELECT * FROM t JOIN query_table('x') USING (id)",
+                "PRAGMA version"):
+        with pytest.raises(ValueError):
+            check_no_denied_functions(bad)
 
 
 def test_column_ddl_and_mask_expr_are_quoted():
@@ -257,6 +270,17 @@ def test_agent_executor_rejects_extra_statements(client, settings, executor):
     out = executor.query("lake", ns, "events",
                          "SELECT 1; ATTACH ':memory:' AS pwn", "bob")
     assert "error" in out and "one SELECT" in out["error"]
+
+
+def test_agent_executor_refuses_postgres_scan(client, settings, executor):
+    # postgres_scan opens its own connection from a DSN and isn't covered by
+    # enable_external_access — it must never be callable from agent SQL
+    ns = _seeded_masked_table(client, settings, "expg")
+    out = executor.query("lake", ns, "events",
+                         "SELECT * FROM postgres_scan('host=127.0.0.1 port=55432 "
+                         "dbname=ducklake_test user=ducklake', 'public', 'duckicelake_role')",
+                         "bob")
+    assert "error" in out and "postgres_scan" in out["error"]
 
 
 def test_agent_executor_requires_table(client, settings, executor):

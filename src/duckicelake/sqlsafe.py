@@ -7,6 +7,7 @@ here or rejected before it gets that far.
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import threading
@@ -95,4 +96,40 @@ def check_single_select(sql: str, what: str = "query", *,
         raise ValueError(f"{what} does not parse: {e}") from None
     if len(stmts) != 1 or stmts[0].type not in allow:
         raise ValueError(f"{what} must be exactly one SELECT statement")
+    return sql
+
+
+# Table/scalar functions agent SQL may never call, even inside one SELECT and
+# with external access locked: the postgres extension's scan/query functions
+# open their own connection from a caller-supplied DSN (not governed by
+# enable_external_access), and query()/query_table() run SQL built from
+# strings, which no static check can see into.
+_DENIED_FUNCTION_PREFIXES = ("postgres_",)
+_DENIED_FUNCTIONS = frozenset({"query", "query_table"})
+
+
+def _function_names(node: Any, out: set[str]) -> set[str]:
+    if isinstance(node, dict):
+        name = node.get("function_name")
+        if isinstance(name, str):
+            out.add(name.lower())
+        for v in node.values():
+            _function_names(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _function_names(v, out)
+    return out
+
+
+def check_no_denied_functions(sql: str, what: str = "query") -> str:
+    """Refuse SQL calling a denied function anywhere in its parse tree
+    (quoting, comments and nesting don't hide a call). Statements the
+    serializer can't represent are refused too — fail closed."""
+    raw = _parse_con().execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0]
+    tree = json.loads(raw)
+    if tree.get("error"):
+        raise ValueError(f"{what} can't be analysed: {tree.get('error_message', 'unsupported statement')}")
+    for name in _function_names(tree, set()):
+        if name in _DENIED_FUNCTIONS or name.startswith(_DENIED_FUNCTION_PREFIXES):
+            raise ValueError(f"{what} may not call {name}()")
     return sql

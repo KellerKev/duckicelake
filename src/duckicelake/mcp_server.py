@@ -36,7 +36,7 @@ import httpx
 
 from .auth import load_auth_config, verify_bearer
 from .config import Settings, load_settings
-from .sqlsafe import check_single_select, qi
+from .sqlsafe import check_no_denied_functions, check_single_select, qi
 
 # The end-user principal for the in-flight MCP request, set by the auth
 # middleware from the caller's verified bearer. Delegation flows this principal
@@ -46,8 +46,8 @@ _CURRENT_PRINCIPAL: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 # Exactly one statement, and only a query: the vended attach is READ_ONLY and
 # the reader role is RLS-scoped, but a second statement (ATTACH, SET, COPY …)
-# must never reach the connection. DESCRIBE/SHOW/PRAGMA/VALUES parse as SELECT.
-_QUERY_TYPES = (duckdb.StatementType.SELECT, duckdb.StatementType.EXPLAIN)
+# must never reach the connection. DESCRIBE/SHOW/VALUES parse as SELECT.
+_QUERY_TYPES = (duckdb.StatementType.SELECT,)
 _MAX_ROWS = 500
 
 
@@ -206,8 +206,9 @@ class GovernedExecutor:
               sql: str, principal: str) -> dict:
         try:
             check_single_select(sql or "", "query", allow=_QUERY_TYPES)
+            check_no_denied_functions(sql, "query")
         except ValueError as e:
-            return {"error": f"{e} (read-only SELECT/DESCRIBE/SHOW/EXPLAIN only)"}
+            return {"error": f"{e} (read-only SELECT/DESCRIBE/SHOW only)"}
         if not table:
             # A namespace-wide agent vend isn't table-routed, so it can't carry
             # the per-table masked view; require the primary table.
