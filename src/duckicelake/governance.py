@@ -87,9 +87,12 @@ _SIDECARS_ENSURED: set[str] = set()
 
 
 def reset_sidecar_cache() -> None:
-    """Forget which schemas' governance sidecars were ensured — call after
-    wiping Postgres so the next ensure re-creates them."""
+    """Forget which schemas' governance sidecars were ensured (and which
+    catalogs' RLS was armed) — call after wiping Postgres or dropping a
+    catalog schema so the next ensure re-creates them."""
     _SIDECARS_ENSURED.clear()
+    from .pg_rls import reset_rls_cache   # pg_rls imports this module
+    reset_rls_cache()
 
 
 def ensure_governance_sidecars(cur, schema: str) -> None:

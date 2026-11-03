@@ -153,6 +153,19 @@ class DuckLakeCatalog:
     # Most reads now go straight to Postgres via the pg pool, so 2 is plenty.
     _DUCKDB_READ_POOL_SIZE = 2
 
+    # Postgres connection budget. Every catalog in every process holds a
+    # psycopg pool plus one DuckDB ATTACH per DuckDB connection (write, read
+    # pool, export), and each ATTACH keeps its own postgres-extension pool
+    # (DuckDB default: 8 cached, never idle-closed, pinned per thread). With
+    # many tenants × several processes that alone exceeds max_connections,
+    # so: small per-ATTACH pools that reap idle connections, psycopg pools
+    # that shrink to `min` when idle, and lazily built read connections.
+    _PG_POOL_MIN = int(os.environ.get("DUCKICELAKE_PG_POOL_MIN", "0"))
+    _PG_POOL_MAX = int(os.environ.get("DUCKICELAKE_PG_POOL_MAX", "16"))
+    _PG_POOL_MAX_IDLE = float(os.environ.get("DUCKICELAKE_PG_POOL_MAX_IDLE", "120"))
+    _DUCKDB_PG_POOL_MAX = int(os.environ.get("DUCKICELAKE_DUCKDB_PG_POOL_MAX", "2"))
+    _DUCKDB_PG_IDLE_MS = int(os.environ.get("DUCKICELAKE_DUCKDB_PG_IDLE_MS", "60000"))
+
     def __init__(self, settings: Settings, catalog_ref: "CatalogRef | None" = None) -> None:
         self.settings = settings
         # The isolated catalog this instance serves. Defaults to the single
@@ -191,9 +204,12 @@ class DuckLakeCatalog:
         # Each pops an entry, uses, pushes back. Worst-case blocks at
         # queue.get() under saturation; that's desirable backpressure vs
         # unbounded conn creation.
+        # Slots start empty (None) and are built on first checkout: most
+        # catalogs never need a DuckDB read conn, and each one costs an
+        # ATTACH plus its own Postgres connections.
         read_q: queue.Queue = queue.Queue(maxsize=self._DUCKDB_READ_POOL_SIZE)
         for _ in range(self._DUCKDB_READ_POOL_SIZE):
-            read_q.put(self._build_duckdb_conn())
+            read_q.put(None)
         self._read_conns = read_q
 
         # Postgres connection pool for metadata reads + commit transactions.
@@ -202,8 +218,9 @@ class DuckLakeCatalog:
         # call would serialise on connection setup.
         self._pg_pool = ConnectionPool(
             conninfo=self._pg_conninfo(),
-            min_size=2,
-            max_size=16,
+            min_size=self._PG_POOL_MIN,
+            max_size=max(1, self._PG_POOL_MAX),
+            max_idle=self._PG_POOL_MAX_IDLE,
             open=True,
             timeout=10.0,
         )
@@ -218,6 +235,13 @@ class DuckLakeCatalog:
         for ext in ("ducklake", "postgres", "httpfs", "spatial"):
             conn.execute(f"INSTALL {ext}")
             conn.execute(f"LOAD {ext}")
+        # Per-ATTACH Postgres pool (applies to the ducklake:postgres ATTACH
+        # below): small, shared across threads, idle connections reaped.
+        conn.execute(f"SET pg_pool_max_connections = {max(1, self._DUCKDB_PG_POOL_MAX)}")
+        conn.execute("SET pg_pool_enable_thread_local_cache = false")
+        if self._DUCKDB_PG_IDLE_MS > 0:
+            conn.execute(f"SET pg_pool_idle_timeout_millis = {self._DUCKDB_PG_IDLE_MS}")
+            conn.execute("SET pg_pool_enable_reaper_thread = true")
 
         # Proxy's own S3 credentials — per-connection so any COPY path works.
         s3 = self.settings.s3
@@ -276,9 +300,11 @@ class DuckLakeCatalog:
         if self._read_conns is not None:
             while not self._read_conns.empty():
                 try:
-                    self._read_conns.get_nowait().close()
+                    c = self._read_conns.get_nowait()
                 except queue.Empty:
                     break
+                if c is not None:
+                    c.close()
             self._read_conns = None
         if self._export_conn is not None:
             self._export_conn.close()
@@ -329,6 +355,12 @@ class DuckLakeCatalog:
             self.connect()
         assert self._read_conns is not None
         conn = self._read_conns.get()
+        if conn is None:
+            try:
+                conn = self._build_duckdb_conn()
+            except BaseException:
+                self._read_conns.put(None)
+                raise
         try:
             yield conn
         finally:

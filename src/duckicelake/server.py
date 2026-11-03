@@ -45,8 +45,9 @@ from .masking_views import (
 from .governance_api import build_governance_router
 from .pg_rls import (
     ensure_rls,
+    ensure_rls_cached,
     ensure_writer_group,
-    gc_expired_roles,
+    gc_expired_roles_soon,
     provision_principal_role,
     provision_writer_role,
     rearm_rls_if_needed,
@@ -696,7 +697,7 @@ def _is_delegated(request: Request | None, scope: str) -> bool:
 # by the same account check as the Iceberg REST routes; resync runs on the
 # catalog the change was made in.
 app.include_router(build_governance_router(
-    resolve_catalog, auth_cfg,
+    resolve_catalog, lambda: auth_cfg,
     on_table_policy_change=_resync_table_governance))
 
 
@@ -1160,7 +1161,7 @@ def _arm_default_rls() -> bool:
     the default path self-heal the same way non-default catalogs do."""
     global _rls_ready
     if _rls_ready:
-        rearm_rls_if_needed(catalog, settings)
+        ensure_rls_cached(catalog, settings)   # throttled coverage check
         return True
     try:
         ensure_rls(catalog, settings)
@@ -1346,10 +1347,7 @@ def ducklake_credentials(
                     "secret-access-key": entry.secret_access_key,
                     "session-token": None, "expiration": None,
                     "enforcement": "bucket-policy-write"}
-        try:
-            gc_expired_roles(catalog)
-        except Exception:
-            pass
+        gc_expired_roles_soon(catalog)
         return w_out
 
     out: dict[str, Any] = {
@@ -1395,7 +1393,7 @@ def ducklake_credentials(
             armed = _arm_default_rls()
         else:
             try:
-                ensure_rls(catalog, settings)
+                ensure_rls_cached(catalog, settings)
                 armed = True
             except Exception:
                 log.exception("per-catalog RLS arming failed for %s", ctx.catalog_id)
@@ -1418,7 +1416,7 @@ def ducklake_credentials(
             out["pg_role"] = pg_role
             out["pg_valid_until"] = expires_at.isoformat()
             reader_dsn_ok = True
-            gc_expired_roles(catalog)
+            gc_expired_roles_soon(catalog)
         except Exception:
             log.exception("reader-role provisioning failed for %s — refusing "
                           "to vend the owner DSN (fail-closed)", sub)
@@ -1638,7 +1636,7 @@ def ducklake_credentials(
             # bytes are denied at the gateway, the masked-sig export tree is
             # allowed. Replaces the long-lived static key entirely.
             gw = gateway_mint(
-                settings, sub=sub, scope=claims.get("scope") or "*:*:*",
+                settings, sub=sub, scope=claims.get("scope") or "",
                 roles=roles, catalog_id=ctx.catalog_id,
                 read_prefixes=read_prefixes, deny_prefixes=deny_prefixes)
             out["s3"] = {
@@ -2736,7 +2734,7 @@ def _build_load_response(
             else [s3.table_prefix(ns[0], table, data_prefix)])
         gw = gateway_mint(
             settings, sub=principal_for_creds or "anonymous",
-            scope=(principal_claims or {}).get("scope") or "*:*:*",
+            scope=(principal_claims or {}).get("scope") or "",
             roles=gw_roles, catalog_id=ctx.catalog_id,
             read_prefixes=gw_prefixes)
         config_out["s3.endpoint"] = settings.s3_gateway_url

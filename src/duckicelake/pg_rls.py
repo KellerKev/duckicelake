@@ -49,6 +49,8 @@ import hashlib
 import logging
 import re
 import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from psycopg import errors as pg_errors
@@ -264,6 +266,40 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
                 catalog, cur, meta, group, hidden_table_fn, hidden_file_fn)
     log.info("RLS ensured: group=%s, %d table-scoped + %d file-scoped policies",
              group, len(table_scoped), len(file_scoped))
+
+
+#: metadata schema -> monotonic time of the last full arm / coverage check
+#: in THIS process. Cleared by `reset_rls_cache()` (tests drop schemas).
+_ARMED: dict[str, float] = {}
+_ARMED_LOCK = threading.Lock()
+RLS_RECHECK_SECONDS = 60.0
+
+
+def reset_rls_cache() -> None:
+    _ARMED.clear()
+
+
+def ensure_rls_cached(catalog: DuckLakeCatalog, settings: Settings,
+                      recheck_every: float = RLS_RECHECK_SECONDS) -> None:
+    """Vend-path arming: the full `ensure_rls` DDL (advisory lock, CREATE OR
+    REPLACE FUNCTION, one policy per table) runs once per catalog per
+    process; after that only `rearm_rls_if_needed`'s single coverage query,
+    at most every `recheck_every` seconds. Raises if the first arm fails
+    (the caller fails closed); a failed arm is not cached."""
+    meta = _meta_schema(catalog)
+    now = time.monotonic()
+    with _ARMED_LOCK:
+        last = _ARMED.get(meta)
+        if last is not None:
+            if now - last < recheck_every:
+                return
+            _ARMED[meta] = now
+    if last is None:
+        ensure_rls(catalog, settings)
+        with _ARMED_LOCK:
+            _ARMED[meta] = time.monotonic()
+    else:
+        rearm_rls_if_needed(catalog, settings)
 
 
 def _preflight_ownership(cur, meta: str) -> None:
@@ -609,36 +645,80 @@ def provision_writer_role(
     return role, password
 
 
+_GC_LOCK = threading.Lock()
+_GC_STATE = {"last": 0.0, "running": False}
+GC_EVERY_SECONDS = 300.0
+
+
+def gc_expired_roles_soon(catalog: DuckLakeCatalog) -> None:
+    """Vend-path hook: start a background role GC if none ran in the last
+    GC_EVERY_SECONDS in this process. Never blocks or fails the vend."""
+    now = time.monotonic()
+    with _GC_LOCK:
+        if _GC_STATE["running"] or now - _GC_STATE["last"] < GC_EVERY_SECONDS:
+            return
+        _GC_STATE["running"] = True
+        _GC_STATE["last"] = now
+
+    def _run() -> None:
+        try:
+            gc_expired_roles(catalog)
+        finally:
+            with _GC_LOCK:
+                _GC_STATE["running"] = False
+    threading.Thread(target=_run, name="duckicelake-role-gc", daemon=True).start()
+
+
 def gc_expired_roles(
     catalog: DuckLakeCatalog,
     *,
     nologin_grace: timedelta = timedelta(hours=24),
     drop_grace: timedelta = timedelta(days=7),
-) -> None:
-    """Lazy lifecycle: expired roles lose LOGIN after a grace period and
-    are dropped (with their mapping row) after a longer one. Best-effort —
-    piggybacked on vends, never blocks them."""
+) -> dict[str, int]:
+    """Role lifecycle, keyed on the role's own VALID UNTIL (pg_roles) so it
+    also reaches roles whose mapping row is gone or lives in another
+    database of this cluster (roles are cluster-wide; the mapping table is
+    per database): LOGIN is revoked `nologin_grace` after expiry (only for
+    roles that still have it), and the role plus any mapping row is dropped
+    after `drop_grace`. Each statement auto-commits, so one role that can't
+    be dropped (e.g. it owns objects) doesn't abort the sweep. Returns
+    counts; never raises."""
     now = datetime.now(timezone.utc)
+    stats = {"nologin": 0, "dropped": 0, "failed": 0}
+    pattern = ROLE_PREFIX.replace("_", "\\_") + "%"
     try:
-        with catalog.pg_cursor() as cur:
+        with catalog.pg_cursor(autocommit=True) as cur:
             _ensure_principal_sidecar(cur)
-            cur.execute(
-                "SELECT pg_role, expires_at FROM public.duckicelake_pg_principal "
-                "WHERE expires_at IS NOT NULL AND expires_at < %s",
-                (now - nologin_grace,),
-            )
-            for role, expires_at in cur.fetchall():
+            cur.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE %s "
+                        "AND rolvaliduntil < %s", (pattern, now - drop_grace))
+            for (role,) in cur.fetchall():
                 try:
-                    if expires_at < now - drop_grace:
-                        cur.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(
-                            sql.Identifier(role)))
-                        cur.execute(
-                            "DELETE FROM public.duckicelake_pg_principal "
-                            "WHERE pg_role = %s", (role,))
-                    else:
-                        cur.execute(sql.SQL("ALTER ROLE {} NOLOGIN").format(
-                            sql.Identifier(role)))
-                except Exception:
-                    log.exception("role GC failed for %s", role)
+                    cur.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(
+                        sql.Identifier(role)))
+                    cur.execute("DELETE FROM public.duckicelake_pg_principal "
+                                "WHERE pg_role = %s", (role,))
+                    stats["dropped"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    log.warning("role GC: cannot drop %s: %s", role, type(e).__name__)
+            # mapping rows whose role is already gone
+            cur.execute("DELETE FROM public.duckicelake_pg_principal p "
+                        "WHERE p.expires_at < %s AND NOT EXISTS "
+                        "(SELECT 1 FROM pg_roles r WHERE r.rolname = p.pg_role)",
+                        (now - drop_grace,))
+            cur.execute("SELECT rolname FROM pg_roles WHERE rolname LIKE %s "
+                        "AND rolcanlogin AND rolvaliduntil < %s",
+                        (pattern, now - nologin_grace))
+            for (role,) in cur.fetchall():
+                try:
+                    cur.execute(sql.SQL("ALTER ROLE {} NOLOGIN").format(
+                        sql.Identifier(role)))
+                    stats["nologin"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    log.warning("role GC: cannot disable %s: %s", role, type(e).__name__)
     except Exception:
         log.exception("role GC sweep failed")
+    if stats["dropped"] or stats["nologin"] or stats["failed"]:
+        log.info("role GC: %s", stats)
+    return stats

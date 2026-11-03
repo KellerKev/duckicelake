@@ -5,19 +5,21 @@ its own module + mounted via `include_router` so the core Iceberg REST
 server (server.py) stays essentially untouched — the governance layer is an
 additive, independently-removable experiment.
 
-Authorization: these paths live under `/v1/` so the existing
-`bearer_auth_middleware` already gates them. Because the paths contain no
-`namespaces` segment, `request_namespace()` returns None and `scope_allows`
-only passes a wildcard (`*:*:*`) token — i.e. governance authoring is
-admin-only by construction in Phase 1, which is what we want. The principal
-is decoded here purely for audit attribution.
+Authorization: every route (reads included) requires an admin (`*`) token,
+checked explicitly here — the bearer middleware alone would let any
+`*:w` / `*:rw` token through, since these paths have no namespace segment.
+The catalog in the URL is resolved through the same account gate as the
+Iceberg REST routes. Audit attribution uses the token's `sub`, or the
+delegated `principal` when a broker acts for a user.
 """
 from __future__ import annotations
+
+from typing import Callable
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .auth import AuthConfig, claims_from_request
+from .auth import AuthConfig, claims_from_request, is_admin_scope, is_broker_scope
 from .sqlsafe import check_single_select
 from .governance import (
     ATTACH_TARGETS,
@@ -112,7 +114,7 @@ class StaticS3KeyRequest(BaseModel):
 
 def build_governance_router(
     resolve_catalog,
-    auth_cfg: AuthConfig,
+    auth_cfg: AuthConfig | Callable[[], AuthConfig],
     on_table_policy_change=None,
 ) -> APIRouter:
     """Governance authoring for ANY catalog, each against its own store.
@@ -125,9 +127,25 @@ def build_governance_router(
     detach/untag, so the server can resync masking views / exports / props."""
     router = APIRouter(prefix="/v1/{prefix}/governance", tags=["governance"])
 
+    def _cfg() -> AuthConfig:   # a getter follows the server's live config
+        return auth_cfg() if callable(auth_cfg) else auth_cfg
+
     def _resolve(prefix: str, request: Request):
+        _require_admin(request)
         ctx = resolve_catalog(prefix, request)
         return ctx.store, ctx.policy_engine, ctx
+
+    def _require_admin(request: Request) -> None:
+        # Governance (authoring AND reads: audit, static keys, other
+        # principals' effective policies) is admin-only. Namespace scopes
+        # like `*:rw` or a read-only broker are not enough; the console
+        # reaches this through a `*` service token after its own
+        # MANAGE_GOVERNANCE check.
+        cfg = _cfg()
+        if not cfg.enabled:
+            return
+        if not is_admin_scope(claims_from_request(cfg, request).get("scope", "")):
+            raise HTTPException(403, "governance requires an admin token")
 
     def _resync(ctx, affected: list[tuple[str, str]]) -> None:
         if not on_table_policy_change:
@@ -139,7 +157,13 @@ def build_governance_router(
                 pass   # best-effort; next read recreates artifacts anyway
 
     def _principal(request: Request) -> str:
-        return claims_from_request(auth_cfg, request).get("sub") or "anonymous"
+        # Audit attribution: a broker acting for a user records the user.
+        claims = claims_from_request(_cfg(), request)
+        qp = request.query_params
+        if (str(qp.get("delegate", "")).lower() in ("1", "true", "yes")
+                and is_broker_scope(claims.get("scope", "")) and qp.get("principal")):
+            return qp["principal"]
+        return claims.get("sub") or "anonymous"
 
     @router.post("/tags", status_code=200)
     def create_tag(prefix: str, req: CreateTagRequest, request: Request):

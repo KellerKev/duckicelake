@@ -74,9 +74,10 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
     """Parse `id1:secret1|scope|roles|account,id2:secret2|scope,...` — empty
     entries ignored.
 
-    `scope`, `roles`, and `account` are optional, in that order,
-    `|`-delimited so secrets can still contain `:`. Defaults: scope `*:*:*`
-    (superuser, for dev), roles empty, account empty. `roles` is a
+    `scope` is REQUIRED (`*` for an admin/service client); `roles` and
+    `account` are optional, in that order, `|`-delimited so secrets can still
+    contain `:`. A client without a scope is a config error — it used to
+    default to superuser, which turned a forgotten field into full access. `roles` is a
     space-separated list of governance role names surfaced in the JWT
     `roles` claim; `account` is the multi-catalog tenant id surfaced as the
     `account` claim (matched against a catalog's account_id).
@@ -86,8 +87,8 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
         pair = pair.strip()
         if not pair:
             continue
-        # Split off optional scope + roles + account first.
-        scope = "*:*:*"
+        # Split off scope + optional roles + account first.
+        scope = ""
         roles = ""
         account = ""
         if "|" in pair:
@@ -105,7 +106,9 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
             )
         cid, csecret = pair.split(":", 1)
         if not cid or not csecret:
-            raise ValueError(f"empty id or secret in {pair!r}")
+            raise ValueError("empty id or secret in a DUCKICELAKE_OAUTH_CLIENTS entry")
+        if not scope:
+            raise ValueError(f"OAuth client {cid!r} has no scope (use '*' for an admin client)")
         out[cid] = {"secret": csecret, "scope": scope, "roles": roles,
                     "account": account}
     return out
@@ -113,7 +116,7 @@ def _parse_clients_env(raw: str) -> dict[str, dict[str, str]]:
 
 def _parse_clients_file(path: str) -> dict[str, dict[str, str]]:
     """JSON file mapping client_id -> {"secret": ..., "scope": ..., "roles": ...}.
-    Also accepts legacy str values (treated as secret with `*:*:*` scope).
+    Every entry needs an explicit `scope` (`*` for an admin client).
 
     `roles` may be a list of strings or a single space-separated string;
     both are normalised to a space-separated string.
@@ -125,14 +128,14 @@ def _parse_clients_file(path: str) -> dict[str, dict[str, str]]:
     for k, v in data.items():
         if not isinstance(k, str):
             raise ValueError(f"{path}: non-string id {k!r}")
-        if isinstance(v, str):
-            out[k] = {"secret": v, "scope": "*:*:*", "roles": "", "account": ""}
-        elif isinstance(v, dict) and "secret" in v:
+        if isinstance(v, str) or (isinstance(v, dict) and not str(v.get("scope", "")).strip()):
+            raise ValueError(f"{path}: client {k!r} has no scope (use '*' for an admin client)")
+        if isinstance(v, dict) and "secret" in v:
             raw_roles = v.get("roles", "")
             roles = " ".join(raw_roles) if isinstance(raw_roles, list) else str(raw_roles)
             out[k] = {
                 "secret": str(v["secret"]),
-                "scope": str(v.get("scope", "*:*:*")),
+                "scope": str(v["scope"]).strip(),
                 "roles": roles.strip(),
                 "account": str(v.get("account", "")).strip(),
             }
@@ -250,7 +253,9 @@ async def oauth_token_endpoint(
     # If the client requested a scope, intersect with what's allowed.
     # v1 binds the full client scope — refining via
     # intersection would be a follow-up.
-    effective_scope = entry.get("scope") or "*:*:*"
+    effective_scope = entry.get("scope") or ""
+    if not effective_scope:     # unreachable with a validated config
+        raise HTTPException(status_code=400, detail="invalid_scope")
     effective_roles = entry.get("roles") or ""
     effective_account = entry.get("account") or ""
     return issue_token(

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 
 import psycopg
@@ -119,6 +120,11 @@ class CatalogRegistry:
             int(os.environ.get("DUCKICELAKE_MAX_ACTIVE_CATALOGS", "32"))
             if max_active is None else max_active
         )
+        # Close catalogs nobody touched for this long (their DuckDB attaches
+        # and Postgres pools), so connections track active tenants, not every
+        # tenant this process ever served. 0 disables. Never the default.
+        self._idle_s = float(os.environ.get("DUCKICELAKE_CATALOG_IDLE_SECONDS", "1800"))
+        self._last_used: dict[str, float] = {}
 
     # ---- resolution ----------------------------------------------------
     def _pg(self):
@@ -186,9 +192,11 @@ class CatalogRegistry:
         """Return the connected context for a catalog id. Raises UnknownCatalog
         if it has no registry entry."""
         with self._lock:
+            self._evict_idle_locked()
             ctx = self._ctxs.get(catalog_id)
             if ctx is not None:
                 self._ctxs.move_to_end(catalog_id)
+                self._last_used[catalog_id] = time.monotonic()
         if ctx is None:
             resolved = self._resolve_row(catalog_id)
             if resolved is None:
@@ -203,6 +211,7 @@ class CatalogRegistry:
                 else:
                     self._ctxs[catalog_id] = ctx
                 self._ctxs.move_to_end(catalog_id)
+                self._last_used[catalog_id] = time.monotonic()
                 self._evict_locked()
         ctx.connect()
         return ctx
@@ -236,14 +245,30 @@ class CatalogRegistry:
             for cid in list(self._ctxs.keys()):
                 if cid == default_id:
                     continue
-                ctx = self._ctxs.pop(cid)
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
+                self._close_locked(cid)
                 break
             else:
                 break  # only the default remains
+
+    def _close_locked(self, cid: str) -> None:
+        ctx = self._ctxs.pop(cid)
+        self._last_used.pop(cid, None)
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+    def _evict_idle_locked(self) -> None:
+        # Same close-under-a-holder caveat as LRU eviction (a request still
+        # holding the ctx after `idle_s` of no other use): the long default
+        # keeps that to pathological requests; fixed with the close race.
+        if self._idle_s <= 0:
+            return
+        cutoff = time.monotonic() - self._idle_s
+        default_id = self.settings.catalog_name
+        for cid in [c for c, t in self._last_used.items()
+                    if t < cutoff and c != default_id and c in self._ctxs]:
+            self._close_locked(cid)
 
     def close_all(self) -> None:
         with self._lock:
@@ -253,3 +278,4 @@ class CatalogRegistry:
                 except Exception:
                     pass
             self._ctxs.clear()
+            self._last_used.clear()

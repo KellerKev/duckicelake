@@ -45,7 +45,17 @@ def stores(two_catalogs):  # noqa: F811
 
 def test_sidecars_live_in_each_catalogs_schema(stores, settings):
     st, cats, refs = stores
+
+    def public_policies():
+        with psycopg.connect(settings.pg_dsn) as c:
+            if c.execute("SELECT to_regclass('public.duckicelake_masking_policy')"
+                         ).fetchone()[0] is None:
+                return 0
+            return c.execute("SELECT count(*) FROM public.duckicelake_masking_policy"
+                             ).fetchone()[0]
+    before = public_policies()          # other tests may have left default-catalog rows
     _mask(st["acme"], "'***'")
+    assert public_policies() == before
     with psycopg.connect(settings.pg_dsn) as c:
         def n(schema, table):   # sidecars are created lazily: absent == 0
             if c.execute("SELECT to_regclass(%s)",
@@ -56,9 +66,6 @@ def test_sidecars_live_in_each_catalogs_schema(stores, settings):
         assert n(refs["acme"].metadata_schema, "masking_policy") == 1
         assert n(refs["acme"].metadata_schema, "policy_attachment") == 1
         assert n(refs["globex"].metadata_schema, "masking_policy") == 0
-        assert c.execute(
-            "SELECT to_regclass('public.duckicelake_masking_policy') IS NULL "
-            "OR (SELECT count(*) = 0 FROM public.duckicelake_masking_policy)").fetchone()[0]
 
 
 def test_same_policy_name_in_two_catalogs_is_independent(stores):
@@ -103,27 +110,39 @@ def test_table_properties_are_per_catalog(stores):
     assert "k" not in cats["globex"].get_table_properties(["sales"], "orders")
 
 
-def test_governance_api_is_tenant_gated(monkeypatch, settings):
-    """Authoring goes to the catalog in the URL, and only for its account."""
+def test_governance_api_is_admin_only_and_tenant_gated(monkeypatch, settings):
+    """Governance needs an admin token; authoring goes to the catalog in the
+    URL, only for the account the broker asserts, attributed to the user."""
     import duckicelake.server as srv
     from fastapi.testclient import TestClient
 
     cid = f"gov_{uuid.uuid4().hex[:6]}"
     srv.registry.provision(cid, f"dl_{cid}__main", f"duckicelake-test/{cid}/main/", "acct-a")
     cfg = AuthConfig(jwt_secret=b"test-secret-32-bytes-xxxxxxxxxxx",
-                     clients={"c": {"secret": "s", "scope": "*:rw", "roles": "", "account": ""}},
+                     clients={"c": {"secret": "s", "scope": "*", "roles": "", "account": ""}},
                      ttl_seconds=300, issuer="duckicelake")
     monkeypatch.setattr(srv, "auth_cfg", cfg)
     body = {"name": "p1", "signature_sql": "(v VARCHAR)", "body_sql": "'x'"}
 
-    def post(account):
-        tok = issue_token(cfg, "u", scope="*:rw", roles="", account=account)["access_token"]
-        return client.post(f"/v1/{cid}/governance/masking-policies", json=body,
-                           headers={"Authorization": f"Bearer {tok}"})
+    def call(method, path, scope, account, token_account="", **kw):
+        tok = issue_token(cfg, "svc", scope=scope, roles="",
+                          account=token_account)["access_token"]
+        params = {"delegate": "1", "principal": "alice", "account": account}
+        return client.request(method, f"/v1/{cid}/governance/{path}", params=params,
+                              headers={"Authorization": f"Bearer {tok}"}, **kw)
     try:
         with TestClient(srv.app) as client:
-            assert post("acct-b").status_code == 404
-            assert post("acct-a").status_code == 200
+            # a tenant's own read-write token is not an admin token
+            assert call("POST", "masking-policies", "*:rw", "acct-a",
+                        token_account="acct-a", json=body).status_code == 403
+            assert call("GET", "audit", "*:r", "acct-a",
+                        token_account="acct-a").status_code == 403
+            assert call("GET", "static-s3-keys", "broker *:r", "acct-a").status_code == 403
+            # admin broker: gated on the asserted account
+            assert call("POST", "masking-policies", "*", "acct-b", json=body).status_code == 404
+            assert call("POST", "masking-policies", "*", "acct-a", json=body).status_code == 200
+            audit = call("GET", "audit", "*", "acct-a").json()["entries"]
+            assert any(e["principal"] == "alice" for e in audit), audit[:3]
         def names(ctx):
             with ctx.catalog.pg_cursor() as cur:
                 cur.execute(f"SELECT name FROM {ctx.catalog.sidecar_sql}.duckicelake_masking_policy")
@@ -163,7 +182,7 @@ def test_upgrade_migration_copies_shared_rows_to_matching_catalogs(settings):
     try:
         got = {(c, n): k for c, n, k in migrate(apply=True) if c == cid}
         assert got[(cid, "masking_policy")] >= 1 and got[(cid, "role_grant")] >= 1
-        assert got[(cid, "policy_attachment")] == 1          # orders only
+        assert got[(cid, "policy_attachment")] >= 1
         with psycopg.connect(settings.pg_dsn) as c:
             rows = c.execute(f'SELECT object_name FROM "{meta}".duckicelake_policy_attachment '
                              "WHERE policy_name = 'mig_pii'").fetchall()

@@ -723,3 +723,56 @@ def test_rls_gc_expired_roles(settings, direct_catalog):
         cur.execute("SELECT 1 FROM public.duckicelake_pg_principal "
                     "WHERE pg_role = %s", (role,))
         assert cur.fetchone() is None
+
+
+def test_rls_gc_is_keyed_on_role_expiry_and_idempotent(settings, direct_catalog):
+    """GC reads VALID UNTIL from pg_roles: it reaches orphaned roles (no
+    mapping row — e.g. minted from another database in the cluster), revokes
+    LOGIN only once, and leaves unexpired roles alone."""
+    now = datetime.now(timezone.utc)
+    live, _ = pg_rls.provision_principal_role(direct_catalog, settings, "gc-live",
+                                              now + timedelta(hours=1))
+    stale, _ = pg_rls.provision_principal_role(direct_catalog, settings, "gc-stale",
+                                               now - timedelta(days=2))
+    orphan, _ = pg_rls.provision_principal_role(direct_catalog, settings, "gc-orphan",
+                                                now - timedelta(days=30))
+    with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
+        c.execute("DELETE FROM public.duckicelake_pg_principal WHERE pg_role = %s", (orphan,))
+    try:
+        first = pg_rls.gc_expired_roles(direct_catalog)
+        assert first["dropped"] >= 1 and first["nologin"] >= 1
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
+            login = dict(c.execute("SELECT rolname, rolcanlogin FROM pg_roles "
+                                   "WHERE rolname = ANY(%s)", ([live, stale, orphan],)).fetchall())
+        assert login == {live: True, stale: False}           # orphan dropped
+        again = pg_rls.gc_expired_roles(direct_catalog)
+        assert again["nologin"] == 0 and again["dropped"] == 0   # nothing re-altered
+    finally:
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as c:
+            for r in (live, stale, orphan):
+                c.execute(f'DROP ROLE IF EXISTS "{r}"')
+
+
+def test_rls_gc_soon_runs_in_background_at_most_once_per_window(monkeypatch, direct_catalog):
+    import threading
+    ran = threading.Event()
+    calls = []
+    monkeypatch.setattr(pg_rls, "gc_expired_roles",
+                        lambda cat: (calls.append(cat), ran.set()))
+    monkeypatch.setattr(pg_rls, "_GC_STATE", {"last": 0.0, "running": False})
+    pg_rls.gc_expired_roles_soon(direct_catalog)
+    assert ran.wait(5)
+    pg_rls.gc_expired_roles_soon(direct_catalog)      # inside the window: skipped
+    assert len(calls) == 1
+
+
+def test_rls_arm_is_cached_per_catalog(monkeypatch, settings, direct_catalog):
+    calls = []
+    monkeypatch.setattr(pg_rls, "ensure_rls", lambda c, s: calls.append("full"))
+    monkeypatch.setattr(pg_rls, "rearm_rls_if_needed", lambda c, s: calls.append("check"))
+    monkeypatch.setattr(pg_rls, "_ARMED", {})
+    pg_rls.ensure_rls_cached(direct_catalog, settings, recheck_every=3600)
+    pg_rls.ensure_rls_cached(direct_catalog, settings, recheck_every=3600)
+    assert calls == ["full"]
+    pg_rls.ensure_rls_cached(direct_catalog, settings, recheck_every=0)
+    assert calls == ["full", "check"]

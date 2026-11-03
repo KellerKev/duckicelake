@@ -206,7 +206,7 @@ def test_default_vend_self_heals(monkeypatch):
             raise RuntimeError("simulated lost startup race")
 
     monkeypatch.setattr(srv, "ensure_rls", flaky_ensure_rls)
-    monkeypatch.setattr(srv, "rearm_rls_if_needed", lambda c, s: False)
+    monkeypatch.setattr(srv, "ensure_rls_cached", lambda c, s: None)
     monkeypatch.setattr(srv, "_rls_ready", False)
 
     assert srv._arm_default_rls() is False        # startup-shaped failure
