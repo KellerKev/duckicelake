@@ -1560,6 +1560,23 @@ class DuckLakeCatalog:
                 )
                 return {int(r[0]): r[1] for r in cur.fetchall()}
 
+    def maintain(self, *, retain_days: float, file_grace_hours: float) -> dict[str, int]:
+        """Routine catalog upkeep: expire snapshots older than `retain_days`
+        (time travel stays possible within that window; DuckLake drops the
+        expired snapshots' metadata rows, including column statistics of
+        tables dropped since — the bloat that slows every commit), then
+        delete data files scheduled for deletion more than
+        `file_grace_hours` ago (in-flight readers keep theirs)."""
+        cat = ql(self._ref.catalog_name)
+        with self.cursor() as c:
+            expired = c.execute(
+                f"CALL ducklake_expire_snapshots({cat}, older_than => "
+                f"now() - INTERVAL '{float(retain_days) * 24:.3f} hours')").fetchall()
+            cleaned = c.execute(
+                f"CALL ducklake_cleanup_old_files({cat}, older_than => "
+                f"now() - INTERVAL '{float(file_grace_hours):.3f} hours')").fetchall()
+        return {"snapshots_expired": len(expired), "files_deleted": len(cleaned)}
+
     def expire_snapshots(self, snapshot_ids: list[int]) -> None:
         """Hard-delete snapshots via DuckLake's built-in expire procedure.
 

@@ -158,6 +158,7 @@ def mint_credentials(settings: Settings, *, sub: str, scope: str,
                      roles: list[str], catalog_id: str,
                      read_prefixes: list[str] | None = None,
                      deny_prefixes: list[str] | None = None,
+                     extra_claims: dict | None = None,
                      now: int | None = None) -> dict:
     """Mint a short-lived, scoped credential. Returns the `access-key-id`,
     `secret-access-key`, and `expiration` (ISO) to hand a DuckLake-direct
@@ -184,6 +185,10 @@ def mint_credentials(settings: Settings, *, sub: str, scope: str,
         claims["pfx"] = list(read_prefixes)
     if deny_prefixes:
         claims["deny"] = list(deny_prefixes)
+    for k, v in (extra_claims or {}).items():
+        if k in claims:
+            raise ValueError(f"extra claim {k!r} would override a core claim")
+        claims[k] = v
     payload = _b64u_encode(
         json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
     access_key_id = _PREFIX + payload

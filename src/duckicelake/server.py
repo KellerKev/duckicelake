@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -55,6 +56,7 @@ from .pg_rls import (
 from .auth import scope_allows
 from .policies import PolicyEngine, _masked_projection, apply_plan_to_metadata, mask_signature
 from .iceberg import build_table_metadata, schema_to_columns_ddl
+from . import result_sets, s3util
 from .materialize import materialize_all
 from .notify import run_listener as run_notify_listener
 from .models import (
@@ -264,7 +266,11 @@ def _file_layer_deny_prefixes(ctx: "CatalogContext", ns: list[str], roles: list[
     already-resolved JWT∪sidecar union. Returns None when there's simply
     nothing to deny; **raises** on any error so the caller fails CLOSED
     (we must never vend a namespace-wide grant we couldn't fully scope)."""
-    tables = [t for (_s, t) in ctx.catalog.list_tables(ns)]
+    # Only tables some policy reaches can be file-layer: plan just those
+    # (a superset; schema-level tags make it every table).
+    existing = {t for (_s, t) in ctx.catalog.list_tables(ns)}
+    tables = [t for t in ctx.policy_engine.store.tables_with_policies(ns[0])
+              if t in existing]
     deny: list[str] = []
     for t in tables:
         plan = ctx.policy_engine.plan_for(principal="__deny_probe__",
@@ -290,6 +296,33 @@ if os.environ.get("DUCKICELAKE_REQUIRE_AUTH", "0") == "1" and not auth_cfg.enabl
         "Set DUCKICELAKE_OAUTH_CLIENTS (or _CLIENTS_FILE) + "
         "DUCKICELAKE_OAUTH_JWT_SECRET, or unset REQUIRE_AUTH for dev."
     )
+
+
+async def _result_sweeper() -> None:
+    """Purge expired result sets every `result_sweep_seconds` (one worker at
+    a time — result_sets.sweep elects via an advisory lock)."""
+    import asyncio
+    s3c = s3util.s3_client(settings.s3)
+    while True:
+        await asyncio.sleep(settings.result_sweep_seconds)
+        try:
+            await asyncio.to_thread(result_sets.sweep, settings, registry.list_refs(), s3c)
+        except Exception:
+            log.exception("result-set sweep failed")
+
+
+async def _catalog_maintenance() -> None:
+    """Hourly check: maintain every catalog whose last run is older than
+    `maintenance_hours` (see maintenance.py)."""
+    import asyncio
+    from . import maintenance
+    await asyncio.sleep(300)          # let startup settle first
+    while True:
+        try:
+            await asyncio.to_thread(maintenance.run_due, settings, registry)
+        except Exception:
+            log.exception("catalog maintenance failed")
+        await asyncio.sleep(3600)
 
 
 @asynccontextmanager
@@ -318,9 +351,15 @@ async def lifespan(app: FastAPI):
     listener_task = asyncio.create_task(
         run_notify_listener(catalog), name="duckicelake-notify-listener",
     )
+    sweeper_task = asyncio.create_task(
+        _result_sweeper(), name="duckicelake-result-sweeper")
+    maintenance_task = asyncio.create_task(
+        _catalog_maintenance(), name="duckicelake-maintenance")
     try:
         yield
     finally:
+        maintenance_task.cancel()
+        sweeper_task.cancel()
         listener_task.cancel()
         try:
             await listener_task
@@ -393,7 +432,11 @@ async def bearer_auth_middleware(request: Request, call_next):
         claims = verify_bearer(auth_cfg, request.headers.get("authorization"))
         scope = claims.get("scope", "")
         ns = request_namespace(path)
-        if not scope_allows(scope, ns, request.method):
+        # Building a result set is a READ of the namespace (the query runs
+        # read-only, as the caller), even though it is a POST.
+        method = ("GET" if request.method == "POST" and path.endswith("/result-sets")
+                  else request.method)
+        if not scope_allows(scope, ns, method):
             return _iceberg_error(
                 403,
                 f"token scope {scope!r} does not allow "
@@ -1193,6 +1236,42 @@ _CRED_CACHE: dict = {}
 _CRED_TTL = float(os.environ.get("DUCKICELAKE_CRED_CACHE_TTL", "30.0"))
 
 
+@dataclass(frozen=True)
+class Identity:
+    """Who a data-plane request acts as. `sub` is the end user: the token's
+    own subject, or — on an explicit delegation (delegate=1) by a trusted
+    broker, or with auth off — the asserted `principal`. `actor`/`channel`
+    are the session context (become `actor:`/`channel:` roles); a direct,
+    non-delegated call is always human/rest. `token_roles` are roles carried
+    on the token, which on a delegated call belong to the broker and so are
+    dropped."""
+    claims: dict
+    sub: str
+    delegated: bool
+    actor: str
+    channel: str
+    token_roles: tuple
+
+
+def effective_identity(request: Request, *, principal: str | None,
+                       actor: str | None, channel: str | None,
+                       delegate: bool) -> Identity:
+    claims = claims_from_request(auth_cfg, request)
+    sub = claims.get("sub") or "anonymous"
+    # Delegation is EXPLICIT and opt-in (delegate=1): a caller that merely
+    # passes a `principal` hint (historically ignored under auth-on) is
+    # unaffected — only a caller that intends per-user delegation, and holds
+    # a broker scope, gets it. Dev/auth-off keeps honoring `principal`.
+    delegated = (not auth_cfg.enabled) or (delegate and is_broker_scope(claims.get("scope", "")))
+    if principal and delegated:
+        sub = principal
+    actor_tag = ((actor or "human") if delegated else "human").strip().lower() or "human"
+    channel_tag = ((channel or "rest") if delegated else "rest").strip().lower() or "rest"
+    token_roles = tuple(sorted(
+        [] if (delegated and principal) else (claims.get("roles") or [])))
+    return Identity(claims, sub, delegated, actor_tag, channel_tag, token_roles)
+
+
 @app.get("/v1/{prefix}/namespaces/{namespace}/ducklake-credentials")
 def ducklake_credentials(
     prefix: str,
@@ -1243,20 +1322,10 @@ def ducklake_credentials(
     if table is not None and not catalog.table_exists(ns, table):
         raise HTTPException(status_code=404, detail=f"Table does not exist: {ns}.{table}")
 
-    claims = claims_from_request(auth_cfg, request)
-    sub = claims.get("sub") or "anonymous"
-    # Delegation is EXPLICIT and opt-in (delegate=1): a trusted broker asserts
-    # the effective end-user principal and session context (actor/channel) on a
-    # caller's behalf. It is opt-in so an existing caller that merely passes a
-    # `principal` hint (historically ignored under auth-on) is unaffected — only
-    # a caller that intends per-user delegation, and holds a broker scope, gets
-    # it. Dev/auth-off keeps honoring `principal` as before. A non-delegating
-    # (or non-broker) call is the direct token principal with human/rest.
-    delegated = (not auth_cfg.enabled) or (delegate and is_broker_scope(claims.get("scope", "")))
-    if principal and delegated:
-        sub = principal
-    actor_tag = ((actor or "human") if delegated else "human").strip().lower() or "human"
-    channel_tag = ((channel or "rest") if delegated else "rest").strip().lower() or "rest"
+    who = effective_identity(request, principal=principal, actor=actor,
+                             channel=channel, delegate=delegate)
+    claims, sub, delegated = who.claims, who.sub, who.delegated
+    actor_tag, channel_tag, token_roles = who.actor, who.channel, who.token_roles
     context_tags = [f"actor:{actor_tag}", f"channel:{channel_tag}"]
 
     # Credential cache lookup (governance-stamp keyed; see _CRED_CACHE above).
@@ -1264,7 +1333,7 @@ def ducklake_credentials(
     # resolve to different masked plans and must not share a cached response.
     _now = time.time()
     _ck = (ctx.catalog_id, sub, namespace, table or "", "w" if write else "r",
-           actor_tag, channel_tag)
+           actor_tag, channel_tag, token_roles)
     try:
         _stamp = governance_store.governance_stamp()
     except Exception:
@@ -1446,7 +1515,7 @@ def ducklake_credentials(
     row_filtered = False
     export = None
     file_layer_required = False
-    roles: list[str] = list(claims.get("roles") or [])
+    roles: list[str] = list(token_roles)
     try:
         roles = sorted(
             set(roles)
@@ -1797,6 +1866,87 @@ def ducklake_credentials(
         _CRED_CACHE[_ck] = (_now + _CRED_TTL, _stamp, dict(out))
     return out
 
+
+
+class ResultSetRequest(BaseModel):
+    sql: str
+    # "materialize" (default): serve from the cache or build it now.
+    # "lookup": only report a hit (with credentials) or {"status": "miss"}.
+    mode: str = "materialize"
+
+
+def _result_cache_for(ctx: CatalogContext) -> "result_sets.ResultSetCache":
+    if not settings.s3_gateway_enabled:
+        raise HTTPException(status_code=501,
+                            detail="result sets need the S3 gateway (DUCKICELAKE_S3_GATEWAY)")
+    return result_sets.ResultSetCache(ctx, settings)
+
+
+@app.post("/v1/{prefix}/namespaces/{namespace}/result-sets")
+def create_result_set(
+    prefix: str,
+    namespace: str,
+    body: ResultSetRequest,
+    request: Request,
+    principal: str | None = None,
+    actor: str | None = None,
+    channel: str | None = None,
+    delegate: bool = False,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> dict[str, Any]:
+    """Run a read-only query AS the caller (same governed session a vend
+    would give them: masks, row filters, RLS) and return its result as
+    Parquet: file paths plus a short-lived credential that reads only this
+    result set. Repeated identical queries over unchanged data and
+    governance are served from the cache. Delegation params as for
+    ducklake-credentials."""
+    ns = _parse_namespace(namespace)
+    if len(ns) != 1 or not ctx.catalog.namespace_exists(ns):
+        raise HTTPException(status_code=404, detail=f"Namespace does not exist: {ns}")
+    if body.mode not in ("materialize", "lookup"):
+        raise HTTPException(status_code=400, detail="mode must be 'materialize' or 'lookup'")
+    cache = _result_cache_for(ctx)
+    who = effective_identity(request, principal=principal, actor=actor,
+                             channel=channel, delegate=delegate)
+    caller = result_sets.Caller(who.sub, who.actor, who.channel, who.token_roles,
+                                who.claims.get("scope") or "")
+
+    def vend() -> dict:
+        return ducklake_credentials(
+            prefix=prefix, namespace=namespace, request=request, table=None,
+            duration_seconds=3600, principal=principal, actor=actor,
+            channel=channel, delegate=delegate, write=False, ctx=ctx)
+
+    try:
+        return cache.request(caller, ns[0], body.sql, vend=vend,
+                             lookup_only=body.mode == "lookup")
+    except result_sets.Rejected as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+
+
+@app.get("/v1/{prefix}/namespaces/{namespace}/result-sets/{rs_id}")
+def get_result_set(
+    prefix: str,
+    namespace: str,
+    rs_id: str,
+    request: Request,
+    principal: str | None = None,
+    actor: str | None = None,
+    channel: str | None = None,
+    delegate: bool = False,
+    ctx: CatalogContext = Depends(resolve_catalog),
+) -> dict[str, Any]:
+    """Fresh credentials for a live result set the caller built (and a
+    reuse: its idle window is extended)."""
+    cache = _result_cache_for(ctx)
+    who = effective_identity(request, principal=principal, actor=actor,
+                             channel=channel, delegate=delegate)
+    caller = result_sets.Caller(who.sub, who.actor, who.channel, who.token_roles,
+                                who.claims.get("scope") or "")
+    try:
+        return cache.refresh(caller, rs_id)
+    except result_sets.Rejected as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
 
 @app.post("/v1/{prefix}/tables/rename", status_code=204)
 def rename_table(
@@ -2581,8 +2731,11 @@ def _build_load_response(
             # DUCKICELAKE_OAUTH_CLIENTS), the sidecar role grants, and the
             # session context tags — any source can carry an unmasked-role
             # bypass (or, inverted, withhold one to tighten for agents).
+            # On a delegated call the token (and its roles) is the broker's.
+            _token_roles = ([] if (_delegated and _qp.get("principal"))
+                            else (principal_claims.get("roles") or []))
             roles = sorted(
-                set(principal_claims.get("roles") or [])
+                set(_token_roles)
                 | set(governance_store.roles_for_principal(principal_for_creds))
                 | set(_context_tags)
             )

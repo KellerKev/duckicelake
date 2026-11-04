@@ -292,6 +292,47 @@ def _ensure_governance_sidecars_ddl(cur, sc: str) -> None:
             detail           JSONB
         )
     """)
+    _ensure_governance_version_ddl(cur, sc)
+
+
+#: Every table whose rows can change what a principal may read. Any write to
+#: one bumps the catalog's governance version (see governance_stamp).
+GOVERNED_TABLES = (
+    "duckicelake_tag", "duckicelake_object_tag", "duckicelake_masking_policy",
+    "duckicelake_row_access_policy", "duckicelake_policy_attachment",
+    "duckicelake_role", "duckicelake_role_grant", "duckicelake_object_owner",
+    "duckicelake_object_grant", "duckicelake_static_s3_key",
+)
+
+
+def _ensure_governance_version_ddl(cur, sc: str) -> None:
+    """A one-row counter bumped by a statement trigger on every governed
+    table — inserts, updates, deletes and truncates alike, whatever code (or
+    psql session) made them. The bump is transactional, so a reader never
+    sees the new version before the change it stands for is visible."""
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {sc}.duckicelake_governance_version (
+            id INT PRIMARY KEY CHECK (id = 1),
+            v  BIGINT NOT NULL
+        )
+    """)
+    cur.execute(f"INSERT INTO {sc}.duckicelake_governance_version VALUES (1, 1) "
+                "ON CONFLICT (id) DO NOTHING")
+    cur.execute(f"""
+        CREATE OR REPLACE FUNCTION {sc}.duckicelake_bump_governance_version()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            UPDATE {sc}.duckicelake_governance_version SET v = v + 1 WHERE id = 1;
+            RETURN NULL;
+        END $$
+    """)
+    for t in GOVERNED_TABLES:
+        cur.execute(f"""
+            CREATE OR REPLACE TRIGGER duckicelake_governance_version
+            AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON {sc}.{t}
+            FOR EACH STATEMENT
+            EXECUTE FUNCTION {sc}.duckicelake_bump_governance_version()
+        """)
 
 
 # ---------------------------------------------------------------------------
@@ -1069,34 +1110,39 @@ class GovernanceStore:
     # -- effective policy view -------------------------------------------
 
     def governance_stamp(self) -> str:
-        """Cheap global governance freshness token: max(created_at) across the
-        policy/tag tables plus the static-S3-key table. Changes on any policy
-        ADD — so a credential cache keyed on it never serves cleartext for a
-        newly-added mask; and a newly-registered static key (no-STS backends)
-        invalidates a principal's cached `s3: None` so the key is vended at once.
-        A DELETE leaves it unchanged (brief over-masking until TTL/next add —
-        fail-safe)."""
+        """This catalog's governance version: changes on ANY write to a
+        governed table (policy, tag, attachment, role, grant, owner, static
+        key) — add, edit or delete — so caches keyed on it (vended
+        credentials, result sets) never outlive the rules they were built
+        under. Read it BEFORE deriving anything from governance state."""
         with self.catalog.pg_cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT COALESCE(max(created_at)::text, '')
-                FROM (
-                    SELECT created_at FROM {self._sc}.duckicelake_object_tag
-                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_policy_attachment
-                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_masking_policy
-                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_row_access_policy
-                    UNION ALL SELECT created_at FROM {self._sc}.duckicelake_static_s3_key
-                ) x
-                """
-            )
-            return cur.fetchone()[0]
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(f"SELECT v FROM {self._sc}.duckicelake_governance_version WHERE id = 1")
+            row = cur.fetchone()
+            return str(row[0]) if row else ""
 
     def tables_with_policies(self, schema: str) -> list[str]:
         """Tables in `schema` carrying at least one policy attachment — via a
         tagged column whose tag is attached, or a direct column/table
         attachment. A SUPERSET (plan_for still applies role bypass); lets the
-        catalog-wide masking vend scan only these instead of every table."""
+        catalog-wide masking vend scan only these instead of every table.
+        A tag on the SCHEMA cascades to every table in it, so an attached
+        schema-level tag makes every table a candidate."""
         with self.catalog.pg_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT 1
+                FROM {self._sc}.duckicelake_object_tag ot
+                JOIN {self._sc}.duckicelake_policy_attachment pa
+                  ON pa.target_kind = 'tag'
+                 AND pa.tag_ns = ot.tag_ns AND pa.tag_name = ot.tag_name
+                WHERE ot.schema_name = %s AND ot.object_kind = 'schema'
+                LIMIT 1
+                """,
+                (schema,),
+            )
+            if cur.fetchone() is not None:
+                return [t for (_s, t) in self.catalog.list_tables([schema])]
             cur.execute(
                 f"""
                 SELECT ot.object_name

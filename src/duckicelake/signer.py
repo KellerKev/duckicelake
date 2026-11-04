@@ -175,6 +175,9 @@ def authorize_sign(ctx, settings: Settings, claims: dict,
         return SignDecision(False, "sign_denied_method")
     if bucket != settings.s3.bucket:
         return SignDecision(False, "sign_denied_bucket")
+    rr = settings.s3.results_root
+    if rr and key.startswith(rr):
+        return _authorize_result_set(ctx, settings, claims, method, key, rr)
     dp = ctx.ref.data_prefix
     if not dp or not key.startswith(dp):   # an empty prefix would match every key
         return SignDecision(False, "sign_denied_prefix")
@@ -233,6 +236,33 @@ def authorize_sign(ctx, settings: Settings, claims: dict,
     http_equiv = "GET" if method in READ_METHODS else "POST"
     if not scope_allows(scope, t_ns, http_equiv):
         return SignDecision(False, "sign_denied_token_scope")
+    return SignDecision(True, "signed")
+
+
+def _authorize_result_set(ctx, settings: Settings, claims: dict, method: str,
+                          key: str, root: str) -> SignDecision:
+    """Cached query results (`{root}{catalog}/{id}/...`): read-only, and only
+    with a credential minted for THAT result set (`rs` claim) of this
+    catalog, for its owner, while the set is live and the governance it was
+    built under still holds (a revoked role stops the reads within the
+    cache TTL)."""
+    if method not in READ_METHODS:
+        return SignDecision(False, "sign_denied_result_write")
+    rs = claims.get("rs")
+    if not rs or not key.startswith(f"{root}{ctx.ref.catalog_name}/{rs}/"):
+        return SignDecision(False, "sign_denied_result_scope")
+    from . import result_sets
+    ck = ("rs", ctx.ref.catalog_name, rs, claims.get("sub") or "")
+    alive = _get(_plan_cache, ck)
+    if alive is None:
+        try:
+            alive = result_sets.is_servable(ctx, rs, claims.get("sub") or "")
+        except Exception:
+            log.exception("result-set lookup failed for %s", rs)
+            return SignDecision(False, "sign_denied_governance_error")
+        _put(_plan_cache, ck, alive, settings.signer_cache_ttl)
+    if not alive:
+        return SignDecision(False, "sign_denied_result_gone")
     return SignDecision(True, "signed")
 
 

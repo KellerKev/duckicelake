@@ -280,6 +280,47 @@ machine.
 - `POST /v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` —
   wraps `ducklake_merge_adjacent_files` + `ducklake_cleanup_old_files`.
   Idempotent; safe to cron.
+- Scheduled maintenance (on by default): once per
+  `DUCKICELAKE_MAINTENANCE_HOURS`, every catalog expires snapshots older
+  than `DUCKICELAKE_SNAPSHOT_RETENTION_DAYS` (dropping their metadata,
+  including column statistics of tables dropped since, which every commit
+  would otherwise re-read) and deletes files scheduled for deletion more than
+  `DUCKICELAKE_FILE_GRACE_HOURS` ago. One worker at a time; last runs in
+  `public.duckicelake_maintenance_run`. No file merging (it would rewrite
+  live files).
+
+### Result sets (query result cache)
+
+`POST /v1/{prefix}/namespaces/{ns}/result-sets` with `{"sql": "SELECT …"}`
+runs the query **as the caller** — the session `ducklake-credentials` would
+vend them (RLS reader, masks, row filters; agents and airtight channels get
+the file-layer tier), locked down — and writes the result as Parquet under
+`{results root}{catalog}/{id}/`. The response carries the file URLs, columns,
+row count and a gateway credential that reads **only that result set**
+(read-only, owner only, refused once governance changed since it was built).
+Delegation params are as for `ducklake-credentials`; the route needs only
+read scope on the namespace.
+
+- **Reuse:** keyed on catalog, effective principal + session context, query
+  text, default namespace, the catalog's governance version (bumped by
+  Postgres triggers on every governance write) and a fingerprint of each table
+  read (live data/delete file ids + columns; views or table functions fall
+  back to the catalog's latest snapshot). A hit returns the same result with a
+  fresh credential. Results are never shared between principals. Queries
+  calling `now()`, `random()`, `current_date`, … are built but never reused.
+- **`mode: "lookup"`** only answers hit (with credentials) or
+  `{"status": "miss"}` — for a client that runs misses itself.
+- `GET …/result-sets/{id}` re-issues credentials for a live result the caller
+  owns (`410` after a governance change).
+- **Retention:** unused for `DUCKICELAKE_RESULT_IDLE_HOURS` (24) → purged;
+  each reuse extends it that long; every result is purged
+  `DUCKICELAKE_RESULT_MAX_DAYS` (30) after it was built. A background sweeper
+  enforces this (plus orphaned objects). `python -m duckicelake.result_sets
+  lifecycle --apply` adds a bucket lifecycle backstop on the results root
+  (expire after max days + 1; on versioned buckets, non-current versions after
+  1 day so purged results don't linger), merged with the bucket's other rules.
+- The results root is outside every catalog's data prefix, so no catalog-wide
+  credential reaches it.
 
 ### Tests + CI
 
@@ -758,6 +799,8 @@ Design details: [docs/multi_catalog_isolation.md](multi_catalog_isolation.md).
 | GET | `/v1/{prefix}/governance/effective-policies` | derived policy set + enforced plan for `?table=…&principal=…` |
 | GET | `/v1/{prefix}/governance/audit` | governance + enforcement audit trail |
 | POST | `/v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` | DuckLake compaction + file cleanup |
+| POST | `/v1/{prefix}/namespaces/{ns}/result-sets` | run a SELECT as the caller, return its result as Parquet + a credential for it (cached; `mode: lookup`) |
+| GET | `/v1/{prefix}/namespaces/{ns}/result-sets/{id}` | fresh credential for a live result set the caller owns |
 
 
 ## Layout
@@ -882,6 +925,20 @@ carry secrets.
 | `DUCKICELAKE_LOG_LEVEL` | `INFO` | |
 | `DUCKICELAKE_AUDIT_RETENTION_DAYS` | `0` *(keep forever)* | lazily purge governance-audit rows older than this |
 | `DUCKICELAKE_MAX_ACTIVE_CATALOGS` | `32` | LRU cap on attached per-tenant catalog contexts |
+| `DUCKICELAKE_CATALOG_IDLE_SECONDS` | `1800` | close per-tenant catalogs unused this long (never mid-request) |
+| `DUCKICELAKE_DUCKLAKE_SPEC` | `1.0` | DuckLake spec for catalogs this server creates; empty = extension default (1.1 on DuckDB 2.0, unreadable by 1.x clients) |
+| `DUCKICELAKE_AIRTIGHT_CHANNELS` | `console` | session channels forced onto file-layer masking (clients that run arbitrary SQL) |
+| `DUCKICELAKE_MASKED_EXPORT_WAIT_SECONDS` | `120` | how long a concurrent first read waits for the in-flight masked export |
+| `DUCKICELAKE_RESULTS_PREFIX` | *(derived: sibling `duckicelake-results/` of a `…data/` prefix)* | result-set root, outside every data prefix |
+| `DUCKICELAKE_RESULT_IDLE_HOURS` / `_MAX_DAYS` | `24` / `30` | result-set retention (sliding idle window / hard limit) |
+| `DUCKICELAKE_RESULT_MAX_ROWS` | `5000000` | larger results are refused (413) |
+| `DUCKICELAKE_RESULT_TIMEOUT_SECONDS` | `300` | query time limit for a result-set build |
+| `DUCKICELAKE_RESULT_CONCURRENCY` | `2` | concurrent builds per worker (429 beyond, after 30 s) |
+| `DUCKICELAKE_RESULT_MEMORY_LIMIT` / `_THREADS` | `2GB` / `2` | per-build DuckDB limits |
+| `DUCKICELAKE_RESULT_SWEEP_SECONDS` | `600` | result-set sweeper interval |
+| `DUCKICELAKE_MAINTENANCE_HOURS` | `24` | scheduled catalog maintenance interval; `0` = off |
+| `DUCKICELAKE_SNAPSHOT_RETENTION_DAYS` | `7` | snapshots older than this are expired (time-travel window) |
+| `DUCKICELAKE_FILE_GRACE_HOURS` | `24` | files scheduled for deletion are removed after this |
 | `DUCKICELAKE_REQUIRE_AUTH` | *(unset)* | `1` → fail boot if no OAuth clients configured |
 | `DUCKICELAKE_OAUTH_CLIENTS` | *(empty → auth disabled)* | `id:secret\|scope\|roles\|account` (roles → governance; account → multi-catalog tenancy) |
 | `DUCKICELAKE_OAUTH_CLIENTS_FILE` | *(empty)* | JSON file alternative |

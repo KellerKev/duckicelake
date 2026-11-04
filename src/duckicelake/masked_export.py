@@ -45,6 +45,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+import psycopg
+
 from .catalog import DuckLakeCatalog
 from .config import Settings
 from .sqlsafe import check_single_select
@@ -130,6 +132,9 @@ class MaskedExportManager:
             "DUCKICELAKE_MASKED_EXPORT_TTL_DAYS", "7"))
         self.export_file_size = os.environ.get(
             "DUCKICELAKE_MASKED_EXPORT_FILE_SIZE", "256MB")
+        # How long a concurrent first read waits for the in-flight export.
+        self.export_wait_seconds = float(os.environ.get(
+            "DUCKICELAKE_MASKED_EXPORT_WAIT_SECONDS", "120"))
 
     # ---- discovery -------------------------------------------------------
 
@@ -209,9 +214,16 @@ class MaskedExportManager:
                 "SELECT pg_try_advisory_lock(%s)", (_lock_key(self._sc, ns[0], table, sig),)
             ).fetchone()[0]
             if not got:
-                # someone else is exporting this sig right now — serve
-                # whatever pointer exists (possibly one snapshot behind)
-                return self.current_export(ns, table, sig)
+                # Someone else is exporting this sig right now — serve
+                # whatever pointer exists (possibly one snapshot behind).
+                existing = self.current_export(ns, table, sig)
+                if existing is not None:
+                    return existing
+                # The FIRST export of this shape is in flight: there is
+                # nothing to serve yet, so wait for it instead of failing
+                # this (fail-closed) read with a spurious 503.
+                if not self._wait_for_lock(lock_cur, ns[0], table, sig):
+                    return None
             try:
                 # re-check under the lock (loser-then-winner race)
                 existing = self.current_export(ns, table, sig)
@@ -294,6 +306,19 @@ class MaskedExportManager:
             finally:
                 lock_cur.execute("SELECT pg_advisory_unlock(%s)",
                                  (_lock_key(self._sc, ns[0], table, sig),))
+
+    def _wait_for_lock(self, cur, schema: str, table: str, sig: str) -> bool:
+        """Block (up to export_wait_seconds) on the export advisory lock."""
+        cur.execute(f"SET lock_timeout = '{int(self.export_wait_seconds * 1000)}ms'")
+        try:
+            cur.execute("SELECT pg_advisory_lock(%s)", (_lock_key(self._sc, schema, table, sig),))
+            return True
+        except psycopg.errors.LockNotAvailable:
+            log.warning("waited %.0fs for the in-flight export of %s.%s sig=%s",
+                        self.export_wait_seconds, schema, table, sig)
+            return False
+        finally:
+            cur.execute("RESET lock_timeout")
 
     # ---- eager refresh -----------------------------------------------------
 

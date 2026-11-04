@@ -37,6 +37,7 @@ import httpx
 
 from .auth import load_auth_config, verify_bearer
 from .config import Settings, load_settings
+from .governed import setup_governed
 from .sqlsafe import check_no_denied_functions, check_single_select, qi
 
 # The end user of the in-flight MCP request — (principal, account) from the
@@ -158,58 +159,13 @@ class GovernedExecutor:
         under the catalog's data path, no further configuration changes — so
         agent SQL can't read local files (the process env, config, keys) or
         other objects in the bucket."""
-        vended = bundle.get("s3") or {}
-        if not vended.get("access-key-id"):
-            # Fail closed: the vend had no scoped credential to give (e.g. no
-            # STS / gateway, nothing registered). Falling back to the proxy's
-            # root keys would read base bytes the governance tier just refused.
-            raise PermissionError(
-                f"no scoped S3 credentials were vended ({bundle.get('vend_status') or 'none'})")
         con = duckdb.connect(":memory:")
         try:
-            self._setup(con, bundle, vended, catalog_id, namespace)
+            setup_governed(con, self.settings, bundle, catalog_id, namespace)
         except BaseException:
             con.close()
             raise
         return con
-
-    def _setup(self, con: duckdb.DuckDBPyConnection, bundle: dict, vended: dict,
-               catalog_id: str, namespace: str) -> None:
-        for ext in ("ducklake", "postgres", "httpfs"):
-            con.execute(f"INSTALL {ext}"); con.execute(f"LOAD {ext}")
-        s3 = self.settings.s3
-        # Point DuckDB at the VENDED endpoint when creds are vended: the S3
-        # gateway (and STS) hand back their own endpoint, and gateway creds only
-        # work against the gateway — using the configured backend host here would
-        # send them to the wrong place. Derive USE_SSL / url-style from the vend
-        # so the http gateway works. Fall back to the backend only for the
-        # root-cred path (no vend).
-        v_ep = vended.get("endpoint")
-        if v_ep:
-            endpoint = v_ep.rsplit("://", 1)[-1]
-            use_ssl = v_ep.startswith("https")
-            url_style = "path" if vended.get("path-style-access", s3.path_style) else "vhost"
-        else:
-            endpoint, use_ssl = s3.host, s3.use_ssl
-            url_style = "path" if s3.path_style else "vhost"
-        con.execute(
-            "CREATE OR REPLACE SECRET s (TYPE S3, KEY_ID ?, SECRET ?, "
-            "REGION ?, ENDPOINT ?, USE_SSL ?, URL_STYLE ?"
-            + (", SESSION_TOKEN ?" if vended.get("session-token") else "") + ")",
-            [vended["access-key-id"], vended.get("secret-access-key"),
-             s3.region, endpoint, use_ssl, url_style]
-            + ([vended["session-token"]] if vended.get("session-token") else []),
-        )
-        con.execute(bundle["ducklake_attach_sql"])
-        post = bundle.get("post_attach_sql") or []
-        if post:
-            for stmt in post:            # masked-view route (column masking)
-                con.execute(stmt)
-        else:                            # no masking policy: default to the ns
-            con.execute(f"USE {qi(catalog_id)}.{qi(namespace)}")
-        con.execute("SET allowed_directories = ?", [[bundle["ducklake_data_path"]]])
-        con.execute("SET enable_external_access = false")
-        con.execute("SET lock_configuration = true")
 
     def query(self, catalog_id: str, namespace: str, table: str | None,
               sql: str, principal: str, account: str | None = None) -> dict:

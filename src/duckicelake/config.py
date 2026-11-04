@@ -165,6 +165,19 @@ class S3Settings:
     # Hetzner project id ("p<id>" without the p) — only used by the
     # bucket-policy generator (duckicelake.hetzner_policy).
     hetzner_project_id: str = ""
+    # Root for cached query result sets (empty = derived: the sibling
+    # `duckicelake-results/` of a `.../data/` prefix). Deliberately OUTSIDE
+    # every catalog's data prefix, so no catalog-wide credential covers it
+    # and one bucket lifecycle rule spans every catalog's results.
+    results_prefix: str = ""
+
+    @property
+    def results_root(self) -> str:
+        if self.results_prefix:
+            return self.results_prefix.rstrip("/") + "/"
+        base = self.data_prefix
+        parent = base[: -len("data/")] if base.endswith("data/") else base
+        return f"{parent}duckicelake-results/"
 
     @property
     def sts_disabled(self) -> bool:
@@ -275,6 +288,25 @@ class Settings:
     # collectors, notebooks) runs DuckDB >= 2.0; empty = extension default.
     # Existing catalogs are never migrated (no AUTOMATIC_MIGRATION).
     ducklake_spec_version: str = "1.0"
+    # Result-set cache (result_sets.py): query results materialized as
+    # Parquet, reused per (principal, query, governance, table versions).
+    # Unused results expire after `result_idle_hours` (each reuse extends
+    # them that long again); every result is purged `result_max_days` after
+    # it was built, used or not.
+    result_idle_hours: float = 24.0
+    result_max_days: float = 30.0
+    result_max_rows: int = 5_000_000
+    result_timeout_seconds: float = 300.0
+    result_concurrency: int = 2          # materializations at once, per process
+    result_memory_limit: str = "2GB"     # per materialization
+    result_threads: int = 2
+    result_sweep_seconds: float = 600.0
+    # Scheduled DuckLake maintenance per catalog (0 hours = off): expire
+    # snapshots older than `snapshot_retention_days`, then delete files
+    # scheduled for deletion over `file_grace_hours` ago.
+    maintenance_hours: float = 24.0
+    snapshot_retention_days: float = 7.0
+    file_grace_hours: float = 24.0
     # Strict mode: extend the airtight tier's fail-CLOSED posture to the
     # COOPERATIVE tier. When true, a governance error on a governed read
     # path — policy planning threw, or a demanded masking view could not be
@@ -381,6 +413,7 @@ def load_settings() -> Settings:
             os.environ.get("DUCKICELAKE_STS_MAX_DURATION", "43200")),
         hetzner_project_id=os.environ.get(
             "DUCKICELAKE_HETZNER_PROJECT_ID", ""),
+        results_prefix=os.environ.get("DUCKICELAKE_RESULTS_PREFIX", ""),
     )
     settings = Settings(
         pg_host=os.environ.get("DUCKICELAKE_PG_HOST", str(REPO_ROOT / ".pgsock")),
@@ -402,6 +435,17 @@ def load_settings() -> Settings:
                 "DUCKICELAKE_AIRTIGHT_CHANNELS", "console").split(",") if c.strip()),
         ducklake_spec_version=os.environ.get(
             "DUCKICELAKE_DUCKLAKE_SPEC", "1.0").strip(),
+        result_idle_hours=float(os.environ.get("DUCKICELAKE_RESULT_IDLE_HOURS", "24")),
+        result_max_days=float(os.environ.get("DUCKICELAKE_RESULT_MAX_DAYS", "30")),
+        result_max_rows=int(os.environ.get("DUCKICELAKE_RESULT_MAX_ROWS", "5000000")),
+        result_timeout_seconds=float(os.environ.get("DUCKICELAKE_RESULT_TIMEOUT_SECONDS", "300")),
+        result_concurrency=int(os.environ.get("DUCKICELAKE_RESULT_CONCURRENCY", "2")),
+        result_memory_limit=os.environ.get("DUCKICELAKE_RESULT_MEMORY_LIMIT", "2GB"),
+        result_threads=int(os.environ.get("DUCKICELAKE_RESULT_THREADS", "2")),
+        result_sweep_seconds=float(os.environ.get("DUCKICELAKE_RESULT_SWEEP_SECONDS", "600")),
+        maintenance_hours=float(os.environ.get("DUCKICELAKE_MAINTENANCE_HOURS", "24")),
+        snapshot_retention_days=float(os.environ.get("DUCKICELAKE_SNAPSHOT_RETENTION_DAYS", "7")),
+        file_grace_hours=float(os.environ.get("DUCKICELAKE_FILE_GRACE_HOURS", "24")),
         governance_fail_closed=os.environ.get(
             "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(
