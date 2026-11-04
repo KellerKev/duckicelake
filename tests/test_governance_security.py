@@ -321,6 +321,22 @@ def test_audit_load_never_raises():
                      applied_policies=[], row_filtered=False)   # no raise
 
 
+def test_audit_load_records_a_row_on_a_fresh_store(direct_catalog, caplog):
+    """A store as the server builds it (no attributes patched) writes the
+    read-path audit row without error — a swallowed init bug once made every
+    audit_load log a failure (and the retention purge never ran)."""
+    import logging
+    import uuid
+    caplog.set_level(logging.ERROR, logger="duckicelake.governance")
+    store = GovernanceStore(direct_catalog)
+    obj = f"audit_{uuid.uuid4().hex[:8]}.t"
+    store.audit_load(principal="auditee", object_=obj, masked_cols=["c"],
+                     applied_policies=["p"], row_filtered=False)
+    assert any(r["object"] == obj and r["principal"] == "auditee"
+               for r in store.list_audit(limit=50))
+    assert not [r for r in caplog.records if "audit failed" in r.getMessage()]
+
+
 def test_audit_retention_purges_old_rows(settings, direct_catalog):
     """With DUCKICELAKE_AUDIT_RETENTION_DAYS set, audit_load lazily purges
     rows older than the window (at most hourly; forced here)."""

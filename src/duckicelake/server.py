@@ -33,7 +33,7 @@ from .auth import (
 from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
 from .sqlsafe import check_identifier, literal
-from .registry import CatalogContext, CatalogRegistry, UnknownCatalog
+from .registry import CatalogContext, CatalogLeaseMiddleware, CatalogRegistry, UnknownCatalog
 from .config import apply_file_config, load_settings, redact_password
 from .governance import GovernanceStore
 from .masked_export import MaskedExportManager
@@ -339,6 +339,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+# Catalog contexts a request resolves stay open until its response is sent
+# (an LRU/idle eviction mid-request defers the close).
+app.add_middleware(CatalogLeaseMiddleware)
 
 
 # Paths excluded from Bearer auth even when auth is enabled:

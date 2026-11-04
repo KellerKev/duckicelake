@@ -336,3 +336,24 @@ def test_untrusted_sql_namespace_vend_reads_export_not_base(client, settings, ct
         gw.get_object(Bucket=s3.bucket, Key=base[0])["Body"].read()
     assert "403" in str(e.value) or "AccessDenied" in str(e.value)
     assert gw.get_object(Bucket=s3.bucket, Key=exported[0])["Body"].read()
+
+
+@pytest.mark.parametrize("body", ["NULL", " null ", "(NULL)"])
+def test_null_mask_keeps_the_column_type(body):
+    """DuckDB >= 2.0 types a bare NULL as "NULL": the masked view, Parquet
+    export and Iceberg schema would lose the column's type. The mask must
+    stay always-NULL but typed like the column."""
+    import duckdb
+    expr = _qualify_expr(body, "amount")
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (amount DECIMAL(10,2))")
+    con.execute("INSERT INTO t VALUES (1.5), (NULL)")
+    rel = con.execute(f"SELECT {expr} AS amount FROM t")
+    assert str(rel.description[0][1]).upper().startswith("DECIMAL")
+    assert rel.fetchall() == [(None,), (None,)]
+
+
+def test_iceberg_type_for_an_untyped_null_column():
+    from duckicelake.types import duckdb_type_to_iceberg
+    assert duckdb_type_to_iceberg('"NULL"') == "string"
+    assert duckdb_type_to_iceberg("NULL") == "string"

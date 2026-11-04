@@ -6,12 +6,15 @@ from __future__ import annotations
 import time
 
 from duckicelake.catalog import DuckLakeCatalog
-from duckicelake.registry import CatalogRegistry
+from duckicelake.registry import _REQUEST_LEASES, CatalogRegistry
 
 
 class _Ctx:
-    def __init__(self):
+    def __init__(self, cid="x"):
         self.closed = False
+        self.catalog_id = cid
+        self._leases = 0
+        self._retired = False
 
     def close(self):
         self.closed = True
@@ -64,3 +67,59 @@ def test_read_connections_are_lazy(settings):
         assert cat._pg_pool.min_size == cat._PG_POOL_MIN
     finally:
         cat.close()
+
+
+def test_evicting_a_leased_catalog_defers_the_close(settings):
+    """A request still holding a catalog keeps its connections open through
+    an eviction; the last release closes it, and a re-get meanwhile reuses
+    the same context instead of attaching twice."""
+    reg = CatalogRegistry(settings, max_active=32)
+    ctx = _Ctx("t1")
+    reg._ctxs["t1"] = ctx
+    reg._last_used["t1"] = time.monotonic()
+    held: list = []
+    token = _REQUEST_LEASES.set(held)
+    try:
+        assert reg.get("t1") is ctx
+    finally:
+        _REQUEST_LEASES.reset(token)
+    assert ctx._leases == 1 and held == [(reg, ctx)]
+
+    with reg._lock:
+        reg._close_locked("t1")             # evicted mid-request
+    assert not ctx.closed and "t1" not in reg._ctxs
+
+    assert reg.get("t1") is ctx             # revived, not re-attached
+    assert reg._ctxs["t1"] is ctx and not ctx._retired
+    with reg._lock:
+        reg._close_locked("t1")
+    reg.release(ctx)
+    assert ctx.closed and ctx._leases == 0 and "t1" not in reg._retired
+
+
+def test_unleased_catalog_closes_at_once(settings):
+    reg = CatalogRegistry(settings, max_active=32)
+    ctx = _Ctx("t2")
+    reg._ctxs["t2"] = ctx
+    reg._last_used["t2"] = time.monotonic()
+    assert reg.get("t2") is ctx and ctx._leases == 0   # no request scope
+    with reg._lock:
+        reg._close_locked("t2")
+    assert ctx.closed
+
+
+def test_new_ducklake_catalogs_are_pinned_to_spec_1_0(settings):
+    """DuckDB 2.0 would create spec-1.1 catalogs that DuckDB 1.x clients
+    cannot read; the server pins what it creates (a no-op on 1.x)."""
+    import duckdb
+    from duckicelake.catalog import pin_ducklake_spec
+    conn = duckdb.connect()
+    try:
+        conn.execute("LOAD ducklake")
+        pin_ducklake_spec(conn, "1.0")
+        if duckdb.__version__.startswith("1."):
+            return
+        assert conn.execute(
+            "SELECT current_setting('ducklake_default_version')").fetchone()[0] == "1.0"
+    finally:
+        conn.close()

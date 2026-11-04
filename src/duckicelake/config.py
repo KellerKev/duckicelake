@@ -269,6 +269,12 @@ class Settings:
     # the cooperative tier (search_path onto a masked view) is sidestepped by
     # a schema-qualified name. Comma-separated; empty disables.
     airtight_channels: tuple[str, ...] = ("console",)
+    # DuckLake spec version for catalogs this server CREATES. DuckDB 2.0's
+    # ducklake extension defaults new catalogs to spec 1.1, which DuckDB 1.x
+    # clients cannot read. Keep "1.0" until every client (warehouses,
+    # collectors, notebooks) runs DuckDB >= 2.0; empty = extension default.
+    # Existing catalogs are never migrated (no AUTOMATIC_MIGRATION).
+    ducklake_spec_version: str = "1.0"
     # Strict mode: extend the airtight tier's fail-CLOSED posture to the
     # COOPERATIVE tier. When true, a governance error on a governed read
     # path — policy planning threw, or a demanded masking view could not be
@@ -394,6 +400,8 @@ def load_settings() -> Settings:
         airtight_channels=tuple(
             c.strip().lower() for c in os.environ.get(
                 "DUCKICELAKE_AIRTIGHT_CHANNELS", "console").split(",") if c.strip()),
+        ducklake_spec_version=os.environ.get(
+            "DUCKICELAKE_DUCKLAKE_SPEC", "1.0").strip(),
         governance_fail_closed=os.environ.get(
             "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(

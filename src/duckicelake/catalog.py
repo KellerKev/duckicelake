@@ -146,6 +146,20 @@ class TableIdResolved:
     schema_id: int
 
 
+def pin_ducklake_spec(conn: duckdb.DuckDBPyConnection, version: str) -> None:
+    """Make catalogs this connection creates use DuckLake spec `version`.
+
+    Only affects a first ATTACH (catalog creation); existing catalogs keep
+    their version. DuckDB 1.x's extension has no such setting (it only
+    writes 1.0), so its "unrecognized parameter" error is ignored."""
+    if not version:
+        return
+    try:
+        conn.execute(f"SET ducklake_default_version = {ql(version)}")
+    except duckdb.CatalogException:
+        pass
+
+
 class DuckLakeCatalog:
     # DuckDB read pool size. Each connection re-ATTACHes the DuckLake
     # catalog, so keep this modest. Only used for pure-read paths
@@ -235,6 +249,7 @@ class DuckLakeCatalog:
         for ext in ("ducklake", "postgres", "httpfs", "spatial"):
             conn.execute(f"INSTALL {ext}")
             conn.execute(f"LOAD {ext}")
+        pin_ducklake_spec(conn, self.settings.ducklake_spec_version)
         # Per-ATTACH Postgres pool (applies to the ducklake:postgres ATTACH
         # below): small, shared across threads, idle connections reaped.
         conn.execute(f"SET pg_pool_max_connections = {max(1, self._DUCKDB_PG_POOL_MAX)}")

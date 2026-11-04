@@ -13,6 +13,7 @@ single-catalog deployments need no registry rows.
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 import threading
@@ -28,6 +29,36 @@ from .masked_export import MaskedExportManager
 from .masking_views import MaskingViewManager
 from .policies import PolicyEngine
 from .sqlsafe import qi
+
+
+#: Contexts handed out during the current request: [(registry, ctx), ...].
+#: Set by `CatalogLeaseMiddleware`; `CatalogRegistry.get` appends to it. The
+#: list object is shared with threadpool workers (contextvars are copied, the
+#: list is not), so leases taken in sync handlers land here too.
+_REQUEST_LEASES: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "duckicelake_catalog_leases", default=None)
+
+
+class CatalogLeaseMiddleware:
+    """Pure-ASGI middleware: every catalog context a request resolves stays
+    open until the response has been fully sent. Eviction (LRU cap or idle
+    timeout) of a context still leased by a request defers the close to the
+    last release instead of closing connections under a running query."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        held: list = []
+        token = _REQUEST_LEASES.set(held)
+        try:
+            return await self.app(scope, receive, send)
+        finally:
+            _REQUEST_LEASES.reset(token)
+            for reg, ctx in held:
+                reg.release(ctx)
 
 
 def ensure_catalog_registry_table(cur) -> None:
@@ -70,6 +101,10 @@ class CatalogContext:
             store=self.store, view_manager=self.masking_view_manager,
         )
         self._connected = False
+        # Request leases (see CatalogLeaseMiddleware) and whether the
+        # registry dropped this context while it was still leased.
+        self._leases = 0
+        self._retired = False
 
     @property
     def catalog_id(self) -> str:
@@ -126,6 +161,8 @@ class CatalogRegistry:
         # tenant this process ever served. 0 disables. Never the default.
         self._idle_s = float(os.environ.get("DUCKICELAKE_CATALOG_IDLE_SECONDS", "1800"))
         self._last_used: dict[str, float] = {}
+        # Evicted while a request still held them; closed on last release.
+        self._retired: dict[str, CatalogContext] = {}
 
     # ---- resolution ----------------------------------------------------
     def _pg(self):
@@ -191,13 +228,15 @@ class CatalogRegistry:
 
     def get(self, catalog_id: str) -> CatalogContext:
         """Return the connected context for a catalog id. Raises UnknownCatalog
-        if it has no registry entry."""
+        if it has no registry entry. Inside a request (CatalogLeaseMiddleware)
+        the context is leased until the response is sent."""
         with self._lock:
             self._evict_idle_locked()
-            ctx = self._ctxs.get(catalog_id)
+            ctx = self._ctxs.get(catalog_id) or self._revive_locked(catalog_id)
             if ctx is not None:
                 self._ctxs.move_to_end(catalog_id)
                 self._last_used[catalog_id] = time.monotonic()
+                self._lease_locked(ctx)
         if ctx is None:
             resolved = self._resolve_row(catalog_id)
             if resolved is None:
@@ -206,15 +245,41 @@ class CatalogRegistry:
             ctx = CatalogContext(self.settings, ref, account_id=account_id)
             with self._lock:
                 # Another thread may have built it meanwhile.
-                existing = self._ctxs.get(catalog_id)
+                existing = self._ctxs.get(catalog_id) or self._revive_locked(catalog_id)
                 if existing is not None:
                     ctx = existing
                 else:
                     self._ctxs[catalog_id] = ctx
                 self._ctxs.move_to_end(catalog_id)
                 self._last_used[catalog_id] = time.monotonic()
+                self._lease_locked(ctx)
                 self._evict_locked()
         ctx.connect()
+        return ctx
+
+    def _lease_locked(self, ctx: CatalogContext) -> None:
+        held = _REQUEST_LEASES.get()
+        if held is not None:
+            ctx._leases += 1
+            held.append((self, ctx))
+
+    def release(self, ctx: CatalogContext) -> None:
+        """Drop one request lease; closes the context if the registry already
+        evicted it and this was the last holder."""
+        with self._lock:
+            ctx._leases = max(0, ctx._leases - 1)
+            if ctx._retired and ctx._leases == 0:
+                self._retired.pop(ctx.catalog_id, None)
+                ctx._retired = False
+                self._close_ctx(ctx)
+
+    def _revive_locked(self, catalog_id: str) -> CatalogContext | None:
+        """An evicted context still leased (not yet closed) is reused rather
+        than opening a second set of connections for the same catalog."""
+        ctx = self._retired.pop(catalog_id, None)
+        if ctx is not None:
+            ctx._retired = False
+            self._ctxs[catalog_id] = ctx
         return ctx
 
     def default(self) -> CatalogContext:
@@ -254,15 +319,21 @@ class CatalogRegistry:
     def _close_locked(self, cid: str) -> None:
         ctx = self._ctxs.pop(cid)
         self._last_used.pop(cid, None)
+        if ctx._leases > 0:
+            # A request is still using it: close on its last release.
+            ctx._retired = True
+            self._retired[cid] = ctx
+            return
+        self._close_ctx(ctx)
+
+    @staticmethod
+    def _close_ctx(ctx: CatalogContext) -> None:
         try:
             ctx.close()
         except Exception:
             pass
 
     def _evict_idle_locked(self) -> None:
-        # Same close-under-a-holder caveat as LRU eviction (a request still
-        # holding the ctx after `idle_s` of no other use): the long default
-        # keeps that to pathological requests; fixed with the close race.
         if self._idle_s <= 0:
             return
         cutoff = time.monotonic() - self._idle_s
@@ -273,10 +344,11 @@ class CatalogRegistry:
 
     def close_all(self) -> None:
         with self._lock:
-            for ctx in self._ctxs.values():
+            for ctx in [*self._ctxs.values(), *self._retired.values()]:
                 try:
                     ctx.close()
                 except Exception:
                     pass
             self._ctxs.clear()
+            self._retired.clear()
             self._last_used.clear()

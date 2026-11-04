@@ -168,6 +168,12 @@ def duckdb_type_to_iceberg(t: str) -> Any:
     if upper in _DUCKDB_TO_ICEBERG:
         return _DUCKDB_TO_ICEBERG[upper]
 
+    if upper.strip('"') == "NULL":
+        # DuckDB >= 2.0 types an always-NULL expression (e.g. a constant
+        # mask) as "NULL", which Iceberg has no name for. Every value is
+        # null, so any nullable type is correct; string is the safest.
+        return "string"
+
     return upper.lower()
 
 

@@ -42,6 +42,7 @@ log = logging.getLogger("duckicelake.policies")
 
 
 _VAL_TOKEN = re.compile(r"\bval\b")
+_BARE_NULL = re.compile(r"^\s*\(*\s*null\s*\)*\s*$", re.IGNORECASE)
 
 
 @dataclass
@@ -126,6 +127,11 @@ def _qualify_expr(body_sql: str, column: str) -> str:
     # A function replacement: the quoted name is inserted verbatim, so a
     # backslash in a column name can't act as a regex group reference.
     quoted = _qi(column)
+    if _BARE_NULL.match(body_sql):
+        # An untyped NULL keeps type "NULL" (DuckDB >= 2.0): the masked view,
+        # the Parquet export and any Iceberg schema would lose the column's
+        # type. A dead CASE branch is always NULL but typed like the column.
+        return f"CASE WHEN false THEN {quoted} END"
     return _VAL_TOKEN.sub(lambda _m: quoted, body_sql)
 
 

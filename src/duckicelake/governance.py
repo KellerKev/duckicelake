@@ -424,17 +424,17 @@ class GovernanceStore:
 
     def __init__(self, catalog: DuckLakeCatalog) -> None:
         self.catalog = catalog
-
-    @property
-    def _sc(self) -> str:
-        """This catalog's quoted governance sidecar schema."""
-        return self.catalog.sidecar_sql
         # Read-path audit retention: rows older than this are lazily purged
         # (at most once an hour, piggybacked on audit_load). 0 = keep forever.
         # The audit table otherwise grows one row per governed read.
         self.audit_retention_days = int(os.environ.get(
             "DUCKICELAKE_AUDIT_RETENTION_DAYS", "0"))
         self._last_audit_purge = 0.0
+
+    @property
+    def _sc(self) -> str:
+        """This catalog's quoted governance sidecar schema."""
+        return self.catalog.sidecar_sql
 
     # -- audit ------------------------------------------------------------
 
