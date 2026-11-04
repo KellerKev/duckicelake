@@ -768,7 +768,7 @@ def test_rls_gc_soon_runs_in_background_at_most_once_per_window(monkeypatch, dir
 
 def test_rls_arm_is_cached_per_catalog(monkeypatch, settings, direct_catalog):
     calls = []
-    monkeypatch.setattr(pg_rls, "ensure_rls", lambda c, s: calls.append("full"))
+    monkeypatch.setattr(pg_rls, "ensure_rls", lambda c, s, **k: calls.append("full"))
     monkeypatch.setattr(pg_rls, "rearm_rls_if_needed", lambda c, s: calls.append("check"))
     monkeypatch.setattr(pg_rls, "_ARMED", {})
     pg_rls.ensure_rls_cached(direct_catalog, settings, recheck_every=3600)

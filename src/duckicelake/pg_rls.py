@@ -247,7 +247,8 @@ def _classify_tables(cur, meta_schema: str) -> tuple[list[str], list[str]]:
     return sorted(table_scoped), sorted(file_scoped)
 
 
-def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
+def ensure_rls(catalog: DuckLakeCatalog, settings: Settings,
+               lock_timeout_ms: int | None = None) -> None:
     """Idempotent: group role, grants, sidecar, predicate functions, and
     one RLS policy per classified ducklake_* table. Safe to call on every
     startup; follows the _ensure_materialisation_sidecar DDL discipline.
@@ -261,9 +262,19 @@ def ensure_rls(catalog: DuckLakeCatalog, settings: Settings) -> None:
     group = _group_for(settings, meta)
     hidden_table_fn, hidden_file_fn = _fn_names(meta)
     with catalog.pg_cursor() as cur:
-        with pg_advisory_lock(cur, f"duckicelake:ensure_rls:{meta}"):
-            table_scoped, file_scoped = _ensure_rls_locked(
-                catalog, cur, meta, group, hidden_table_fn, hidden_file_fn)
+        # `lock_timeout_ms` bounds every wait (the advisory lock and each
+        # DDL's table lock): ALTER/CREATE POLICY need exclusive locks on the
+        # ducklake_* tables, so an unbounded wait behind any open reader or
+        # writer transaction would also queue every later query on them.
+        if lock_timeout_ms:
+            cur.execute(f"SET lock_timeout = '{int(lock_timeout_ms)}ms'")
+        try:
+            with pg_advisory_lock(cur, f"duckicelake:ensure_rls:{meta}"):
+                table_scoped, file_scoped = _ensure_rls_locked(
+                    catalog, cur, meta, group, hidden_table_fn, hidden_file_fn)
+        finally:
+            if lock_timeout_ms:
+                cur.execute("RESET lock_timeout")
     log.info("RLS ensured: group=%s, %d table-scoped + %d file-scoped policies",
              group, len(table_scoped), len(file_scoped))
 
@@ -277,6 +288,14 @@ RLS_RECHECK_SECONDS = 60.0
 
 def reset_rls_cache() -> None:
     _ARMED.clear()
+    _FULL_ARM_PENDING.clear()
+
+
+#: Vend-path DDL waits at most this long for its table locks.
+RLS_DDL_LOCK_TIMEOUT_MS = 5000
+#: Catalogs whose full arm was skipped because the tables were busy (RLS
+#: was already in place); retried at the next recheck.
+_FULL_ARM_PENDING: set[str] = set()
 
 
 def ensure_rls_cached(catalog: DuckLakeCatalog, settings: Settings,
@@ -285,7 +304,12 @@ def ensure_rls_cached(catalog: DuckLakeCatalog, settings: Settings,
     REPLACE FUNCTION, one policy per table) runs once per catalog per
     process; after that only `rearm_rls_if_needed`'s single coverage query,
     at most every `recheck_every` seconds. Raises if the first arm fails
-    (the caller fails closed); a failed arm is not cached."""
+    (the caller fails closed); a failed arm is not cached.
+
+    The DDL waits at most RLS_DDL_LOCK_TIMEOUT_MS for table locks. When it
+    can't get them (some transaction is open on the catalog's metadata) but
+    RLS is already fully in place — the normal case after a restart — the
+    vend proceeds and the full arm is retried at the next recheck."""
     meta = _meta_schema(catalog)
     now = time.monotonic()
     with _ARMED_LOCK:
@@ -294,12 +318,34 @@ def ensure_rls_cached(catalog: DuckLakeCatalog, settings: Settings,
             if now - last < recheck_every:
                 return
             _ARMED[meta] = now
-    if last is None:
-        ensure_rls(catalog, settings)
+        pending = meta in _FULL_ARM_PENDING
+    if last is None or pending:
+        try:
+            ensure_rls(catalog, settings, lock_timeout_ms=RLS_DDL_LOCK_TIMEOUT_MS)
+        except pg_errors.LockNotAvailable:
+            if not rls_fully_armed(catalog, settings):
+                raise
+            log.warning("RLS DDL for %s skipped: its tables are busy, and RLS is "
+                        "already in place; retrying later", meta)
+            with _ARMED_LOCK:
+                _FULL_ARM_PENDING.add(meta)
+                _ARMED[meta] = time.monotonic()
+            return
         with _ARMED_LOCK:
+            _FULL_ARM_PENDING.discard(meta)
             _ARMED[meta] = time.monotonic()
     else:
         rearm_rls_if_needed(catalog, settings)
+
+
+def rls_fully_armed(catalog: DuckLakeCatalog, settings: Settings) -> bool:
+    """The reader group exists and every ducklake_* table it must see is
+    granted (and therefore policied by the arm that granted it)."""
+    meta = _meta_schema(catalog)
+    group = _group_for(settings, meta)
+    with catalog.pg_cursor(autocommit=False) as cur:
+        gap = _coverage_gap(cur, meta, group)
+    return gap == 0
 
 
 def _preflight_ownership(cur, meta: str) -> None:
@@ -417,6 +463,28 @@ def _ensure_rls_locked(catalog: DuckLakeCatalog, cur, meta: str, group: str,
     return table_scoped, file_scoped
 
 
+def _coverage_gap(cur, meta: str, group: str) -> int | None:
+    """ducklake_* tables the reader group should be granted but isn't; None
+    when the group doesn't exist (RLS never armed)."""
+    cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (group,))
+    if cur.fetchone() is None:
+        return None
+    # %% — this query binds a param, so literal % must be doubled.
+    cur.execute("""
+        SELECT count(*) FROM information_schema.tables t
+        WHERE t.table_schema = %s AND t.table_type = 'BASE TABLE'
+          AND t.table_name LIKE 'ducklake\\_%%'
+          AND t.table_name NOT LIKE 'ducklake\\_inlined\\_data\\_%%'
+          AND t.table_name NOT IN ('ducklake_snapshot_changes',
+                                   'ducklake_files_scheduled_for_deletion')
+          AND NOT EXISTS (
+            SELECT 1 FROM information_schema.role_table_grants g
+            WHERE g.grantee = %s AND g.table_schema = %s
+              AND g.table_name = t.table_name)
+    """, (meta, group, meta))
+    return cur.fetchone()[0]
+
+
 def rearm_rls_if_needed(catalog: DuckLakeCatalog, settings: Settings) -> bool:
     """`ensure_rls` runs once at startup and grants/policies per-table, so a
     `ducklake_*` table created LATER (e.g. a DuckLake version introducing a
@@ -430,26 +498,12 @@ def rearm_rls_if_needed(catalog: DuckLakeCatalog, settings: Settings) -> bool:
     group = _group_for(settings, meta)
     try:
         with catalog.pg_cursor(autocommit=False) as cur:
-            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (group,))
-            if cur.fetchone() is None:
-                return False   # RLS never armed; ensure_rls (startup) owns that
-            # %% — this query binds a param, so literal % must be doubled.
-            cur.execute("""
-                SELECT count(*) FROM information_schema.tables t
-                WHERE t.table_schema = %s AND t.table_type = 'BASE TABLE'
-                  AND t.table_name LIKE 'ducklake\\_%%'
-                  AND t.table_name NOT LIKE 'ducklake\\_inlined\\_data\\_%%'
-                  AND t.table_name NOT IN ('ducklake_snapshot_changes',
-                                           'ducklake_files_scheduled_for_deletion')
-                  AND NOT EXISTS (
-                    SELECT 1 FROM information_schema.role_table_grants g
-                    WHERE g.grantee = %s AND g.table_schema = %s
-                      AND g.table_name = t.table_name)
-            """, (meta, group, meta))
-            gap = cur.fetchone()[0]
+            gap = _coverage_gap(cur, meta, group)
+        if gap is None:
+            return False   # RLS never armed; ensure_rls (startup) owns that
         if gap:
             log.info("RLS coverage gap (%d ungranted ducklake_* tables) — re-arming", gap)
-            ensure_rls(catalog, settings)
+            ensure_rls(catalog, settings, lock_timeout_ms=RLS_DDL_LOCK_TIMEOUT_MS)
             return True
     except Exception:
         log.exception("rearm_rls_if_needed failed")
