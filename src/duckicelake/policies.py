@@ -294,10 +294,12 @@ def mask_signature(plan: TablePolicyPlan, columns: list[str] | None = None) -> s
 #: Session-dependent SQL tokens that cannot be baked into physical bytes —
 #: a file-layer export with any of these in a mask/filter body is refused
 #: (fail-open to catalog-level masking).
-_SESSION_TOKENS = re.compile(
-    r"\b(current_user|session_user|current_setting|current_role|user)\b",
+SESSION_TOKENS = re.compile(
+    r"\b(current_user|session_user|current_setting|current_role|user|getvariable"
+    r"|current_schema|current_schemas|current_database|current_catalog)\b",
     re.IGNORECASE,
 )
+_SESSION_TOKENS = SESSION_TOKENS
 
 
 def plan_is_exportable(plan: TablePolicyPlan) -> bool:

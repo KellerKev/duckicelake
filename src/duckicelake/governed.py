@@ -25,10 +25,14 @@ def setup_governed(con: duckdb.DuckDBPyConnection, settings: Settings, bundle: d
                    catalog_id: str, namespace: str, *,
                    extra_dirs: Iterable[str] = (),
                    memory_limit: str | None = None,
-                   threads: int | None = None) -> None:
+                   threads: int | None = None,
+                   spill_dir: str | None = None) -> None:
     """Configure `con` from a `ducklake-credentials` bundle, then lock it.
     `extra_dirs` are additional allowed directories (e.g. a private local
-    output directory the caller COPYs a result into). Raises PermissionError
+    output directory the caller COPYs a result into). `spill_dir` is a
+    private directory for DuckDB's temp files, capped at
+    `settings.spill_limit` (a query over its memory limit spills there
+    instead of failing, and fails once the cap is hit). Raises PermissionError
     when the bundle carries no scoped S3 credential (fail closed)."""
     vended = bundle.get("s3") or {}
     if not vended.get("access-key-id"):
@@ -67,6 +71,9 @@ def setup_governed(con: duckdb.DuckDBPyConnection, settings: Settings, bundle: d
         con.execute("SET memory_limit = ?", [memory_limit])
     if threads:
         con.execute(f"SET threads = {int(threads)}")
+    if spill_dir:
+        con.execute("SET temp_directory = ?", [spill_dir])
+        con.execute("SET max_temp_directory_size = ?", [settings.spill_limit])
     con.execute("SET allowed_directories = ?",
                 [[bundle["ducklake_data_path"], *extra_dirs]])
     con.execute("SET enable_external_access = false")

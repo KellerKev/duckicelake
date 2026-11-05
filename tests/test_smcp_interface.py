@@ -31,10 +31,13 @@ def _cfg() -> SMCPConfig:
     )
 
 
-def test_registers_the_four_governed_tools():
+def test_registers_the_governed_tools():
     server, _ = si.build_server(smcp_cfg=_cfg(), mcp_cfg=MCPConfig())
     caps = server.node.capabilities
-    assert set(caps) == {"list_namespaces", "list_tables", "describe_table", "query"}
+    assert set(caps) == {"list_namespaces", "list_tables", "describe_table", "query",
+                         "query_result_set", "fetch_result_set"}
+    assert set(caps["fetch_result_set"].parameters["required"]) == {
+        "catalog", "namespace", "result_set_id"}
     # the query tool declares its params + required list
     qp = caps["query"].parameters
     assert set(qp["required"]) == {"catalog", "namespace", "table", "sql"}

@@ -312,17 +312,28 @@ async def _result_sweeper() -> None:
 
 
 async def _catalog_maintenance() -> None:
-    """Hourly check: maintain every catalog whose last run is older than
-    `maintenance_hours` (see maintenance.py)."""
+    """Maintain every catalog whose last full run is older than
+    `maintenance_hours` (checked hourly), and auto-compact the tables that
+    need it every `compaction_check_seconds` (see maintenance.py)."""
     import asyncio
+    import time as _time
     from . import maintenance
     await asyncio.sleep(300)          # let startup settle first
+    tick = settings.compaction_check_seconds or 3600.0
+    next_full = 0.0
     while True:
-        try:
-            await asyncio.to_thread(maintenance.run_due, settings, registry)
-        except Exception:
-            log.exception("catalog maintenance failed")
-        await asyncio.sleep(3600)
+        if _time.monotonic() >= next_full:
+            next_full = _time.monotonic() + 3600
+            try:
+                await asyncio.to_thread(maintenance.run_due, settings, registry)
+            except Exception:
+                log.exception("catalog maintenance failed")
+        elif settings.compaction_check_seconds > 0:
+            try:
+                await asyncio.to_thread(maintenance.run_compaction, settings, registry)
+            except Exception:
+                log.exception("auto-compaction failed")
+        await asyncio.sleep(min(tick, 3600.0))
 
 
 @asynccontextmanager

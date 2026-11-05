@@ -295,8 +295,8 @@ def test_agent_executor_masks_and_is_locked_down(client, settings, executor):
     assert out.get("rows") == [["***"]], out
     for sql in ("SELECT * FROM read_text('/proc/self/environ')",
                 f"SELECT * FROM read_parquet('s3://{settings.s3.bucket}/*/*.parquet')"):
-        with pytest.raises(duckdb.Error):
-            executor.query("lake", ns, "events", sql, "bob")
+        out = executor.query("lake", ns, "events", sql, "bob")
+        assert "rows" not in out and "query failed" in out.get("error", ""), out
 
 
 def test_hostile_names_in_tool_paths_stay_one_segment(executor):
@@ -357,3 +357,38 @@ def test_iceberg_type_for_an_untyped_null_column():
     from duckicelake.types import duckdb_type_to_iceberg
     assert duckdb_type_to_iceberg('"NULL"') == "string"
     assert duckdb_type_to_iceberg("NULL") == "string"
+
+
+def test_agent_result_set_is_masked_and_pages(client, settings, executor):
+    """Large results for agents: materialized through the governance core as
+    the agent session (masked), previewed, then paged back through the
+    gateway with the result's own credential."""
+    ns = _seeded_masked_table(client, settings, "exrs")
+    out = executor.query_result_set("lake", ns, "SELECT id, email FROM events ORDER BY id",
+                                    "bob", preview_rows=1)
+    assert "error" not in out, out
+    assert out["row_count"] >= 1 and out["rows"] and all(r[1] == "***" for r in out["rows"])
+    assert "s3" not in out and "files" not in out           # no credentials unless asked
+    page = executor.fetch_result_set("lake", ns, out["result_set_id"], "bob",
+                                     offset=0, limit=1000)
+    assert len(page["rows"]) == out["row_count"] and page["next_offset"] is None
+    assert all(r[1] == "***" for r in page["rows"])
+    if out["row_count"] > 1:
+        assert out["next_offset"] == 1
+    creds = executor.fetch_result_set("lake", ns, out["result_set_id"], "bob",
+                                      include_credentials=True)
+    assert creds["s3"]["access-key-id"] and creds["files"]
+
+
+def test_agent_result_set_errors_are_replies(client, settings, executor):
+    ns = _seeded_masked_table(client, settings, "exre")
+    assert "error" in executor.query_result_set("lake", ns, "DELETE FROM events", "bob")
+    assert "error" in executor.query_result_set("lake", ns, "SELECT * FROM nope", "bob")
+    gone = executor.fetch_result_set("lake", ns, "0" * 24, "bob")
+    assert "404" in gone.get("error", "")
+
+
+def test_agent_query_hints_at_result_sets_when_truncated(client, settings, executor):
+    ns = _seeded_masked_table(client, settings, "exhn")
+    out = executor.query("lake", ns, "events", "SELECT * FROM range(1000)", "bob")
+    assert out["truncated"] and "query_result_set" in out["hint"]

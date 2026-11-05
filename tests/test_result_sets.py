@@ -231,3 +231,93 @@ def test_analyse(sql, tables, volatile, tf):
     assert shape.table_functions == tf
     if "WITH c" in sql:
         assert shape.ctes == {"c"}
+
+
+# ---- sharing within a governance class ----------------------------------------
+
+def test_principals_with_identical_governance_share_one_result(client, settings, masked_ns):
+    """Same granted roles, same context: one result, served to both — and
+    readable by both through the gateway; a principal in another class gets
+    its own result and can't read the shared one."""
+    ns = masked_ns
+    bob2 = BOB + "_2"
+    sql = "SELECT id, email FROM events ORDER BY id"
+    first = _rs(client, ns, sql, BOB).json()
+    assert first["status"] == "materialized" and first["shared"] is True
+    second = _rs(client, ns, sql, bob2).json()
+    assert second["status"] == "hit" and second["id"] == first["id"]
+    assert _read(second) == [(1, "al***"), (2, "bo***")]
+    # the reader may refresh it too, and the share is audited once
+    assert client.get(f"/v1/lake/namespaces/{ns}/result-sets/{first['id']}",
+                      params={"principal": bob2}).status_code == 200
+    with psycopg.connect(settings.pg_dsn) as c:
+        audits = c.execute(
+            "SELECT count(*) FROM public.duckicelake_governance_audit "
+            "WHERE principal_sub = %s AND decision = 'shared' AND detail->>'id' = %s",
+            (bob2, first["id"])).fetchone()[0]
+    assert audits == 1
+
+    # alice (pii_reader) is another class: her own, cleartext result
+    alice = _rs(client, ns, sql, ALICE).json()
+    assert alice["id"] != first["id"] and _read(alice)[0][1] == "alice@example.com"
+    # ...and a principal outside bob's class can't fetch bob's result
+    assert client.get(f"/v1/lake/namespaces/{ns}/result-sets/{first['id']}",
+                      params={"principal": ALICE}).status_code == 404
+    # a second pii_reader shares alice's
+    alice2 = ALICE + "_2"
+    client.post("/v1/lake/governance/role-grants",
+                json={"role": "pii_reader", "principal": alice2}).raise_for_status()
+    # (the grant moved the governance version: alice rebuilds, then shares)
+    a1 = _rs(client, ns, sql, ALICE).json()
+    a2 = _rs(client, ns, sql, alice2).json()
+    assert a2["status"] == "hit" and a2["id"] == a1["id"]
+
+
+def test_session_context_is_part_of_the_class(client, masked_ns):
+    ns = masked_ns
+    sql = "SELECT id FROM events ORDER BY id"
+    human = _rs(client, ns, sql, BOB).json()
+    agent = _rs(client, ns, sql, BOB + "_2",
+                {"actor": "agent", "channel": "mcp", "delegate": "1"}).json()
+    assert agent["id"] != human["id"]
+
+
+def test_session_dependent_queries_are_never_shared(client, masked_ns):
+    ns = masked_ns
+    sql = "SELECT id, current_user AS u FROM events"
+    a = _rs(client, ns, sql, BOB).json()
+    b = _rs(client, ns, sql, BOB + "_2").json()
+    assert a["shared"] is False and b["status"] == "materialized" and a["id"] != b["id"]
+    # still reused for the same principal
+    assert _rs(client, ns, sql, BOB).json()["id"] == a["id"]
+
+
+def test_session_dependent_policies_are_never_shared(client, settings):
+    """A row filter that reads the session could differ between principals
+    with the same roles: such a table's results stay per principal."""
+    ns = _ns("rss")
+    _make_table(client, ns, "events")
+    _seed_rows(settings, ns)
+    pol = f"rap_{uuid.uuid4().hex[:6]}"
+    client.post("/v1/lake/governance/row-access-policies",
+                json={"name": pol, "signature": "()",
+                      "body": "id > 0 OR current_user = 'nobody'"}).raise_for_status()
+    client.post("/v1/lake/governance/policy-attachments",
+                json={"policy-kind": "row_access", "policy-name": pol, "target-kind": "table",
+                      "schema": ns, "object": "events"}).raise_for_status()
+    sql = "SELECT count(*) AS n FROM events"
+    a = _rs(client, ns, sql, BOB)
+    assert a.status_code == 200, a.text
+    a = a.json()
+    b = _rs(client, ns, sql, BOB + "_2").json()
+    assert a["shared"] is False and a["id"] != b["id"]
+
+
+@pytest.mark.parametrize("sql, session", [
+    ("SELECT current_user", True),
+    ("SELECT user AS u FROM t", True),
+    ("SELECT getvariable('x')", True),
+    ("SELECT a FROM t", False),
+])
+def test_analyse_session_functions(sql, session):
+    assert analyse(sql).session_dependent is session

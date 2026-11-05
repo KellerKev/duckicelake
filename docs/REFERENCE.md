@@ -278,16 +278,43 @@ machine.
   TABLE plus delete every S3 object under the table prefix (data,
   delete files, manifests, metadata JSON).
 - `POST /v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` —
-  wraps `ducklake_merge_adjacent_files` + `ducklake_cleanup_old_files`.
-  Idempotent; safe to cron.
-- Scheduled maintenance (on by default): once per
-  `DUCKICELAKE_MAINTENANCE_HOURS`, every catalog expires snapshots older
-  than `DUCKICELAKE_SNAPSHOT_RETENTION_DAYS` (dropping their metadata,
-  including column statistics of tables dropped since, which every commit
-  would otherwise re-read) and deletes files scheduled for deletion more than
-  `DUCKICELAKE_FILE_GRACE_HOURS` ago. One worker at a time; last runs in
-  `public.duckicelake_maintenance_run`. No file merging (it would rewrite
-  live files).
+  compacts one table now (merge small files, rewrite delete-heavy ones) and
+  deletes files scheduled for deletion more than `DUCKICELAKE_FILE_GRACE_HOURS`
+  ago — never the files it just replaced, which in-flight readers may still
+  need. Idempotent; safe to cron.
+- **Auto-compaction** (on by default): every
+  `DUCKICELAKE_COMPACTION_CHECK_SECONDS` (900) a metadata query per catalog
+  finds tables with at least `DUCKICELAKE_COMPACTION_MIN_FILES` (8) live data
+  files under `DUCKICELAKE_COMPACTION_SMALL_FILE_BYTES` (64 MiB), or a file
+  with more than `DUCKICELAKE_COMPACTION_DELETE_RATIO` (0.2) of its rows
+  deleted, and compacts just those (`ducklake_merge_adjacent_files` /
+  `ducklake_rewrite_data_files`, on a dedicated connection so commits aren't
+  blocked). A table with nothing to do gets no new snapshot. Opt a table out
+  with DuckLake's own option:
+  `CALL lake.set_option('auto_compact', false, table_name => 't', schema => 's')`.
+  Compaction is a new snapshot: Iceberg clients see it on their next
+  LoadTable, and cached result sets over that table are rebuilt on next use.
+- **Scheduled maintenance** (on by default): once per
+  `DUCKICELAKE_MAINTENANCE_HOURS`, every catalog
+  1. creates any missing lookup indexes on its DuckLake metadata tables
+     (`duckicelake_ix_*`, by `table_id` etc. — additive; DuckLake never reads
+     them; `DUCKICELAKE_CATALOG_INDEXES=0` to skip),
+  2. flushes inlined rows to Parquet and compacts the whole catalog,
+  3. expires snapshots older than `DUCKICELAKE_SNAPSHOT_RETENTION_DAYS`
+     (dropping their metadata, including column statistics of tables dropped
+     since, which every commit would otherwise re-read),
+  4. deletes files scheduled for deletion more than
+     `DUCKICELAKE_FILE_GRACE_HOURS` ago, and
+  5. sweeps orphaned data files older than that — DuckLake data files a
+     failed or interrupted write left behind (`DUCKICELAKE_ORPHAN_SWEEP=0` to
+     skip). DuckLake's own `ducklake_delete_orphaned_files` would delete every
+     untracked Parquet file under the data path, masked exports and Iceberg
+     metadata included, so only its dry-run list is used, filtered to
+     `ducklake-*` files outside `__masked__/` and `metadata/` and not under
+     another catalog's data path.
+
+  One worker at a time (auto-compaction waits for a running pass); last runs
+  in `public.duckicelake_maintenance_run`.
 
 ### Result sets (query result cache)
 
@@ -301,17 +328,40 @@ row count and a gateway credential that reads **only that result set**
 Delegation params are as for `ducklake-credentials`; the route needs only
 read scope on the namespace.
 
-- **Reuse:** keyed on catalog, effective principal + session context, query
+- **Reuse:** keyed on catalog, who is asking + session context, query
   text, default namespace, the catalog's governance version (bumped by
   Postgres triggers on every governance write) and a fingerprint of each table
   read (live data/delete file ids + columns; views or table functions fall
   back to the catalog's latest snapshot). A hit returns the same result with a
-  fresh credential. Results are never shared between principals. Queries
-  calling `now()`, `random()`, `current_date`, … are built but never reused.
+  fresh credential. Queries calling `now()`, `random()`, `current_date`, …
+  are built but never reused.
+- **Sharing** (`DUCKICELAKE_RESULT_SHARE`, on): "who is asking" is the
+  caller's *governance class* — the roles granted to them in this catalog,
+  the roles on their token, the session context (actor/channel) and the token
+  scope. Masks, row filters and Postgres RLS table visibility depend on
+  nothing else, so principals equal in all of these get the same bytes and
+  share one result (`"shared": true`). A query, or a policy on a table it
+  reads, that calls a session function (`current_user`, `current_setting`,
+  `getvariable`, …), and any table-function query, stays per principal.
+  Each principal served a shared result is recorded as its reader (and
+  audited once, decision `shared`); the gateway and `GET …/result-sets/{id}`
+  serve a result only to its builder and readers.
 - **`mode: "lookup"`** only answers hit (with credentials) or
   `{"status": "miss"}` — for a client that runs misses itself.
 - `GET …/result-sets/{id}` re-issues credentials for a live result the caller
-  owns (`410` after a governance change).
+  built or was served (`410` after a governance change).
+- **Agents** reach result sets through the MCP and SMCP tools
+  `query_result_set` (build or reuse, returns id, shape and a preview) and
+  `fetch_result_set` (pages of up to 1000 rows, read back through the gateway
+  with the result's own credential; `include_credentials` also hands the
+  agent the Parquet URLs and that credential). The plain `query` tool still
+  returns at most 500 rows and points at these when it truncates.
+- **Sizing:** a build runs with `DUCKICELAKE_RESULT_MEMORY_LIMIT` /
+  `_THREADS`, spills to a private directory under `DUCKICELAKE_WORK_DIR` up to
+  `DUCKICELAKE_SPILL_LIMIT`, and is interrupted after
+  `DUCKICELAKE_RESULT_TIMEOUT_SECONDS`. Agent queries get
+  `DUCKICELAKE_AGENT_MEMORY_LIMIT` and `DUCKICELAKE_AGENT_TIMEOUT_SECONDS`
+  the same way.
 - **Retention:** unused for `DUCKICELAKE_RESULT_IDLE_HOURS` (24) → purged;
   each reuse extends it that long; every result is purged
   `DUCKICELAKE_RESULT_MAX_DAYS` (30) after it was built. A background sweeper
@@ -938,7 +988,17 @@ carry secrets.
 | `DUCKICELAKE_RESULT_SWEEP_SECONDS` | `600` | result-set sweeper interval |
 | `DUCKICELAKE_MAINTENANCE_HOURS` | `24` | scheduled catalog maintenance interval; `0` = off |
 | `DUCKICELAKE_SNAPSHOT_RETENTION_DAYS` | `7` | snapshots older than this are expired (time-travel window) |
-| `DUCKICELAKE_FILE_GRACE_HOURS` | `24` | files scheduled for deletion are removed after this |
+| `DUCKICELAKE_FILE_GRACE_HOURS` | `24` | files scheduled for deletion (and orphans) are removed after this |
+| `DUCKICELAKE_ORPHAN_SWEEP` | `1` | sweep orphaned DuckLake data files during maintenance |
+| `DUCKICELAKE_CATALOG_INDEXES` | `1` | create lookup indexes on the DuckLake metadata tables |
+| `DUCKICELAKE_COMPACTION_CHECK_SECONDS` | `900` | auto-compaction check interval; `0` = off |
+| `DUCKICELAKE_COMPACTION_MIN_FILES` / `_SMALL_FILE_BYTES` | `8` / `67108864` | a table with this many live files under this size is compacted |
+| `DUCKICELAKE_COMPACTION_DELETE_RATIO` | `0.2` | files with more than this share of rows deleted are rewritten |
+| `DUCKICELAKE_RESULT_SHARE` | `1` | share results within a governance class (`0` = per principal) |
+| `DUCKICELAKE_WORK_DIR` | system temp dir | local scratch for spill files and results being written — use a disk, not a tmpfs |
+| `DUCKICELAKE_SPILL_LIMIT` | `10GB` | spill cap per result-set build / agent query |
+| `DUCKICELAKE_DUCKDB_MEMORY_LIMIT` | `1GB` | memory limit of each of the catalog's own DuckDB connections (empty = DuckDB default, 80% of RAM each) |
+| `DUCKICELAKE_AGENT_TIMEOUT_SECONDS` / `_MEMORY_LIMIT` | `120` / `1GB` | per-query limits for MCP/SMCP agent queries |
 | `DUCKICELAKE_REQUIRE_AUTH` | *(unset)* | `1` → fail boot if no OAuth clients configured |
 | `DUCKICELAKE_OAUTH_CLIENTS` | *(empty → auth disabled)* | `id:secret\|scope\|roles\|account` (roles → governance; account → multi-catalog tenancy) |
 | `DUCKICELAKE_OAUTH_CLIENTS_FILE` | *(empty)* | JSON file alternative |

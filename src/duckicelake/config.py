@@ -301,12 +301,44 @@ class Settings:
     result_memory_limit: str = "2GB"     # per materialization
     result_threads: int = 2
     result_sweep_seconds: float = 600.0
-    # Scheduled DuckLake maintenance per catalog (0 hours = off): expire
-    # snapshots older than `snapshot_retention_days`, then delete files
-    # scheduled for deletion over `file_grace_hours` ago.
+    # Share a result between principals whose governance is identical (same
+    # granted roles, token roles and session context, no session-dependent
+    # policy bodies). Off = one result per principal.
+    result_share: bool = True
+    # Local scratch space for DuckDB spill files and results being written
+    # (default: the system temp dir — point it at a disk, not a tmpfs).
+    work_dir: str = ""
+    # DuckDB sessions the proxy runs for others (result sets, MCP/SMCP agent
+    # queries) spill to `work_dir` up to this much each before failing.
+    spill_limit: str = "10GB"
+    # The catalog's own DuckDB connections (commits, reads, exports,
+    # maintenance): memory each may use before spilling. Empty = DuckDB's
+    # default (80% of RAM per connection).
+    duckdb_memory_limit: str = "1GB"
+    # Agent (MCP/SMCP) queries: wall-clock limit and memory per query.
+    agent_timeout_seconds: float = 120.0
+    agent_memory_limit: str = "1GB"
+    # Scheduled DuckLake maintenance per catalog (0 hours = off): compact,
+    # expire snapshots older than `snapshot_retention_days`, then delete
+    # files scheduled for deletion over `file_grace_hours` ago, and sweep
+    # orphaned data files (written by a failed commit) older than that.
     maintenance_hours: float = 24.0
     snapshot_retention_days: float = 7.0
     file_grace_hours: float = 24.0
+    orphan_sweep: bool = True
+    # Auto-compaction between maintenance runs: every
+    # `compaction_check_seconds` (0 = off) each catalog is checked for tables
+    # with at least `compaction_min_files` live data files under
+    # `compaction_small_file_bytes`, or files with more than
+    # `compaction_delete_ratio` of their rows deleted, and those tables are
+    # compacted. A table opts out with DuckLake's `auto_compact` option.
+    compaction_check_seconds: float = 900.0
+    compaction_min_files: int = 8
+    compaction_small_file_bytes: int = 64 * 1024 * 1024
+    compaction_delete_ratio: float = 0.2
+    # Lookup indexes on the DuckLake metadata tables (additive, named
+    # duckicelake_ix_*; DuckLake never sees them).
+    catalog_indexes: bool = True
     # Strict mode: extend the airtight tier's fail-CLOSED posture to the
     # COOPERATIVE tier. When true, a governance error on a governed read
     # path — policy planning threw, or a demanded masking view could not be
@@ -392,6 +424,15 @@ class Settings:
         return f"s3://{self.s3.bucket}/{ref.data_prefix}"
 
 
+def work_dir(settings: "Settings", *parts: str) -> str:
+    """A directory under the configured work dir (created on demand)."""
+    import tempfile
+    base = settings.work_dir or os.path.join(tempfile.gettempdir(), "duckicelake")
+    path = os.path.join(base, *parts)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
 def load_settings() -> Settings:
     apply_file_config()
     pg_password = os.environ.get("DUCKICELAKE_PG_PASSWORD") or None
@@ -446,6 +487,21 @@ def load_settings() -> Settings:
         maintenance_hours=float(os.environ.get("DUCKICELAKE_MAINTENANCE_HOURS", "24")),
         snapshot_retention_days=float(os.environ.get("DUCKICELAKE_SNAPSHOT_RETENTION_DAYS", "7")),
         file_grace_hours=float(os.environ.get("DUCKICELAKE_FILE_GRACE_HOURS", "24")),
+        orphan_sweep=os.environ.get("DUCKICELAKE_ORPHAN_SWEEP", "1") == "1",
+        result_share=os.environ.get("DUCKICELAKE_RESULT_SHARE", "1") == "1",
+        work_dir=os.environ.get("DUCKICELAKE_WORK_DIR", ""),
+        spill_limit=os.environ.get("DUCKICELAKE_SPILL_LIMIT", "10GB"),
+        duckdb_memory_limit=os.environ.get("DUCKICELAKE_DUCKDB_MEMORY_LIMIT", "1GB"),
+        agent_timeout_seconds=float(os.environ.get("DUCKICELAKE_AGENT_TIMEOUT_SECONDS", "120")),
+        agent_memory_limit=os.environ.get("DUCKICELAKE_AGENT_MEMORY_LIMIT", "1GB"),
+        compaction_check_seconds=float(
+            os.environ.get("DUCKICELAKE_COMPACTION_CHECK_SECONDS", "900")),
+        compaction_min_files=int(os.environ.get("DUCKICELAKE_COMPACTION_MIN_FILES", "8")),
+        compaction_small_file_bytes=int(
+            os.environ.get("DUCKICELAKE_COMPACTION_SMALL_FILE_BYTES", str(64 * 1024 * 1024))),
+        compaction_delete_ratio=float(
+            os.environ.get("DUCKICELAKE_COMPACTION_DELETE_RATIO", "0.2")),
+        catalog_indexes=os.environ.get("DUCKICELAKE_CATALOG_INDEXES", "1") == "1",
         governance_fail_closed=os.environ.get(
             "DUCKICELAKE_GOVERNANCE_FAIL_CLOSED", "0") == "1",
         reader_group_role=os.environ.get(

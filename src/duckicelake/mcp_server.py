@@ -10,6 +10,14 @@ agent never receives the DuckLake DSN or S3 credentials, so it cannot reach a
 base table behind a masked view. That closes the cooperative-masking gap of the
 raw ducklake-credentials path.
 
+Large results go through the governance core's result-set cache:
+`query_result_set` runs the query there (as the agent session, so the same
+masking applies) and returns its id, shape and a preview; `fetch_result_set`
+pages through it. Pages are read back through the S3 gateway with a
+credential that reads that one result set only; `include_credentials`
+hands that credential to the agent too, for clients that read the Parquet
+themselves.
+
 This server is a trusted delegation *broker*: it authenticates to the
 governance core with a broker-scoped service token and asserts the acting
 principal on the caller's behalf. It runs as its own listener; wiring it into a
@@ -27,6 +35,8 @@ from __future__ import annotations
 
 import contextvars
 import os
+import shutil
+import tempfile
 import threading
 import time
 from typing import Any
@@ -36,9 +46,9 @@ import duckdb
 import httpx
 
 from .auth import load_auth_config, verify_bearer
-from .config import Settings, load_settings
+from .config import Settings, load_settings, work_dir
 from .governed import setup_governed
-from .sqlsafe import check_no_denied_functions, check_single_select, qi
+from .sqlsafe import check_no_denied_functions, check_single_select, qi, ql
 
 # The end user of the in-flight MCP request — (principal, account) from the
 # caller's verified bearer, set by the auth middleware. Every governance call
@@ -52,6 +62,9 @@ _CURRENT_CALLER: contextvars.ContextVar[tuple[str, str | None] | None] = \
 # must never reach the connection. DESCRIBE/SHOW/VALUES parse as SELECT.
 _QUERY_TYPES = (duckdb.StatementType.SELECT,)
 _MAX_ROWS = 500
+#: Rows per fetch_result_set page (upper bound) and in a result-set preview.
+_MAX_PAGE = 1000
+_PREVIEW_ROWS = 20
 
 
 def _seg(value: str) -> str:
@@ -86,6 +99,8 @@ class GovernedExecutor:
         self._tok: str | None = None
         self._tok_exp = 0.0
         self._lock = threading.Lock()
+        self._spills: dict[int, str] = {}
+        self._spill_lock = threading.Lock()
 
     # ---- governance-core client (as a broker) ------------------------------
     def _broker_token(self) -> str | None:
@@ -113,12 +128,25 @@ class GovernedExecutor:
         """GET on the governance core AS the end user: every call is delegated
         (principal + account + agent session), so the core gates the catalog
         on the user's account — never on the broker's own identity."""
-        delegation = {"delegate": "1", "principal": principal,
-                      "actor": "agent", "channel": self.channel}
-        if account:
-            delegation["account"] = account
+        delegation = self._delegation(principal, account)
         r = httpx.get(f"{self.cfg.gov_url}{path}", params={**(params or {}), **delegation},
                       headers=self._headers(), timeout=30.0)
+        r.raise_for_status()
+        return r.json()
+
+    def _delegation(self, principal: str, account: str | None) -> dict:
+        d = {"delegate": "1", "principal": principal,
+             "actor": "agent", "channel": self.channel}
+        if account:
+            d["account"] = account
+        return d
+
+    def gov_post(self, path: str, principal: str, account: str | None,
+                 body: dict, timeout: float = 30.0) -> Any:
+        """POST on the governance core AS the end user (see gov_get)."""
+        r = httpx.post(f"{self.cfg.gov_url}{path}",
+                       params=self._delegation(principal, account),
+                       json=body, headers=self._headers(), timeout=timeout)
         r.raise_for_status()
         return r.json()
 
@@ -160,12 +188,26 @@ class GovernedExecutor:
         agent SQL can't read local files (the process env, config, keys) or
         other objects in the bucket."""
         con = duckdb.connect(":memory:")
+        spill = tempfile.mkdtemp(prefix="agent-", dir=work_dir(self.settings, "agent"))
         try:
-            setup_governed(con, self.settings, bundle, catalog_id, namespace)
+            setup_governed(con, self.settings, bundle, catalog_id, namespace,
+                           memory_limit=self.settings.agent_memory_limit,
+                           threads=self.settings.result_threads,
+                           spill_dir=spill)
         except BaseException:
             con.close()
+            shutil.rmtree(spill, ignore_errors=True)
             raise
+        with self._spill_lock:
+            self._spills[id(con)] = spill     # removed by _close
         return con
+
+    def _close(self, con: duckdb.DuckDBPyConnection) -> None:
+        with self._spill_lock:
+            spill = self._spills.pop(id(con), None)
+        con.close()
+        if spill:
+            shutil.rmtree(spill, ignore_errors=True)
 
     def query(self, catalog_id: str, namespace: str, table: str | None,
               sql: str, principal: str, account: str | None = None) -> dict:
@@ -190,17 +232,121 @@ class GovernedExecutor:
             con = self._conn_for(bundle, catalog_id, namespace)
         except PermissionError as e:
             return {"error": str(e)}
+        timer = threading.Timer(self.settings.agent_timeout_seconds, con.interrupt)
+        timer.start()
         try:
             cur = con.execute(sql)
             cols = [d[0] for d in (cur.description or [])]
             rows = cur.fetchmany(_MAX_ROWS)
             more = cur.fetchone() is not None
-            return {"columns": cols,
-                    "rows": [[_json_safe(v) for v in r] for r in rows],
-                    "row_count": len(rows), "truncated": more,
-                    "governed": True, "actor": "agent"}
+            out = {"columns": cols,
+                   "rows": [[_json_safe(v) for v in r] for r in rows],
+                   "row_count": len(rows), "truncated": more,
+                   "governed": True, "actor": "agent"}
+            if more:
+                out["hint"] = ("more rows than fit in a reply: use query_result_set to "
+                               "materialize the full result and fetch_result_set to page it")
+            return out
+        except duckdb.InterruptException:
+            return {"error": f"query exceeded {self.settings.agent_timeout_seconds:.0f}s"}
+        except duckdb.Error as e:
+            return {"error": f"query failed: {str(e).splitlines()[0][:300]}"}
+        finally:
+            timer.cancel()
+            self._close(con)
+
+    # ---- result sets (large results, via the governance core's cache) ------
+    def _result_set_path(self, catalog_id: str, namespace: str, rs_id: str = "") -> str:
+        base = f"/v1/{_seg(catalog_id)}/namespaces/{_seg(namespace)}/result-sets"
+        return f"{base}/{_seg(rs_id)}" if rs_id else base
+
+    def _read_page(self, rs: dict, offset: int, limit: int) -> tuple[list, list]:
+        """Rows [offset, offset+limit) of a result set, read through the S3
+        gateway with the result's own credential (it reads nothing else)."""
+        s3 = rs.get("s3") or {}
+        files = rs.get("files") or []
+        if not files:
+            return [c["name"] for c in rs.get("columns") or []], []
+        ep = s3.get("endpoint") or ""
+        con = duckdb.connect(":memory:")
+        try:
+            con.execute("INSTALL httpfs")
+            con.execute("LOAD httpfs")
+            con.execute(
+                "CREATE SECRET rs (TYPE S3, KEY_ID ?, SECRET ?, REGION ?, ENDPOINT ?, "
+                "USE_SSL ?, URL_STYLE ?)",
+                [s3["access-key-id"], s3["secret-access-key"], s3.get("region") or "",
+                 ep.rsplit("://", 1)[-1], ep.startswith("https"),
+                 "path" if s3.get("path-style-access", True) else "vhost"])
+            con.execute("SET memory_limit = ?", [self.settings.agent_memory_limit])
+            con.execute("SET allowed_directories = ?",
+                        [[f.rsplit("/", 1)[0] + "/" for f in files]])
+            con.execute("SET enable_external_access = false")
+            con.execute("SET lock_configuration = true")
+            cur = con.execute(
+                f"SELECT * FROM read_parquet([{', '.join(ql(f) for f in files)}]) "
+                f"LIMIT {int(limit)} OFFSET {int(offset)}")
+            cols = [d[0] for d in (cur.description or [])]
+            return cols, [[_json_safe(v) for v in r] for r in cur.fetchall()]
         finally:
             con.close()
+
+    def _rs_reply(self, rs: dict, offset: int, limit: int,
+                  include_credentials: bool) -> dict:
+        cols, rows = self._read_page(rs, offset, limit)
+        total = int(rs.get("row_count") or 0)
+        out = {
+            "result_set_id": rs["id"], "status": rs.get("status"),
+            "row_count": total, "bytes": rs.get("bytes"),
+            "columns": rs.get("columns") or [{"name": c} for c in cols],
+            "offset": offset, "rows": rows,
+            "next_offset": offset + len(rows) if offset + len(rows) < total else None,
+            "expires_at": rs.get("expires_at"), "shared": rs.get("shared", False),
+            "governed": True, "actor": "agent",
+        }
+        if include_credentials:
+            out["files"] = rs.get("files")
+            out["s3"] = rs.get("s3")
+        return out
+
+    def query_result_set(self, catalog_id: str, namespace: str, sql: str,
+                         principal: str, account: str | None = None, *,
+                         preview_rows: int = _PREVIEW_ROWS,
+                         include_credentials: bool = False) -> dict:
+        try:
+            check_single_select(sql or "", "query", allow=_QUERY_TYPES)
+            check_no_denied_functions(sql, "query")
+        except ValueError as e:
+            return {"error": f"{e} (read-only SELECT only)"}
+        try:
+            rs = self.gov_post(self._result_set_path(catalog_id, namespace), principal,
+                               account, {"sql": sql},
+                               timeout=self.settings.result_timeout_seconds + 60)
+        except httpx.HTTPStatusError as e:
+            return {"error": _gov_error(e)}
+        n = max(0, min(int(preview_rows), _MAX_PAGE))
+        return self._rs_reply(rs, 0, n, include_credentials)
+
+    def fetch_result_set(self, catalog_id: str, namespace: str, result_set_id: str,
+                         principal: str, account: str | None = None, *,
+                         offset: int = 0, limit: int = _MAX_ROWS,
+                         include_credentials: bool = False) -> dict:
+        try:
+            rs = self.gov_get(self._result_set_path(catalog_id, namespace, result_set_id),
+                              principal, account)
+        except httpx.HTTPStatusError as e:
+            return {"error": _gov_error(e)}
+        return self._rs_reply(rs, max(0, int(offset)), max(1, min(int(limit), _MAX_PAGE)),
+                              include_credentials)
+
+
+def _gov_error(e: httpx.HTTPStatusError) -> str:
+    try:
+        detail = e.response.json().get("detail")
+    except Exception:
+        detail = None
+    code = e.response.status_code
+    return f"governance refused the request ({code}){': ' + str(detail)[:300] if detail else ''}"
 
 
 def _json_safe(v: Any) -> Any:
@@ -293,6 +439,31 @@ def build_server(config: MCPConfig | None = None):
         raw credentials). `table` names the query's primary table so masking is
         routed; write `FROM <table>` unqualified."""
         return ex.query(catalog, namespace, table, sql, *resolve_caller(cfg))
+
+    @mcp.tool()
+    def query_result_set(catalog: str, namespace: str, sql: str,
+                         preview_rows: int = _PREVIEW_ROWS,
+                         include_credentials: bool = False) -> dict:
+        """Run a read-only SQL query whose result may be large. The full
+        result is materialized (governed for an agent: row-filtered, column-
+        masked) and cached; you get its id, row count, columns and the first
+        `preview_rows` rows. Page through the rest with fetch_result_set.
+        Repeating an identical query over unchanged data is served from the
+        cache. `include_credentials` adds the Parquet paths and a short-lived
+        S3 credential that reads this result only."""
+        return ex.query_result_set(catalog, namespace, sql, *resolve_caller(cfg),
+                                   preview_rows=preview_rows,
+                                   include_credentials=include_credentials)
+
+    @mcp.tool()
+    def fetch_result_set(catalog: str, namespace: str, result_set_id: str,
+                         offset: int = 0, limit: int = _MAX_ROWS,
+                         include_credentials: bool = False) -> dict:
+        """Rows [offset, offset+limit) of a result set from query_result_set
+        (limit at most 1000). `next_offset` is null on the last page."""
+        return ex.fetch_result_set(catalog, namespace, result_set_id, *resolve_caller(cfg),
+                                   offset=offset, limit=limit,
+                                   include_credentials=include_credentials)
 
     return mcp
 

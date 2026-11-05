@@ -16,7 +16,7 @@ import os
 import queue
 import threading
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -250,6 +250,10 @@ class DuckLakeCatalog:
             conn.execute(f"INSTALL {ext}")
             conn.execute(f"LOAD {ext}")
         pin_ducklake_spec(conn, self.settings.ducklake_spec_version)
+        if self.settings.duckdb_memory_limit:
+            # Every catalog connection is its own DuckDB instance with its own
+            # buffer pool; DuckDB's default lets each take 80% of the RAM.
+            conn.execute("SET memory_limit = ?", [self.settings.duckdb_memory_limit])
         # Per-ATTACH Postgres pool (applies to the ducklake:postgres ATTACH
         # below): small, shared across threads, idle connections reaped.
         conn.execute(f"SET pg_pool_max_connections = {max(1, self._DUCKDB_PG_POOL_MAX)}")
@@ -699,53 +703,30 @@ class DuckLakeCatalog:
         return deleted
 
     def compact_table(self, ns: list[str], name: str) -> dict[str, Any]:
-        """Trigger DuckLake's built-in compaction + file-cleanup for a table.
+        """Compact one table now (see `compact`): merge small files, rewrite
+        delete-heavy ones, then delete files scheduled for deletion more than
+        `file_grace_hours` ago — never the ones just replaced, which readers
+        that planned a scan a moment ago still need. Runs on a dedicated
+        connection, so commits aren't blocked meanwhile.
 
-        Wraps two DuckLake procedures (DuckLake 0.3+ signatures):
-          - `ducklake_merge_adjacent_files(catalog, table_ref)` — rewrites
-            small files into larger ones, collapsing position-delete
-            files into their base data files where possible.
-          - `ducklake_cleanup_old_files(catalog, dry_run, cleanup_all,
-            older_than TIMESTAMPTZ)` — physically deletes S3 objects that
-            DuckLake has marked as scheduled for deletion. We pass
-            `cleanup_all=true` + a far-future timestamp so every
-            already-scheduled object gets collected.
-
-        Returns a summary dict; individual procedure failures are captured
-        in the response rather than raised, so a partial success still
-        returns useful info.
-        """
-        cat = self._ref.catalog_name
+        Returns a summary dict; failures are reported in it rather than
+        raised, so a partial success still returns useful info."""
+        cat = ql(self._ref.catalog_name)
         out: dict[str, Any] = {"schema": ns[0], "table": name}
-        with self.cursor() as c:
-            # Scope the session to the target schema so merge_adjacent's
-            # table-ref argument resolves correctly — fully-qualified
-            # "schema.table" triggered a DuckLake catalog-lookup bug in
-            # 1.0.x. Resetting USE in `finally` keeps us idempotent.
-            c.execute(f'USE {self._cat()}.{qi(ns[0])}')
+        with self.maintenance_cursor() as c:
             try:
-                try:
-                    c.execute(
-                        "CALL ducklake_merge_adjacent_files(?, ?)",
-                        [cat, name],
-                    )
-                    out["merge"] = "ok"
-                except duckdb.Error as e:
-                    out["merge"] = f"error: {e}"
-                try:
-                    # `cleanup_all` and `older_than` are mutually exclusive
-                    # in DuckLake — pass only one. `cleanup_all=TRUE`
-                    # collects every already-scheduled object regardless
-                    # of age, which is what an admin-triggered compact wants.
-                    c.execute(
-                        "CALL ducklake_cleanup_old_files(?, cleanup_all => TRUE)",
-                        [cat],
-                    )
-                    out["cleanup"] = "ok"
-                except duckdb.Error as e:
-                    out["cleanup"] = f"error: {e}"
-            finally:
-                c.execute(f"USE {self._cat()}")
+                out.update(self.compact([(ns[0], name)], conn=c))
+                out["merge"] = "ok"
+            except duckdb.Error as e:
+                out["merge"] = f"error: {e}"
+            try:
+                cleaned = c.execute(
+                    f"CALL ducklake_cleanup_old_files({cat}, older_than => now() - "
+                    f"INTERVAL '{float(self.settings.file_grace_hours):.3f} hours')").fetchall()
+                out["cleanup"] = "ok"
+                out["files_deleted"] = len(cleaned)
+            except duckdb.Error as e:
+                out["cleanup"] = f"error: {e}"
         return out
 
     def _live_data_file_id_by_abs_path(
@@ -1560,22 +1541,210 @@ class DuckLakeCatalog:
                 )
                 return {int(r[0]): r[1] for r in cur.fetchall()}
 
-    def maintain(self, *, retain_days: float, file_grace_hours: float) -> dict[str, int]:
-        """Routine catalog upkeep: expire snapshots older than `retain_days`
-        (time travel stays possible within that window; DuckLake drops the
-        expired snapshots' metadata rows, including column statistics of
-        tables dropped since — the bloat that slows every commit), then
-        delete data files scheduled for deletion more than
-        `file_grace_hours` ago (in-flight readers keep theirs)."""
+    @contextmanager
+    def maintenance_cursor(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """A dedicated, short-lived DuckDB connection for maintenance:
+        compaction rewrites data, which on the write connection would hold
+        `_lock` and block every commit for its duration."""
+        conn = self._build_duckdb_conn()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def compaction_candidates(self, *, min_files: int, small_file_bytes: int,
+                              delete_ratio: float) -> list[tuple[str, str]]:
+        """(schema, table) of live tables worth compacting: at least
+        `min_files` small live data files without deletes (merge), or any
+        file with more than `delete_ratio` of its rows deleted (rewrite).
+        Tables opted out with DuckLake's `auto_compact=false` are skipped.
+        Pure metadata read; cheap enough to run every few minutes."""
+        m = self.sidecar_sql
+        with self.pg_cursor() as cur:
+            rows = cur.execute(
+                f"""WITH live AS (
+                        SELECT f.table_id, f.file_size_bytes, f.record_count, d.delete_count
+                        FROM {m}.ducklake_data_file f
+                        LEFT JOIN {m}.ducklake_delete_file d
+                          ON d.data_file_id = f.data_file_id AND d.end_snapshot IS NULL
+                        WHERE f.end_snapshot IS NULL)
+                    SELECT s.schema_name, t.table_name
+                    FROM live
+                    JOIN {m}.ducklake_table t ON t.table_id = live.table_id
+                                             AND t.end_snapshot IS NULL
+                    JOIN {m}.ducklake_schema s ON s.schema_id = t.schema_id
+                                              AND s.end_snapshot IS NULL
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {m}.ducklake_metadata o
+                        WHERE o.key = 'auto_compact' AND lower(o.value) = 'false'
+                          AND ((o.scope = 'table' AND o.scope_id = t.table_id)
+                               OR (o.scope = 'schema' AND o.scope_id = s.schema_id)
+                               OR o.scope IS NULL))
+                    GROUP BY s.schema_name, t.table_name
+                    HAVING count(*) FILTER (WHERE live.delete_count IS NULL
+                                              AND live.file_size_bytes < %s) >= %s
+                        OR count(*) FILTER (WHERE live.delete_count::float8
+                                              / greatest(live.record_count, 1) > %s) > 0
+                    ORDER BY 1, 2""",
+                (int(small_file_bytes), max(2, int(min_files)), float(delete_ratio)),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def compact(self, tables: list[tuple[str, str]] | None = None, *,
+                delete_ratio: float = 0.2,
+                conn: duckdb.DuckDBPyConnection | None = None) -> dict[str, int]:
+        """Merge adjacent small files and rewrite files whose deleted share
+        exceeds `delete_ratio`, for `tables` (None = the whole catalog,
+        inlined rows flushed to Parquet first). A table with nothing to do
+        gets no new snapshot. The replaced files are scheduled for deletion
+        and removed by a later maintenance run after the grace period."""
         cat = ql(self._ref.catalog_name)
-        with self.cursor() as c:
+        out = {"inlined_flushed": 0, "files_merged": 0, "files_rewritten": 0}
+        with (self.maintenance_cursor() if conn is None else nullcontext(conn)) as c:
+            if tables is None:
+                # rows: (schema, table, rows_flushed)
+                out["inlined_flushed"] = sum(
+                    int(r[2] or 0) for r in
+                    c.execute(f"CALL ducklake_flush_inlined_data({cat})").fetchall())
+                targets = [(None, None)]
+            else:
+                targets = list(tables)
+            for schema, table in targets:
+                scope = "" if table is None else f", {ql(table)}, schema => {ql(schema)}"
+                merged = c.execute(
+                    f"CALL ducklake_merge_adjacent_files({cat}{scope})").fetchall()
+                rewritten = c.execute(
+                    f"CALL ducklake_rewrite_data_files({cat}{scope}, "
+                    f"delete_threshold => {float(delete_ratio)})").fetchall()
+                # rows: (schema, table, files_processed, files_created)
+                out["files_merged"] += sum(int(r[2]) for r in merged)
+                out["files_rewritten"] += sum(int(r[2]) for r in rewritten)
+        for schema, table in (tables or []):
+            self.invalidate_metadata_cache([schema], table)
+        if tables is None:
+            with self._metadata_cache_lock:
+                self._metadata_cache.clear()
+        return out
+
+    #: (table, columns) lookup indexes on DuckLake's metadata tables. Every
+    #: DuckLake read and commit, the RLS predicates and the result-set
+    #: fingerprints look these tables up by id; DuckLake itself only keys a
+    #: few of them. Additive and owned by us (duckicelake_ix_*): DuckLake
+    #: never reads them, and a spec migration that rebuilds a table simply
+    #: drops them until the next maintenance run recreates them.
+    METADATA_INDEXES = (
+        ("ducklake_table", ("table_id",)),
+        ("ducklake_table", ("schema_id",)),
+        ("ducklake_column", ("table_id",)),
+        ("ducklake_data_file", ("table_id",)),
+        ("ducklake_delete_file", ("table_id",)),
+        ("ducklake_delete_file", ("data_file_id",)),
+        ("ducklake_file_column_stats", ("table_id",)),
+        ("ducklake_table_column_stats", ("table_id",)),
+        ("ducklake_table_stats", ("table_id",)),
+        ("ducklake_file_partition_value", ("table_id",)),
+        ("ducklake_files_scheduled_for_deletion", ("data_file_id",)),
+    )
+
+    def ensure_metadata_indexes(self) -> int:
+        """Create any missing METADATA_INDEXES (CONCURRENTLY: writers are
+        never blocked). Returns how many were created."""
+        schema = self.sidecar_schema
+        created = 0
+        with psycopg.connect(self._pg_conninfo(), autocommit=True) as pg:
+            have = {r[0]: r[1] for r in pg.execute(
+                """SELECT c.relname, i.indisvalid FROM pg_index i
+                   JOIN pg_class c ON c.oid = i.indexrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = %s AND c.relname LIKE 'duckicelake_ix_%%'""",
+                (schema,)).fetchall()}
+            cols = {(r[0], r[1]) for r in pg.execute(
+                "SELECT table_name, column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name LIKE 'ducklake_%%'",
+                (schema,)).fetchall()}
+            for table, columns in self.METADATA_INDEXES:
+                if not all((table, c) in cols for c in columns):
+                    continue          # not in this spec version
+                name = f"duckicelake_ix_{table[len('ducklake_'):]}_{'_'.join(columns)}"[:63]
+                if have.get(name) is True:
+                    continue
+                if name in have:      # a failed CONCURRENTLY build leaves it invalid
+                    pg.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {qi(schema)}.{qi(name)}")
+                pg.execute(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {qi(name)} "
+                    f"ON {qi(schema)}.{qi(table)} ({', '.join(qi(c) for c in columns)})")
+                created += 1
+        return created
+
+    def sweep_orphans(self, *, older_than_hours: float,
+                      other_data_paths: list[str] = (),
+                      conn: duckdb.DuckDBPyConnection | None = None) -> int:
+        """Delete data files DuckLake wrote but never committed (a failed or
+        interrupted write), older than `older_than_hours`. DuckLake's own
+        `ducklake_delete_orphaned_files` treats every untracked Parquet file
+        under the data path as an orphan — that includes our masked exports
+        (`__masked__/`) and anything else stored there — so we only take its
+        dry-run list as candidates and delete just DuckLake's own data files:
+        `ducklake-*` objects of this catalog, outside `__masked__/` and
+        `metadata/`, not under another catalog's (nested) data path."""
+        cat = ql(self._ref.catalog_name)
+        root = self.settings.data_path_for(self._ref)
+        nested = [p for p in other_data_paths if p != root and p.startswith(root)]
+        with (self.maintenance_cursor() if conn is None else nullcontext(conn)) as c:
+            paths = [r[0] for r in c.execute(
+                f"CALL ducklake_delete_orphaned_files({cat}, older_than => now() - "
+                f"INTERVAL '{float(older_than_hours):.3f} hours', dry_run => true)").fetchall()]
+        bucket_prefix = f"s3://{self.settings.s3.bucket}/"
+        keys = []
+        for p in paths:
+            rel = p[len(root):] if p.startswith(root) else None
+            if (rel is None or not p.startswith(bucket_prefix)
+                    or any(p.startswith(n) for n in nested)
+                    or "__masked__/" in rel or "/metadata/" in f"/{rel}"
+                    or not rel.rsplit("/", 1)[-1].startswith("ducklake-")):
+                continue
+            keys.append(p[len(bucket_prefix):])
+        for i in range(0, len(keys), 1000):
+            self._s3_client.delete_objects(
+                Bucket=self.settings.s3.bucket,
+                Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]], "Quiet": True})
+        return len(keys)
+
+    def maintain(self, *, retain_days: float, file_grace_hours: float,
+                 compact: bool = True, delete_ratio: float = 0.2,
+                 orphans: bool = True, indexes: bool = True,
+                 other_data_paths: list[str] = ()) -> dict[str, int]:
+        """Routine catalog upkeep, on a dedicated connection:
+          * compact the whole catalog (flush inlined rows, merge small files,
+            rewrite delete-heavy files);
+          * expire snapshots older than `retain_days` (time travel stays
+            possible within that window; DuckLake drops the expired
+            snapshots' metadata rows, including column statistics of tables
+            dropped since — the bloat that slows every commit);
+          * delete files scheduled for deletion more than `file_grace_hours`
+            ago (in-flight readers keep theirs) and orphaned data files older
+            than that;
+          * make sure the metadata lookup indexes exist."""
+        cat = ql(self._ref.catalog_name)
+        out: dict[str, int] = {}
+        if indexes:
+            out["indexes_created"] = self.ensure_metadata_indexes()
+        with self.maintenance_cursor() as c:
+            if compact:
+                out.update(self.compact(None, delete_ratio=delete_ratio, conn=c))
             expired = c.execute(
                 f"CALL ducklake_expire_snapshots({cat}, older_than => "
                 f"now() - INTERVAL '{float(retain_days) * 24:.3f} hours')").fetchall()
             cleaned = c.execute(
                 f"CALL ducklake_cleanup_old_files({cat}, older_than => "
                 f"now() - INTERVAL '{float(file_grace_hours):.3f} hours')").fetchall()
-        return {"snapshots_expired": len(expired), "files_deleted": len(cleaned)}
+            out["snapshots_expired"] = len(expired)
+            out["files_deleted"] = len(cleaned)
+            if orphans:
+                out["orphans_deleted"] = self.sweep_orphans(
+                    older_than_hours=file_grace_hours,
+                    other_data_paths=list(other_data_paths), conn=c)
+        return out
 
     def expire_snapshots(self, snapshot_ids: list[int]) -> None:
         """Hard-delete snapshots via DuckLake's built-in expire procedure.

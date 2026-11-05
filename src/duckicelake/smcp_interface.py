@@ -2,7 +2,7 @@
 an authenticated, per-message-encrypted transport.
 
 Same governed tools as `duckicelake.mcp_server` (list_namespaces, list_tables,
-describe_table, query) and the same broker-delegated agent governance
+describe_table, query, query_result_set, fetch_result_set) and the same broker-delegated agent governance
 (actor=agent, channel=smcp — so airtight file-layer masking + read-only apply),
 but reached over SMCP (github.com/KellerKev/smcp): api_key/JWT auth (RS256 in
 production so clients can't forge tokens), replay protection, and authenticated
@@ -87,7 +87,7 @@ def _build_identity_node(cfg):
 
 
 def build_server(smcp_cfg=None, mcp_cfg: MCPConfig | None = None):
-    """Construct the `SMCPServer` with duckicelake's four governed tools
+    """Construct the `SMCPServer` with duckicelake's governed tools
     registered on an identity-aware node. Returns (server, smcp_cfg)."""
     from smcp_config import SMCPConfig
     from smcp_server import SMCPServer
@@ -132,6 +132,36 @@ def build_server(smcp_cfg=None, mcp_cfg: MCPConfig | None = None):
          "table": {"type": "string"}, "sql": {"type": "string"},
          "required": ["catalog", "namespace", "table", "sql"]},
         q)
+
+    server.register_tool(
+        "query_result_set",
+        "Run a read-only SQL query whose result may be large. The full result is "
+        "materialized (governed for an agent: row-filtered, column-masked) and "
+        "cached; returns its id, row count, columns and the first `preview_rows` "
+        "rows. Page with fetch_result_set. `include_credentials` adds the Parquet "
+        "paths and a short-lived S3 credential that reads this result only.",
+        {"catalog": {"type": "string"}, "namespace": {"type": "string"},
+         "sql": {"type": "string"}, "preview_rows": {"type": "integer"},
+         "include_credentials": {"type": "boolean"},
+         "required": ["catalog", "namespace", "sql"]},
+        lambda catalog, namespace, sql, preview_rows=20, include_credentials=False:
+            ex.query_result_set(catalog, namespace, sql, *resolve_caller(),
+                                preview_rows=preview_rows,
+                                include_credentials=include_credentials))
+
+    server.register_tool(
+        "fetch_result_set",
+        "Rows [offset, offset+limit) of a result set from query_result_set "
+        "(limit at most 1000). `next_offset` is null on the last page.",
+        {"catalog": {"type": "string"}, "namespace": {"type": "string"},
+         "result_set_id": {"type": "string"}, "offset": {"type": "integer"},
+         "limit": {"type": "integer"}, "include_credentials": {"type": "boolean"},
+         "required": ["catalog", "namespace", "result_set_id"]},
+        lambda catalog, namespace, result_set_id, offset=0, limit=500,
+        include_credentials=False:
+            ex.fetch_result_set(catalog, namespace, result_set_id, *resolve_caller(),
+                                offset=offset, limit=limit,
+                                include_credentials=include_credentials))
 
     return server, smcp_cfg
 

@@ -9,11 +9,22 @@ nothing else. Masked or filtered data is therefore materialized once per
 query and principal, instead of copying whole tables.
 
 Reuse: a result is keyed on everything that could change it — the catalog,
-the effective principal and session context, the query text and default
+who is asking and in which session context, the query text and default
 namespace, the catalog's governance version, and a fingerprint of every table
 the query reads (falling back to the catalog's latest snapshot when the query
 reads something we can't fingerprint, e.g. a view). Queries calling volatile
 functions (now(), random(), ...) are materialized but never reused.
+
+"Who is asking" is the principal's *governance class* when the result can be
+shared (`result_share`): what a governed session returns depends only on the
+roles granted to the principal in this catalog (masks, row filters and
+Postgres RLS table visibility all key on them), the roles carried on the
+token, the session context and the token scope — so principals equal in all
+of those get the same bytes and share one result. It falls back to the
+principal itself when anything could make two such sessions differ: a policy
+body or the query calling a session function (current_user, ...), or a
+table function. Every principal served a shared result is recorded as a
+reader of it; the gateway serves it to its builder and its readers only.
 
 Retention (Postgres, swept in the background): a result unused for
 `result_idle_hours` is purged; each reuse extends it that long again; every
@@ -37,6 +48,7 @@ import duckdb
 import psycopg
 
 from .catalog import pg_advisory_lock
+from .config import work_dir
 from .governed import setup_governed
 from .sqlsafe import check_no_denied_functions, check_single_select, ql, qi
 
@@ -53,6 +65,14 @@ VOLATILE_FUNCTIONS = frozenset({
     "localtimestamp", "current_localtime", "current_localtimestamp",
     "random", "uuid", "gen_random_uuid", "uuidv4", "uuidv7", "setseed",
     "nextval", "currval", "current_query", "txid_current",
+})
+
+#: Functions whose value depends on the executing session: a query calling
+#: one is never shared between principals.
+SESSION_FUNCTIONS = frozenset({
+    "current_user", "session_user", "user", "current_role", "current_setting",
+    "getvariable", "current_schema", "current_schemas", "current_database",
+    "current_catalog", "pg_backend_pid",
 })
 
 _SIDECAR_DONE: set[str] = set()
@@ -101,11 +121,27 @@ def ensure_result_sidecar(cur, schema: str) -> None:
                     f"ON {sc}.duckicelake_result_set (cache_key)")
         cur.execute(f"CREATE INDEX IF NOT EXISTS duckicelake_result_set_exp "
                     f"ON {sc}.duckicelake_result_set (expires_at)")
+        cur.execute(f"ALTER TABLE {sc}.duckicelake_result_set "
+                    "ADD COLUMN IF NOT EXISTS shared BOOLEAN NOT NULL DEFAULT false")
+        # Principals other than the builder a shared result was served to.
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {sc}.duckicelake_result_set_reader (
+                rs_id         TEXT NOT NULL REFERENCES {sc}.duckicelake_result_set (id)
+                                  ON DELETE CASCADE,
+                principal     TEXT NOT NULL,
+                first_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (rs_id, principal)
+            )
+        """)
     _SIDECAR_DONE.add(schema)
 
 
 _COLS = ("id, reusable, principal, namespace, governance_stamp, prefix, files, columns, "
-         "row_count, bytes, use_count, created_at, expires_at, hard_expires_at")
+         "row_count, bytes, use_count, created_at, expires_at, hard_expires_at, shared")
+
+#: SQL: `principal` may read result `id` (its builder, or a recorded reader).
+_MAY_READ = ("(principal = %s OR EXISTS (SELECT 1 FROM {sc}.duckicelake_result_set_reader r "
+             "WHERE r.rs_id = id AND r.principal = %s))")
 
 
 @dataclass
@@ -124,6 +160,7 @@ class ResultSet:
     created_at: datetime
     expires_at: datetime
     hard_expires_at: datetime
+    shared: bool = False
 
     @classmethod
     def from_row(cls, r) -> "ResultSet":
@@ -143,6 +180,10 @@ class QueryShape:
     @property
     def volatile(self) -> bool:
         return bool(self.functions & VOLATILE_FUNCTIONS)
+
+    @property
+    def session_dependent(self) -> bool:
+        return bool(self.functions & SESSION_FUNCTIONS)
 
 
 _PARSER = threading.local()
@@ -175,7 +216,8 @@ def analyse(sql: str) -> QueryShape:
                 # `current_date`, `current_timestamp`, ... parse as bare
                 # column refs and bind to the function later.
                 names = node.get("column_names") or []
-                if len(names) == 1 and str(names[0]).lower() in VOLATILE_FUNCTIONS:
+                if len(names) == 1 and str(names[0]).lower() in (
+                        VOLATILE_FUNCTIONS | SESSION_FUNCTIONS):
                     shape.functions.add(str(names[0]).lower())
             cte = node.get("cte_map")
             if isinstance(cte, dict):
@@ -254,6 +296,18 @@ def data_version(catalog, catalog_id: str, namespace: str, shape: QueryShape) ->
         return {"snapshot": snap}
 
 
+def session_dependent_policies(catalog) -> bool:
+    """Does any policy of this catalog read the executing session? Then two
+    principals with the same roles can still see different rows or values."""
+    from .policies import SESSION_TOKENS
+    sc = catalog.sidecar_sql
+    with catalog.pg_cursor() as cur:
+        bodies = [r[0] for r in cur.execute(
+            f"SELECT body_sql FROM {sc}.duckicelake_masking_policy UNION ALL "
+            f"SELECT body_sql FROM {sc}.duckicelake_row_access_policy").fetchall()]
+    return any(SESSION_TOKENS.search(b or "") for b in bodies)
+
+
 def cache_key(material: dict) -> str:
     raw = json.dumps({"v": FORMAT_VERSION, **material}, sort_keys=True,
                      separators=(",", ":"), default=str)
@@ -312,10 +366,34 @@ class ResultSetCache:
             self._ensure(cur)
             r = cur.execute(
                 f"""SELECT {_COLS} FROM {self.sc}.duckicelake_result_set
-                    WHERE id = %s AND principal = %s
+                    WHERE id = %s AND {_MAY_READ.format(sc=self.sc)}
                       AND expires_at > now() AND hard_expires_at > now()""",
-                (rs_id, principal)).fetchone()
+                (rs_id, principal, principal)).fetchone()
         return ResultSet.from_row(r) if r else None
+
+    def add_reader(self, rs: ResultSet, principal: str) -> bool:
+        """Record `principal` as a reader of a shared result; True when this
+        is their first use of it."""
+        if principal == rs.principal:
+            return False
+        with self._cursor() as cur:
+            r = cur.execute(
+                f"""INSERT INTO {self.sc}.duckicelake_result_set_reader (rs_id, principal)
+                    VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING 1""",
+                (rs.id, principal)).fetchone()
+        return r is not None
+
+    def _serve_hit(self, hit: ResultSet, caller: "Caller", namespace: str) -> dict:
+        if hit.principal != caller.sub and self.add_reader(hit, caller.sub):
+            try:
+                self.ctx.store.audit_load(
+                    principal=caller.sub, object_=f"{namespace}.<query>", masked_cols=[],
+                    applied_policies=[], row_filtered=False, operation="result_set",
+                    decision="shared",
+                    detail={"id": hit.id, "built_by": hit.principal, "rows": hit.row_count})
+            except Exception:
+                pass
+        return self._response(self.touch(hit), caller, "hit")
 
     def touch(self, rs: ResultSet) -> ResultSet:
         """A reuse: extend the idle window (never past the hard limit)."""
@@ -345,19 +423,27 @@ class ResultSetCache:
         shape = analyse(sql)
         # Read governance BEFORE deriving anything from it (see governance_stamp).
         stamp = self.ctx.store.governance_stamp()
+        granted = sorted(self.ctx.store.roles_for_principal(caller.sub))
+        shared = self.shareable(shape, caller, namespace, granted)
         material = {
-            "cat": self.ctx.catalog_id, "sub": caller.sub, "actor": caller.actor,
+            "cat": self.ctx.catalog_id, "actor": caller.actor,
             "channel": caller.channel, "roles": list(caller.token_roles),
             "ns": namespace, "sql": sql, "gov": stamp,
             "data": data_version(self.catalog, self.ctx.catalog_id, namespace, shape),
         }
+        if shared:
+            # The governance class: everything a governed session's output
+            # depends on besides the query and the data (module docstring).
+            material["class"] = {"granted": granted, "scope": caller.scope or ""}
+        else:
+            material["sub"] = caller.sub
         key = cache_key(material)
         reusable = shape.parsed and not shape.volatile
 
         if reusable:
             hit = self.lookup(key)
             if hit is not None:
-                return self._response(self.touch(hit), caller, "hit")
+                return self._serve_hit(hit, caller, namespace)
         if lookup_only:
             return {"status": "miss", "reusable": reusable}
 
@@ -381,13 +467,42 @@ class ResultSetCache:
                     if reusable:
                         hit = self.lookup(key)
                         if hit is not None:
-                            return self._response(self.touch(hit), caller, "hit")
-                    rs = self._materialize(caller, namespace, sql, key, reusable, stamp, vend)
+                            return self._serve_hit(hit, caller, namespace)
+                    rs = self._materialize(caller, namespace, sql, key, reusable, stamp, vend,
+                                           shared=shared and reusable)
                 finally:
                     lock_cur.execute("SELECT pg_advisory_unlock(%s)", (lock,))
         finally:
             slots.release()
         return self._response(rs, caller, "materialized")
+
+    def shareable(self, shape: QueryShape, caller: Caller, namespace: str,
+                  granted: list[str]) -> bool:
+        """May this query's result be shared within a governance class? Not
+        when the query or a policy that applies to it reads the executing
+        session. Each table's plan is built for the caller exactly as the
+        vend builds it; a reference that isn't a plain table of this catalog
+        (a view, say) falls back to checking every policy in the catalog."""
+        from .policies import plan_is_exportable
+        if not self.settings.result_share:
+            return False
+        if not shape.parsed or shape.table_functions or shape.session_dependent:
+            return False
+        roles = sorted(set(caller.token_roles) | set(granted)
+                       | {f"actor:{caller.actor}", f"channel:{caller.channel}"})
+        for cat, schema, name in shape.tables:
+            if not schema and not cat and name in shape.ctes:
+                continue
+            if cat and cat != self.ctx.catalog_id:
+                return False
+            schema = schema or namespace
+            if not self.catalog.table_exists([schema], name):
+                return not session_dependent_policies(self.catalog)
+            plan = self.ctx.policy_engine.plan_for(
+                principal=caller.sub, roles=roles, schema=schema, table=name)
+            if not plan_is_exportable(plan):
+                return False
+        return True
 
     def refresh(self, caller: Caller, rs_id: str) -> dict:
         """Fresh credentials for a live result set the caller owns (a reuse:
@@ -401,12 +516,13 @@ class ResultSetCache:
 
     # -- materialization ------------------------------------------------------
     def _materialize(self, caller: Caller, namespace: str, sql: str, key: str,
-                     reusable: bool, stamp: str, vend: Callable[[], dict]) -> ResultSet:
+                     reusable: bool, stamp: str, vend: Callable[[], dict], *,
+                     shared: bool = False) -> ResultSet:
         settings = self.settings
         bundle = vend()       # exactly the session this caller would be vended
         rs_id = hashlib.sha256(os.urandom(16)).hexdigest()[:24]
         prefix = f"{settings.s3.results_root}{self.ctx.catalog_id}/{rs_id}/"
-        tmp = tempfile.mkdtemp(prefix="duckicelake-rs-")
+        tmp = tempfile.mkdtemp(prefix="rs-", dir=work_dir(settings, "results"))
         out = os.path.join(tmp, "part-0.parquet")
         con = duckdb.connect(":memory:")
         timer = threading.Timer(settings.result_timeout_seconds, con.interrupt)
@@ -415,7 +531,8 @@ class ResultSetCache:
                 setup_governed(con, settings, bundle, self.ctx.catalog_id, namespace,
                                extra_dirs=[tmp + "/"],
                                memory_limit=settings.result_memory_limit,
-                               threads=settings.result_threads)
+                               threads=settings.result_threads,
+                               spill_dir=os.path.join(tmp, "spill"))
             except PermissionError as e:
                 raise Rejected(503, str(e))
             cap = int(settings.result_max_rows)
@@ -452,11 +569,12 @@ class ResultSetCache:
             r = cur.execute(
                 f"""INSERT INTO {self.sc}.duckicelake_result_set
                     (id, cache_key, reusable, principal, namespace, sql, governance_stamp,
-                     prefix, files, columns, row_count, bytes, expires_at, hard_expires_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     prefix, files, columns, row_count, bytes, expires_at, hard_expires_at,
+                     shared)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING {_COLS}""",
                 (rs_id, key, reusable, caller.sub, namespace, sql, stamp, prefix,
-                 json.dumps(files), json.dumps(cols), int(n), size, expires, hard),
+                 json.dumps(files), json.dumps(cols), int(n), size, expires, hard, shared),
             ).fetchone()
         rs = ResultSet.from_row(r)
         try:
@@ -464,7 +582,8 @@ class ResultSetCache:
                 principal=caller.sub, object_=f"{namespace}.<query>", masked_cols=[],
                 applied_policies=[], row_filtered=False, operation="result_set",
                 decision="materialized",
-                detail={"id": rs_id, "rows": int(n), "bytes": size, "reusable": reusable})
+                detail={"id": rs_id, "rows": int(n), "bytes": size, "reusable": reusable,
+                        "shared": shared})
         except Exception:
             pass
         return rs
@@ -489,6 +608,7 @@ class ResultSetCache:
             "expires_at": rs.expires_at.isoformat(),
             "hard_expires_at": rs.hard_expires_at.isoformat(),
             "use_count": rs.use_count,
+            "shared": rs.shared,
             "s3": {
                 "endpoint": s.s3_gateway_url,
                 "region": s.s3.region,
@@ -504,16 +624,17 @@ class ResultSetCache:
 
 def is_servable(ctx, rs_id: str, principal: str) -> bool:
     """For the gateway: may `principal` read result set `rs_id` right now?
-    It must exist, be theirs, be live, and have been built under the
-    catalog's current governance."""
+    It must exist, be theirs (built by them, or served to them as a shared
+    result), be live, and have been built under the catalog's current
+    governance."""
     cat = ctx.catalog
     with cat.pg_cursor() as cur:
         ensure_result_sidecar(cur, cat.sidecar_schema)
         r = cur.execute(
             f"""SELECT governance_stamp FROM {cat.sidecar_sql}.duckicelake_result_set
-                WHERE id = %s AND principal = %s
+                WHERE id = %s AND {_MAY_READ.format(sc=cat.sidecar_sql)}
                   AND expires_at > now() AND hard_expires_at > now()""",
-            (rs_id, principal)).fetchone()
+            (rs_id, principal, principal)).fetchone()
     return r is not None and r[0] == ctx.store.governance_stamp()
 
 

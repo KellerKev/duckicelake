@@ -27,3 +27,7 @@ duckicelake.toml
 # SMCP interface config (secrets) + RS256/TLS keys — never commit
 smcp.toml
 keys/
+
+# Scratch (DuckDB spill, result sets being written)
+.work/
+duckicelake.aws.toml
