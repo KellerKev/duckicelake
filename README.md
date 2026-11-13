@@ -167,9 +167,9 @@ bucket policy enforced — details in [OPERATIONS.md](OPERATIONS.md) and
 backend (2026-07-16): a DuckDB `httpfs` client reads through the gateway and
 gets rows, while out-of-scope, expired, and wrong-secret credentials are
 denied before any backend call — and its SigV4 verifier interops with
-botocore's own signer by construction (unit-tested against it). AWS runs the
-same code paths but hasn't been exercised against live AWS yet; it's
-unit-tested only.
+botocore's own signer by construction (unit-tested against it). The STS
+path was live-verified on real AWS S3 (2026-07-07) — see
+[Receipts](#receipts).
 
 For **file-layer masking on a no-STS backend**, a masked reader needs a
 **confined static key** (registered `confined=true`) so the proxy can vend it
@@ -200,6 +200,55 @@ The recording ends on the identity check: `DuckLake HEAD == Iceberg
 current-snapshot-id`, deterministically. Snapshot ids aren't random, so the
 two systems' state lines up directly when you're debugging.
 
+## Large results, cached under governance
+
+`POST /v1/{prefix}/namespaces/{ns}/result-sets` runs a query **as the
+caller** — same masks, row filters and RLS reader role as a credential vend —
+and writes the result once as Parquet. The caller gets the file URLs plus a
+gateway credential that reads **only that result**, refused the moment
+governance changes. Repeat queries are served from the cache until the data
+or the policies move: the key covers the query text, each table's live files
+and the catalog's governance version, bumped by Postgres triggers on every
+governance write.
+
+- **Shared only between identical access.** Two principals with the same
+  granted roles, token roles, session context (human/agent, channel) and
+  token scope get the same bytes, so they share one result. A query — or a
+  policy on a table it reads — that calls `current_user`, `current_setting`
+  or another session function stays per principal. Every principal served a
+  shared result is recorded and audited.
+- **Agents page through big answers.** The MCP and SMCP servers add
+  `query_result_set` (build or reuse; returns id, shape and a preview) and
+  `fetch_result_set` (pages of up to 1,000 rows, read back with the result's
+  own credential). The agent still never sees the catalog's DSN or storage
+  keys, unless you opt it into the per-result credential.
+- **Bounded.** Builds and agent queries run under a memory limit and a
+  timeout, spilling to a private work directory instead of exhausting RAM.
+  Unused results expire after 24h, every result after 30 days.
+
+Details: [Result sets](docs/REFERENCE.md#result-sets-query-result-cache).
+
+## A lake that maintains itself
+
+Small writes and long histories are what make a DuckLake catalog slow: every
+commit re-reads catalog statistics, and every scan opens every small file.
+The proxy keeps both in check without a cron job:
+
+- **Auto-compaction.** Every 15 minutes it checks the metadata for tables
+  with many small files or heavily deleted files and merges or rewrites just
+  those, on a dedicated connection. Untouched tables get no new snapshot;
+  DuckLake's `auto_compact=false` opts a table out.
+- **Daily maintenance.** Flushes inlined rows, compacts the catalog, expires
+  old snapshots (taking dropped tables' statistics with them), deletes
+  replaced files after a grace period so in-flight readers aren't cut off,
+  and sweeps data files a failed write left behind — never masked exports or
+  Iceberg metadata, which DuckLake's own orphan cleanup would delete.
+- **Metadata indexes.** Additive lookup indexes on the DuckLake tables in
+  Postgres; DuckLake's schema itself is never modified.
+
+One worker at a time runs it, under a Postgres advisory lock. Details:
+[Admin](docs/REFERENCE.md#admin).
+
 ## What makes it different
 
 | | Typical REST catalog + catalog-level masking | duckicelake |
@@ -209,6 +258,7 @@ two systems' state lines up directly when you're debugging.
 | Storage credentials | static keys or vendor-specific vending | scoped STS, per-request remote signing, or generated bucket policies — backend's choice |
 | Writes | Iceberg commits only | Iceberg commits **and** plain SQL, converging in ~1s |
 | LLM agents | prompt-level "please behave" | masked and audited at the catalog; read-only MCP front door |
+| Large results | re-run per user, or hand out storage access | cached as governed Parquet, shared only between identical access, one-result credentials |
 | Every read audited | rarely | yes — including credential vends, sign requests, and commits |
 
 Every row of that table is backed by a runnable script or test in this
@@ -277,10 +327,12 @@ where connecting *is* the agent signal: every call is stamped `actor=agent,
 channel=mcp`, and its tools (`list_namespaces`, `list_tables`, `describe_table`,
 `query`) execute read-only SQL **server-side and return rows only** — the agent
 never receives the DSN or S3 credentials, so it can't slip past a masked view to
-the base table.
+the base table. For answers too big for one reply, `query_result_set` and
+`fetch_result_set` build a governed cached result and page through it (see
+[Large results](#large-results-cached-under-governance)).
 
 For agents reaching the catalog **across a network or between agents**, the same
-four tools are also exposed over **SMCP** ([Secure MCP](https://github.com/KellerKev/smcp))
+six tools are also exposed over **SMCP** ([Secure MCP](https://github.com/KellerKev/smcp))
 via `duckicelake.smcp_interface`: MCP's tool model wrapped in `api_key`/JWT auth
 (RS256 so clients can't forge tokens), authenticated per-message encryption, and
 replay protection. An SMCP session vends `actor=agent, channel=smcp`, so it
@@ -329,7 +381,7 @@ adversarial review passes — is in
 
 Claims above, and where they're proven:
 
-- **180+ pytest tests across 18 files**, all against a live
+- **310+ pytest tests across 30 files**, all against a live
   proxy + MinIO + Postgres stack — including the byte-proofs (masked
   principal's creds 403 on base Parquet, 200 on masked copies), the
   fail-closed regression suite, STS policy-degradation units, and the
@@ -434,8 +486,12 @@ governed-read walkthrough: [docs/REFERENCE.md](docs/REFERENCE.md#sample-data--qu
 Alpha. Shipped and tested today: the full Iceberg
 REST surface (v2 + v3), the hybrid write model, tags/RBAC/masking/row
 policies with both enforcement tiers, per-principal reader roles + RLS,
-credential vending across all three backend dialects, multi-catalog
-tenancy, OAuth2, audit, Prometheus observability.
+credential vending across all four enforcement dialects, multi-catalog
+tenancy, OAuth2, audit, Prometheus observability, the governed result-set
+cache with agent paging, and self-maintaining catalogs (auto-compaction,
+snapshot expiry, orphan sweep). Runs on DuckDB 2.0; new catalogs are
+created at DuckLake spec 1.0 (`DUCKICELAKE_DUCKLAKE_SPEC`) so 1.x clients
+can still attach.
 
 Known boundaries — the short version (full list in
 [MISSING.md](MISSING.md)):
@@ -443,8 +499,6 @@ Known boundaries — the short version (full list in
 - Dev-stack Postgres runs `trust` auth; RLS *authentication* is only real
   under production `scram-sha-256` + TLS ([OPERATIONS.md](OPERATIONS.md)
   has the recipe).
-- AWS STS is code-correct and unit-tested but not yet run against live
-  AWS; Hetzner is live-verified.
 - Not yet built: a dedicated agent-role convention layer, Spark/Trino
   integration tests, HA/ops hardening (tracing, dashboards, chaos runs).
 

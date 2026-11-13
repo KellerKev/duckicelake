@@ -374,7 +374,7 @@ read scope on the namespace.
 
 ### Tests + CI
 
-- 180+ `pytest` tests covering the REST surface, cache LRU, metrics
+- 310+ `pytest` tests covering the REST surface, cache LRU, metrics
   endpoint, Puffin writer byte-level structure, the eager-materialisation
   listener, config-file loading, multi-catalog isolation (per-tenant PG
   schemas / S3 prefixes / reader roles, account-scoped routing, per-catalog
