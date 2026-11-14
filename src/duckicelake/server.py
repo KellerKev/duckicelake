@@ -1423,12 +1423,34 @@ def ducklake_credentials(
                     "expiration": creds.expiration_iso}
             except Exception:
                 log.exception("write STS vend failed for %s", sub)
+        elif settings.s3_gateway_enabled:
+            # No STS: a gateway credential confined to this namespace's data
+            # prefix. The gateway re-runs authorize_sign per request, so writes
+            # need a write-capable token scope and masked exports stay
+            # read-only — no long-lived static key required.
+            w_roles = sorted(set(token_roles)
+                             | set(governance_store.roles_for_principal(sub))
+                             | set(context_tags))
+            gw = gateway_mint(
+                settings, sub=sub, scope=claims.get("scope") or "",
+                roles=w_roles, catalog_id=ctx.catalog_id,
+                read_prefixes=[f"{ctx.ref.data_prefix}{ns[0]}/"])
+            w_out["s3"] = {
+                "endpoint": settings.s3_gateway_url, "region": settings.s3.region,
+                "path-style-access": settings.s3.path_style,
+                "access-key-id": gw["access_key_id"],
+                "secret-access-key": gw["secret_access_key"],
+                "session-token": None, "expiration": gw["expiration_iso"],
+                "enforcement": "gateway"}
         else:
             entry = None
             try:
                 entry = governance_store.static_key_for_principal(sub)
             except Exception:
-                pass
+                log.exception("static-key lookup failed for %s", sub)
+            if entry is None:
+                log.warning("write vend for %s on %s has no S3 credential: no STS, "
+                            "gateway off, no static key registered", sub, ctx.catalog_id)
             if entry is not None:   # Hetzner: a static key the operator bucket-policies to PutObject the prefix
                 w_out["s3"] = {
                     "endpoint": settings.s3.endpoint, "region": settings.s3.region,

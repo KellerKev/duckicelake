@@ -307,7 +307,7 @@ def _vended_duckdb(settings, vended: dict) -> duckdb.DuckDBPyConnection:
         """
     )
     con.execute(vended["ducklake_attach_sql"])
-    for stmt in vended["post_attach_sql"]:
+    for stmt in vended.get("post_attach_sql") or []:
         con.execute(stmt)
     return con
 
@@ -473,6 +473,26 @@ def test_schema_change_drops_stale_masking_views(client, settings):
     new_view = md["properties"]["duckicelake.masking-view-name"]
     assert new_view != old_view
     assert _live_view_rows(settings.pg_dsn, ns, new_view) == 1
+
+
+def test_ducklake_credentials_write_vend_inserts(client, settings):
+    """write=1 vends usable S3 credentials on every backend — a gateway
+    credential when there is no STS (no static key registered) — and a client
+    following the response can INSERT and read its rows back."""
+    ns = _ns("wr")
+    _make_table(client, ns, "events")
+    r = client.get(f"/v1/lake/namespaces/{ns}/ducklake-credentials",
+                   params={"write": 1, "principal": f"ingest_{uuid.uuid4().hex[:6]}"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["write"] is True
+    _assert_creds_vended(body["s3"])
+    con = _vended_duckdb(settings, body)
+    alias = body["ducklake_attach_sql"].split(" AS ", 1)[1].split()[0]
+    con.execute(f'INSERT INTO {alias}."{ns}".events VALUES (7, \'w@example.com\')')
+    assert con.execute(f'SELECT id, email FROM {alias}."{ns}".events').fetchall() == [
+        (7, "w@example.com")]
+    con.close()
 
 
 def test_ducklake_credentials_namespace_only(client, settings):
