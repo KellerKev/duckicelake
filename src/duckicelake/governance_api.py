@@ -171,6 +171,19 @@ def build_governance_router(
         store.create_tag(_principal(request), req.tag_ns, req.tag_name, req.allowed_values)
         return {"status": "created", "tag": f"{req.tag_ns}.{req.tag_name}"}
 
+    @router.get("/tags", status_code=200)
+    def list_tags(prefix: str, request: Request):
+        store, engine, ctx = _resolve(prefix, request)
+        return {"tags": store.list_tags()}
+
+    @router.get("/object-tags", status_code=200)
+    def list_object_tags(prefix: str, request: Request, schema: str | None = None,
+                         table: str | None = None, limit: int = 5000):
+        store, engine, ctx = _resolve(prefix, request)
+        if table is not None and schema is None:
+            raise HTTPException(400, "table needs schema")
+        return {"object_tags": store.list_object_tags(schema, table, max(1, min(limit, 20000)))}
+
     @router.post("/object-tags", status_code=200)
     def assign_object_tag(prefix: str, req: AssignObjectTagRequest, request: Request):
         store, engine, ctx = _resolve(prefix, request)

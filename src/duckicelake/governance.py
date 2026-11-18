@@ -597,6 +597,38 @@ class GovernanceStore:
 
     # -- tags -------------------------------------------------------------
 
+    def list_tags(self) -> list[dict]:
+        """Every tag defined in this catalog."""
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(f"SELECT tag_ns, tag_name, allowed_values FROM {self._sc}.duckicelake_tag "
+                        "ORDER BY tag_ns, tag_name")
+            return [{"namespace": r[0], "name": r[1], "allowed_values": r[2]}
+                    for r in cur.fetchall()]
+
+    def list_object_tags(self, schema: str | None = None, table: str | None = None,
+                         limit: int = 5000) -> list[dict]:
+        """Tag assignments: all of them, those in one schema, or those that reach one
+        table (the schema's, the table's own and its columns')."""
+        where, args = [], []
+        if schema is not None:
+            where.append("schema_name = %s")
+            args.append(schema)
+            if table is not None:
+                where.append("(object_kind = 'schema' OR object_name = %s)")
+                args.append(table)
+        sql = (f"SELECT object_kind, schema_name, object_name, column_name, tag_ns, tag_name, "
+               f"tag_value FROM {self._sc}.duckicelake_object_tag"
+               + (" WHERE " + " AND ".join(where) if where else "")
+               + " ORDER BY schema_name, object_name, column_name, tag_ns, tag_name LIMIT %s")
+        with self.catalog.pg_cursor() as cur:
+            ensure_governance_sidecars(cur, self.catalog.sidecar_schema)
+            cur.execute(sql, (*args, limit))
+            cols = ["object_kind", "schema_name", "object_name", "column_name",
+                    "tag_ns", "tag_name", "tag_value"]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
     def create_tag(self, principal: str, tag_ns: str, tag_name: str,
                    allowed_values: list[str] | None) -> None:
         with self.catalog.pg_cursor() as cur:
