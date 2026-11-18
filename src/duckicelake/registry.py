@@ -147,6 +147,18 @@ def _check_catalog_names(catalog_id: str, metadata_schema: str, data_prefix: str
             "ending in '/', with no '.'/'..' segments")
 
 
+#: Top-level prefixes of the bucket that hold data which is not a catalog's (backups,
+#: other applications, the default catalog's root). A catalog whose data prefix starts
+#: with one of these is never deleted. DUCKICELAKE_PROTECTED_PREFIXES adds more.
+_PROTECTED_DEFAULT = ("backups", "levitate", "pycorner", "streamgen", "cvinfo", "uplevate",
+                      "eutonomous", "course", "duckicelake-test", "results", "__masked__")
+
+
+def protected_prefixes() -> set[str]:
+    extra = os.environ.get("DUCKICELAKE_PROTECTED_PREFIXES", "")
+    return set(_PROTECTED_DEFAULT) | {p.strip().strip("/") for p in extra.split(",") if p.strip()}
+
+
 class CatalogRegistry:
     def __init__(self, settings: Settings, max_active: int | None = None) -> None:
         self.settings = settings
@@ -302,6 +314,123 @@ class CatalogRegistry:
                 [catalog_id, metadata_schema, data_prefix, account_id],
             )
         return self.get(catalog_id)
+
+    # ---- deprovisioning + usage ------------------------------------------
+    def _owned_ref(self, catalog_id: str) -> CatalogRef:
+        """The registered ref of a catalog it is safe to delete or measure on its own,
+        else ValueError / UnknownCatalog.
+
+        The bucket is shared with data that is not ours (other prefixes at its root), so
+        everything that deletes is held to the narrowest shape: never the default
+        catalog, a data prefix of at least two segments whose first one is not a protected
+        top-level prefix, not overlapping any other catalog's prefix or the default data
+        prefix, and a metadata schema of its own."""
+        if catalog_id == self.settings.catalog_name:
+            raise ValueError("the default catalog is never deprovisioned")
+        resolved = self._resolve_row(catalog_id)
+        if resolved is None:
+            raise UnknownCatalog(catalog_id)
+        ref = resolved[0]
+        meta, prefix = ref.metadata_schema or "", ref.data_prefix or ""
+        _check_catalog_names(catalog_id, meta, prefix)
+        segs = prefix.split("/")
+        if len(segs) < 3 or not all(segs[:-1]):
+            raise ValueError(f"data prefix {prefix!r} is too broad to delete")
+        if segs[0] in protected_prefixes():
+            raise ValueError(f"data prefix {prefix!r} is under a protected prefix")
+        if meta == "public" or meta.startswith("pg_") or meta == "information_schema":
+            raise ValueError(f"metadata schema {meta!r} is not a catalog's own")
+        default_prefix = self.settings.s3.data_prefix or ""
+        if not default_prefix or prefix.startswith(default_prefix) or default_prefix.startswith(prefix):
+            raise ValueError(f"data prefix {prefix!r} overlaps the default catalog")
+        for other_id, other in self.list_refs():
+            if other_id in (catalog_id, self.settings.catalog_name):
+                continue
+            op = other.data_prefix or ""
+            if op.startswith(prefix) or prefix.startswith(op) or other.metadata_schema == meta:
+                raise ValueError(f"catalog {catalog_id!r} shares storage with {other_id!r}")
+        return ref
+
+    def _objects(self, prefix: str):
+        from .s3util import s3_client
+        client = s3_client(self.settings.s3)
+        token = None
+        while True:
+            kw = {"Bucket": self.settings.s3.bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if token:
+                kw["ContinuationToken"] = token
+            r = client.list_objects_v2(**kw)
+            yield client, r.get("Contents") or []
+            if not r.get("IsTruncated"):
+                return
+            token = r.get("NextContinuationToken")
+
+    def usage(self, catalog_id: str) -> dict:
+        """Bytes and objects the catalog holds in S3 (its data, deletes, masked exports)."""
+        ref = self._owned_ref(catalog_id)
+        total = count = 0
+        for _client, objs in self._objects(ref.data_prefix):
+            count += len(objs)
+            total += sum(int(o.get("Size") or 0) for o in objs)
+        return {"catalog_id": catalog_id, "bytes": total, "objects": count,
+                "data_prefix": ref.data_prefix}
+
+    def _delete_prefix(self, prefix: str) -> tuple[int, int]:
+        deleted = size = 0
+        for client, objs in self._objects(prefix):
+            keys = [o["Key"] for o in objs if str(o.get("Key", "")).startswith(prefix)]
+            if not keys:
+                continue
+            r = client.delete_objects(Bucket=self.settings.s3.bucket,
+                                      Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True})
+            errs = r.get("Errors") or []
+            if errs:
+                raise RuntimeError(f"S3 refused {len(errs)} deletes, first: {errs[0]}")
+            deleted += len(keys)
+            size += sum(int(o.get("Size") or 0) for o in objs)
+        return deleted, size
+
+    def deprovision(self, catalog_id: str) -> dict:
+        """Delete a catalog for good: its S3 objects, its Postgres metadata schema, its
+        per-catalog reader/writer groups and predicate functions, then the registry row.
+        Every step is idempotent and the row goes last, so a failure part-way is finished
+        by calling again. Contexts cached in other worker processes fail on their next use
+        and age out; nothing routes to a deleted account's catalogs any more."""
+        from psycopg import sql as psql
+
+        from . import pg_rls
+        ref = self._owned_ref(catalog_id)
+        meta, prefix = ref.metadata_schema, ref.data_prefix
+        with self._lock:
+            if catalog_id in self._ctxs:
+                self._close_locked(catalog_id)
+            ctx = self._retired.pop(catalog_id, None)
+            if ctx is not None:
+                self._close_ctx(ctx)
+        objects, size = self._delete_prefix(prefix)
+        left: list[str] = []
+        groups = [pg_rls._group_for(self.settings, meta),
+                  pg_rls._writer_group_for(self.settings, meta)]
+        with self._pg() as c, c.cursor() as cur:
+            cur.execute("SET lock_timeout = '20s'")
+            cur.execute(psql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psql.Identifier(meta)))
+            for fn in pg_rls._fn_names(meta):
+                cur.execute(psql.SQL("DROP FUNCTION IF EXISTS public.{}()").format(psql.Identifier(fn)))
+            for g in groups:
+                if not cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [g]).fetchone():
+                    continue
+                try:
+                    cur.execute(psql.SQL("DROP OWNED BY {}").format(psql.Identifier(g)))
+                    cur.execute(psql.SQL("DROP ROLE {}").format(psql.Identifier(g)))
+                except psycopg.Error as e:
+                    left.append(f"{g}: {type(e).__name__}")
+        # anything a still-open writer put there while the schema went
+        more, more_size = self._delete_prefix(prefix)
+        with self._pg() as c, c.cursor() as cur:
+            cur.execute("DELETE FROM public.duckicelake_catalog WHERE catalog_id = %s", [catalog_id])
+        return {"catalog_id": catalog_id, "deleted_objects": objects + more,
+                "deleted_bytes": size + more_size, "metadata_schema": meta,
+                "data_prefix": prefix, "roles_left": left}
 
     def _evict_locked(self) -> None:
         """Close + drop least-recently-used contexts beyond the cap. Never

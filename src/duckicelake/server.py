@@ -34,6 +34,7 @@ from .auth import (
 from .auth import claims_from_request
 from .catalog import DuckLakeCatalog
 from .sqlsafe import check_identifier, literal
+import psycopg
 from .registry import CatalogContext, CatalogLeaseMiddleware, CatalogRegistry, UnknownCatalog
 from .config import apply_file_config, load_settings, redact_password
 from .governance import GovernanceStore
@@ -710,6 +711,35 @@ def provision_catalog(req: ProvisionCatalogRequest, request: Request) -> Catalog
         metadata_schema=ctx.ref.metadata_schema or "",
         data_prefix=ctx.ref.data_prefix,
     )
+
+
+@app.get("/v1/catalogs/{catalog_id}/usage")
+def catalog_usage(catalog_id: str, request: Request) -> dict:
+    """Bytes and objects a provisioned catalog holds in S3 (for storage billing).
+    Control-plane op: admin-scope token, like provisioning."""
+    _require_admin(request)
+    try:
+        return registry.usage(catalog_id)
+    except UnknownCatalog:
+        raise HTTPException(status_code=404, detail=f"Unknown catalog '{catalog_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/v1/catalogs/{catalog_id}")
+def deprovision_catalog(catalog_id: str, request: Request) -> dict:
+    """Delete a provisioned catalog for good (its S3 data, metadata schema, per-catalog
+    roles, registry row). Idempotent: an unknown catalog answers 404, a busy one 409 (call
+    again). Control-plane op: admin-scope token."""
+    _require_admin(request)
+    try:
+        return registry.deprovision(catalog_id)
+    except UnknownCatalog:
+        raise HTTPException(status_code=404, detail=f"Unknown catalog '{catalog_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except psycopg.errors.LockNotAvailable:
+        raise HTTPException(status_code=409, detail="the catalog is in use; try again shortly")
 
 
 # ---- namespaces --------------------------------------------------------
