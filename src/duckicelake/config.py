@@ -282,6 +282,13 @@ class Settings:
     # the cooperative tier (search_path onto a masked view) is sidestepped by
     # a schema-qualified name. Comma-separated; empty disables.
     airtight_channels: tuple[str, ...] = ("console",)
+    # Agent sessions are read-only at the data plane unless this is on. When
+    # on, a WRITE vend for an `actor:agent` session is honoured only when a
+    # trusted broker delegated it (`delegate=1` + broker scope): the broker
+    # attests that the end user's own privileges allow the write and that it
+    # keeps the agent's reads on a governed reader (the writer connection is
+    # unmasked and outside RLS). A non-delegated agent stays read-only.
+    agent_writes: bool = False
     # DuckLake spec version for catalogs this server CREATES. DuckDB 2.0's
     # ducklake extension defaults new catalogs to spec 1.1, which DuckDB 1.x
     # clients cannot read. Keep "1.0" until every client (warehouses,
@@ -474,6 +481,7 @@ def load_settings() -> Settings:
         airtight_channels=tuple(
             c.strip().lower() for c in os.environ.get(
                 "DUCKICELAKE_AIRTIGHT_CHANNELS", "console").split(",") if c.strip()),
+        agent_writes=os.environ.get("DUCKICELAKE_AGENT_WRITES", "0") == "1",
         ducklake_spec_version=os.environ.get(
             "DUCKICELAKE_DUCKLAKE_SPEC", "1.0").strip(),
         result_idle_hours=float(os.environ.get("DUCKICELAKE_RESULT_IDLE_HOURS", "24")),

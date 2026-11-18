@@ -65,11 +65,24 @@ unmasked_roles = ARRAY['channel:rest']   -- only REST callers see cleartext
 Combine with real roles as usual, e.g. `ARRAY['actor:human','pii_reader']` — any
 listed role bypasses.
 
-## 4. Read-only for agents
+## 4. Read-only for agents (and delegated agent writes)
 
 Agent sessions are read-only at the data plane: a `write=1` DuckLake-direct vend
 is refused (403, audited `error_agent_readonly`) when `actor:agent` is present,
 regardless of token scope. Reads apply the masking above.
+
+`DUCKICELAKE_AGENT_WRITES=1` lets a **delegated** agent session (`delegate=1`
+from a broker-scoped token) receive a write vend; it is audited `ok_agent_write`.
+The broker takes on two duties when it asks for one:
+
+- it has checked that the end user's own privileges allow the write (and any
+  narrower ceiling it keeps for agents), and
+- it never runs the agent's SQL on the writer connection, which is unmasked and
+  outside RLS. The agent's query runs on the governed reader vend and only its
+  result rows (plus plain DDL) reach the writer, so a write never carries more
+  than the agent could read.
+
+A non-delegated agent stays read-only whatever the setting.
 
 ## 5. Notes / limits
 

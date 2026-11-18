@@ -1402,11 +1402,15 @@ def ducklake_credentials(
     # on reads. Short-circuits the read/masking machinery below.
     if write:
         # Agent sessions are read-only at the data plane, regardless of token
-        # scope or what the caller requests — authoritative here.
+        # scope or what the caller requests — unless `agent_writes` is on AND a
+        # trusted broker delegated this session (it vouches for the end user's
+        # privileges and keeps the agent's reads on a governed reader).
         if actor_tag == "agent":
-            _audit_credentials_denied(ctx, sub, ns, table, "error_agent_readonly")
-            raise HTTPException(
-                status_code=403, detail="agent sessions are read-only")
+            if not (settings.agent_writes and delegated):
+                _audit_credentials_denied(ctx, sub, ns, table, "error_agent_readonly")
+                raise HTTPException(
+                    status_code=403, detail="agent sessions are read-only")
+            _audit_credentials_denied(ctx, sub, ns, table, "ok_agent_write")
         if not scope_allows(claims.get("scope", ""), ns[0], "POST"):
             _audit_credentials_denied(ctx, sub, ns, table, "error_write_scope")
             raise HTTPException(
