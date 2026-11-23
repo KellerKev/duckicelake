@@ -531,6 +531,49 @@ curl -sX POST "$P/spec?mode=apply&if_version=42&source=$(git rev-parse HEAD)" --
   export creates the missing definitions once, after which export → import
   is a no-op.
 
+### Lineage
+
+Every catalog keeps OpenLineage `RunEvent`s in its own sidecar table
+(`duckicelake_lineage_event`, next to the audit trail), so lineage is as
+isolated as the catalog and disappears with it on deprovision. Datasets are
+named `duckicelake://<public host>/<catalog>` + `schema.table`.
+
+| Kind | Where it comes from | Inputs → outputs |
+|---|---|---|
+| `commit` | DuckLake's own commit log (`ducklake_snapshot_changes`), harvested every minute and right before maintenance expires snapshots, so every write path is covered | — → the tables a snapshot created, wrote, altered, renamed or dropped (`lifecycleStateChange`, `duckicelake_write` facets) |
+| `access` | a granted credential vend (read or write) or a governed LoadTable | the table → —, with principal, masked columns, row filter, actor/channel |
+| `query` | a materialized result set | the tables its SQL read → the result set |
+| `ingest` | `POST /v1/{prefix}/lineage` from another producer | as sent |
+
+**Who wrote a commit** comes from a trigger on `ducklake_snapshot` that
+records the committing session's Postgres login role; a vended per-principal
+role maps back to its principal, so a DuckLake-direct writer cannot claim to
+be someone else (DuckLake's own `author` field is client-set and is kept
+only as a facet). Iceberg REST commits run on the proxy's connection; the
+commit handler names the caller for the snapshots it made. A producer can
+tie its run to the commit by putting
+`{"openlineage": {"run_id": …, "job_namespace": …, "job_name": …}}` in the
+DuckLake commit's `extra_info`; it becomes the commit event's `parent` facet.
+
+Not recorded: LoadTable of a table without policies (only governed reads
+are audited), denied/failed requests (they stay in the audit trail only),
+S3 requests themselves, and schema-only or maintenance snapshots
+(compaction, inline flushes).
+
+```bash
+curl -s "$L?dataset=sales.orders&direction=upstream"          # graph + who touched it
+curl -s "$L/events?dataset=sales.orders&kind=commit,access"     # raw events
+curl -s "$L/events?after_id=1234&format=ndjson"                 # forwarding cursor (X-Last-Id)
+curl -sX POST $L -H $H -d @run_event.json                       # ingest (admin or broker)
+# L=localhost:8181/v1/lake/lineage — the OpenLineage HTTP transport works with endpoint=v1/lake/lineage
+```
+
+Reads are admin-only (lineage names tables and the people who used them)
+and harvest the latest commits first. `DUCKICELAKE_LINEAGE=0` turns it off;
+`DUCKICELAKE_LINEAGE_HARVEST_SECONDS` (60) sets the harvest interval;
+`DUCKICELAKE_LINEAGE_RETENTION_DAYS` (365, 0 = forever) is applied by the
+maintenance pass.
+
 ### How policies compose
 
 - **Can one tag carry multiple policies?** Yes — a tag can hold several
@@ -922,6 +965,9 @@ Design details: [docs/multi_catalog_isolation.md](multi_catalog_isolation.md).
 | GET | `/v1/{prefix}/governance/audit` | governance + enforcement audit trail |
 | GET | `/v1/{prefix}/governance/spec` | governance as a declarative spec (YAML; `?format=json`) |
 | POST | `/v1/{prefix}/governance/spec` | plan (default) or `?mode=apply` a spec; `prune`, `if_version`, `source` |
+| GET | `/v1/{prefix}/lineage` | dataset lineage graph around `?dataset=schema.table` + who touched it (admin) |
+| GET | `/v1/{prefix}/lineage/events` | OpenLineage events; `after_id` cursor, `dataset`, `kind`, `since`, `format=ndjson` (admin) |
+| POST | `/v1/{prefix}/lineage` | ingest OpenLineage RunEvents (admin or broker; caller stamped) |
 | POST | `/v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` | DuckLake compaction + file cleanup |
 | POST | `/v1/{prefix}/namespaces/{ns}/result-sets` | run a SELECT as the caller, return its result as Parquet + a credential for it (cached; `mode: lookup`) |
 | GET | `/v1/{prefix}/namespaces/{ns}/result-sets/{id}` | fresh credential for a live result set the caller owns |

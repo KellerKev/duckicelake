@@ -45,6 +45,8 @@ from .masking_views import (
     MaskingViewManager,
 )
 from .governance_api import build_governance_router
+from . import lineage
+from .lineage_api import build_lineage_router
 from .pg_rls import (
     ensure_rls,
     ensure_rls_cached,
@@ -312,6 +314,26 @@ async def _result_sweeper() -> None:
             log.exception("result-set sweep failed")
 
 
+async def _lineage_harvester() -> None:
+    """Turn new DuckLake commits into lineage events, every
+    DUCKICELAKE_LINEAGE_HARVEST_SECONDS (60) for every catalog. All workers
+    run it; each catalog's cursor row is taken SKIP LOCKED, so one works
+    while the others skip (lineage.harvest)."""
+    import asyncio
+    every = float(os.environ.get("DUCKICELAKE_LINEAGE_HARVEST_SECONDS", "60"))
+    if lineage.disabled() or every <= 0:
+        return
+    await asyncio.sleep(30)
+    while True:
+        for cid, _ref in registry.list_refs():
+            try:
+                await asyncio.to_thread(lineage.harvest, registry.get(cid).catalog,
+                                        settle_seconds=10)
+            except Exception:
+                log.exception("lineage harvest failed for %s", cid)
+        await asyncio.sleep(every)
+
+
 async def _catalog_maintenance() -> None:
     """Maintain every catalog whose last full run is older than
     `maintenance_hours` (checked hourly), and auto-compact the tables that
@@ -367,9 +389,12 @@ async def lifespan(app: FastAPI):
         _result_sweeper(), name="duckicelake-result-sweeper")
     maintenance_task = asyncio.create_task(
         _catalog_maintenance(), name="duckicelake-maintenance")
+    lineage_task = asyncio.create_task(
+        _lineage_harvester(), name="duckicelake-lineage")
     try:
         yield
     finally:
+        lineage_task.cancel()
         maintenance_task.cancel()
         sweeper_task.cancel()
         listener_task.cancel()
@@ -793,6 +818,7 @@ def _is_delegated(request: Request | None, scope: str) -> bool:
 app.include_router(build_governance_router(
     resolve_catalog, lambda: auth_cfg,
     on_table_policy_change=_resync_table_governance))
+app.include_router(build_lineage_router(resolve_catalog, lambda: auth_cfg))
 
 
 @app.get("/v1/{prefix}/namespaces", response_model=ListNamespacesResponse)
@@ -1429,6 +1455,15 @@ def ducklake_credentials(
             raise HTTPException(
                 status_code=503, detail="could not provision a writer role (fail-closed)")
         w_dsn = settings.pg_dsn_for(w_role, w_pw)
+        if actor_tag != "agent":       # an agent write is audited above (ok_agent_write)
+            # A granted write vend is audited like a read vend. This also
+            # records the lineage access event, which installs the snapshot-
+            # writer trigger before the client can commit (lineage.py).
+            governance_store.audit_load(
+                principal=sub, object_=f"{ns[0]}.{table or '*'}", masked_cols=[],
+                applied_policies=[], row_filtered=False,
+                operation="ducklake_credentials", decision="ok_write",
+                detail={"write": True, "pg_role": w_role})
         w_out: dict[str, Any] = {
             "ducklake_dsn": w_dsn,
             "ducklake_data_path": data_path,
@@ -1441,6 +1476,9 @@ def ducklake_credentials(
             "pg_valid_until": expires_at.isoformat(),
             "write": True,
             "s3": None,
+            # how lineage names this catalog's datasets, so a writer reporting
+            # its run (POST /lineage) names them as the commit events do
+            "lineage_namespace": lineage.dataset_namespace(catalog),
         }
         if not settings.s3.sts_disabled:
             try:
@@ -1518,6 +1556,7 @@ def ducklake_credentials(
         "mask_projection": None,   # SELECT list to apply over read_parquet, or null
         "row_filter": None,        # WHERE predicate to apply, or null
         "scan_files": None,        # explicit file list (file-layer export), or null
+        "lineage_namespace": lineage.dataset_namespace(catalog),
     }
 
     # Phase 3a: vend a per-principal RLS-governed reader role instead of
@@ -2282,6 +2321,9 @@ def commit_table(
     # rolled back by this scope, but DuckLake itself enforces per-call
     # atomicity on the snapshot allocator.
     schema_changed = False
+    # Lineage: the trigger sees this proxy's role, so name the caller for the
+    # snapshots this commit makes (lineage.attribute_commit, below).
+    lineage_before = None if lineage.disabled() else lineage.current_snapshot_id(catalog)
     with catalog.commit_transaction():
         if new_schema is not None:
             _apply_schema_diff(ctx, ns, table, new_schema)
@@ -2402,6 +2444,10 @@ def commit_table(
             })
     except Exception:
         log.exception("commit audit failed for %s.%s", ns[0], table)
+    if lineage_before is not None:
+        lineage.attribute_commit(
+            catalog, principal=(claims_from_request(auth_cfg, request).get("sub") or "anonymous"),
+            table=(ns[0], table), after_snapshot=lineage_before)
 
     # Eager materialise: _build_load_response calls materialize_all, which
     # writes all the snapshot/manifest Avros + the new vN.metadata.json and

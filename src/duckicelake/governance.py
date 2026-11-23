@@ -91,6 +91,8 @@ def reset_sidecar_cache() -> None:
     catalogs' RLS was armed) — call after wiping Postgres or dropping a
     catalog schema so the next ensure re-creates them."""
     _SIDECARS_ENSURED.clear()
+    from .lineage import reset_lineage_cache
+    reset_lineage_cache()
     from .pg_rls import reset_rls_cache   # pg_rls imports this module
     reset_rls_cache()
 
@@ -535,9 +537,32 @@ class GovernanceStore:
                     detail={"row_filtered": row_filtered, **(detail or {})},
                 )
                 self._maybe_purge_audit(cur)
+            self._lineage_access(principal=principal, operation=operation, object_=object_,
+                                 decision=decision or ("masked" if (masked_cols or row_filtered)
+                                                       else "ok"),
+                                 masked_cols=masked_cols, row_filtered=row_filtered,
+                                 detail=detail)
         except Exception:
             log.exception("read-path audit failed for %s on %s (read served)",
                           principal, object_)
+
+    def _lineage_access(self, *, principal: str, operation: str, object_: str,
+                        decision: str, masked_cols, row_filtered: bool,
+                        detail: dict | None) -> None:
+        """A granted credential vend / governed LoadTable as a lineage access
+        event. Its own cursor: lineage must never cost the audit row."""
+        from . import lineage
+        if (operation not in lineage.ACCESS_OPS or lineage.disabled()
+                or str(decision).startswith(("error", "denied", "deny"))):
+            return
+        try:
+            with self.catalog.pg_cursor() as cur:
+                lineage.record_access(cur, self.catalog, principal=principal,
+                                      operation=operation, object_=object_,
+                                      decision=decision, masked_cols=masked_cols,
+                                      row_filtered=row_filtered, detail=detail)
+        except Exception:
+            log.exception("lineage access event failed for %s on %s", principal, object_)
 
     def _maybe_purge_audit(self, cur) -> None:
         """Lazy retention: delete audit rows older than the configured

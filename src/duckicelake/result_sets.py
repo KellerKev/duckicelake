@@ -586,6 +586,17 @@ class ResultSetCache:
                         "shared": shared})
         except Exception:
             pass
+        from . import lineage
+        if not lineage.disabled():
+            try:
+                shape = analyse(sql)
+                tables = {(schema or namespace, name) for cat, schema, name in shape.tables
+                          if schema or cat or name not in shape.ctes}
+                lineage.record_query(self.catalog, principal=caller.sub, namespace=namespace,
+                                     tables=tables, result_set_id=rs_id, rows=int(n),
+                                     actor=caller.actor, channel=caller.channel)
+            except Exception:
+                log.exception("lineage: result-set event failed for %s", rs_id)
         return rs
 
     # -- response ---------------------------------------------------------------

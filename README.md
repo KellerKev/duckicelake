@@ -132,6 +132,13 @@ catalog's whole governance model as one YAML document; `POST` it back to plan
 authoritative (`prune=true`). Keep it in git, review it in a PR, apply it on
 merge — see [docs/REFERENCE.md](docs/REFERENCE.md#governance-as-a-spec-export--plan--apply).
 
+**Lineage comes from the catalog itself.** Every commit (whatever wrote it),
+every granted credential vend and every cached query result lands as an
+OpenLineage event in the catalog, with the writer taken from the Postgres
+role that committed rather than from what the client claims. Other producers
+can POST their own events; `GET /lineage` draws the graph — see
+[docs/REFERENCE.md](docs/REFERENCE.md#lineage).
+
 *Receipts:* [`masked_export.py`](src/duckicelake/masked_export.py) ·
 byte-proof tests in [`test_governance_phase4.py`](tests/test_governance_phase4.py)
 (masked principal's creds: 403 on base keys, 200 on masked copies) ·

@@ -43,6 +43,19 @@ def due_catalogs(con, catalog_ids: list[str], every_hours: float) -> list[str]:
     return [c for c in catalog_ids if not last.get(c)]
 
 
+def _lineage_before_expiry(cat, cid: str) -> None:
+    """Harvest commits into lineage before maintain() expires their
+    snapshots (and with them the commit log rows), then apply retention."""
+    from . import lineage
+    if lineage.disabled():
+        return
+    try:
+        lineage.harvest(cat)
+        lineage.purge(cat, lineage.retention_days())
+    except Exception:
+        log.exception("lineage harvest before maintenance failed for %s", cid)
+
+
 def run_due(settings, registry) -> dict[str, dict]:
     """Maintain every catalog that is due. Returns {catalog_id: result}."""
     import json
@@ -57,6 +70,7 @@ def run_due(settings, registry) -> dict[str, dict]:
             ids = [cid for cid, _ref in refs]
             paths = [settings.data_path_for(ref) for _cid, ref in refs]
             for cid in due_catalogs(con, ids, settings.maintenance_hours):
+                _lineage_before_expiry(registry.get(cid).catalog, cid)
                 try:
                     res = registry.get(cid).catalog.maintain(
                         retain_days=settings.snapshot_retention_days,
