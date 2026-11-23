@@ -2919,6 +2919,13 @@ def _build_load_response(
                               if file_layer_export is not None else None),
                     detail={"file_layer": file_layer_export is not None},
                 )
+            else:
+                # no policy applies, so the audit trail has no row for this
+                # read; lineage still records who was handed the table
+                lineage.record_plain_access(
+                    catalog, principal=principal_for_creds, operation="load_table",
+                    object_=f"{ns[0]}.{table}",
+                    detail={"actor": _actor, "channel": _channel})
         except Exception:
             log.exception("governance enforcement failed for %s.%s — "
                           "fail-open only for the cooperative tier", ns[0], table)

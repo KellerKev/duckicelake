@@ -136,7 +136,9 @@ merge — see [docs/REFERENCE.md](docs/REFERENCE.md#governance-as-a-spec-export-
 every granted credential vend and every cached query result lands as an
 OpenLineage event in the catalog, with the writer taken from the Postgres
 role that committed rather than from what the client claims. Other producers
-can POST their own events; `GET /lineage` draws the graph — see
+can POST their own events, and say which governance tags a copy carries from
+its sources (kept per table until it is replaced or dropped, so a broker can
+treat a copy like the original); `GET /lineage` draws the graph — see
 [docs/REFERENCE.md](docs/REFERENCE.md#lineage).
 
 *Receipts:* [`masked_export.py`](src/duckicelake/masked_export.py) ·

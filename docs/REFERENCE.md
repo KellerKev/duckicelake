@@ -540,8 +540,8 @@ named `duckicelake://<public host>/<catalog>` + `schema.table`.
 
 | Kind | Where it comes from | Inputs → outputs |
 |---|---|---|
-| `commit` | DuckLake's own commit log (`ducklake_snapshot_changes`), harvested every minute and right before maintenance expires snapshots, so every write path is covered | — → the tables a snapshot created, wrote, altered, renamed or dropped (`lifecycleStateChange`, `duckicelake_write` facets) |
-| `access` | a granted credential vend (read or write) or a governed LoadTable | the table → —, with principal, masked columns, row filter, actor/channel |
+| `commit` | DuckLake's own commit log (`ducklake_snapshot_changes`), harvested every minute and right before maintenance expires snapshots, so every write path is covered | — → the tables a snapshot created, replaced (`OVERWRITE`), wrote, altered, renamed or dropped (`lifecycleStateChange`, `duckicelake_write` facets) |
+| `access` | a granted credential vend (read or write) or a LoadTable | the table → —, with principal, masked columns, row filter, actor/channel |
 | `query` | a materialized result set | the tables its SQL read → the result set |
 | `ingest` | `POST /v1/{prefix}/lineage` from another producer | as sent |
 
@@ -554,9 +554,33 @@ commit handler names the caller for the snapshots it made. A producer can
 tie its run to the commit by putting
 `{"openlineage": {"run_id": …, "job_namespace": …, "job_name": …}}` in the
 DuckLake commit's `extra_info`; it becomes the commit event's `parent` facet.
+A commit made before the trigger existed (lineage switched on later) has
+`writer.recorded: false`; if the audit trail shows exactly one principal
+committing that table through REST at that moment, it is named with
+`via: "audit"`, otherwise the writer stays empty.
 
-Not recorded: LoadTable of a table without policies (only governed reads
-are audited), denied/failed requests (they stay in the audit trail only),
+A LoadTable of a table no policy applies to has no audit row, but is an
+access event all the same — once per principal and table in
+`DUCKICELAKE_LINEAGE_ACCESS_DEDUP_SECONDS` (300; `0` records every load),
+since an Iceberg client loads a table for every query it plans.
+
+**Names.** DuckDB matches names ignoring case, so a producer may send
+`sales.orders` for a table created as `Sales.Orders`. Ingested datasets of
+this catalog are stored under the name the catalog has (the event's
+`duckicelake_ingest.renamed` says what was changed), and `?dataset=` is
+matched the same way, so producer events and the table's own commits are
+one node.
+
+**Carried tags.** A producer that copies tagged data says which tags went
+along in the output dataset's `duckicelake_carriedTags` facet
+(`{"tags": ["pii.email"]}`). duckicelake keeps them per table, drops them
+when the table is created anew, replaced or dropped — by anyone, since it
+reads that from the commit log — and moves them on a rename; the run that
+made a replacing commit (its `parent` facet) keeps what it reported. They
+enforce nothing here: a broker reads `GET …/lineage/carried-tags` to treat
+a copy like its source.
+
+Not recorded: denied/failed requests (they stay in the audit trail only),
 S3 requests themselves, and schema-only or maintenance snapshots
 (compaction, inline flushes).
 
@@ -564,6 +588,8 @@ S3 requests themselves, and schema-only or maintenance snapshots
 curl -s "$L?dataset=sales.orders&direction=upstream"          # graph + who touched it
 curl -s "$L/events?dataset=sales.orders&kind=commit,access"     # raw events
 curl -s "$L/events?after_id=1234&format=ndjson"                 # forwarding cursor (X-Last-Id)
+curl -s "$L/events?dataset=sales.orders&order=desc&limit=50"    # the latest events
+curl -s "$L/carried-tags"                                       # tags tables carry from their sources
 curl -sX POST $L -H $H -d @run_event.json                       # ingest (admin or broker)
 # L=localhost:8181/v1/lake/lineage — the OpenLineage HTTP transport works with endpoint=v1/lake/lineage
 ```
@@ -966,7 +992,8 @@ Design details: [docs/multi_catalog_isolation.md](multi_catalog_isolation.md).
 | GET | `/v1/{prefix}/governance/spec` | governance as a declarative spec (YAML; `?format=json`) |
 | POST | `/v1/{prefix}/governance/spec` | plan (default) or `?mode=apply` a spec; `prune`, `if_version`, `source` |
 | GET | `/v1/{prefix}/lineage` | dataset lineage graph around `?dataset=schema.table` + who touched it (admin) |
-| GET | `/v1/{prefix}/lineage/events` | OpenLineage events; `after_id` cursor, `dataset`, `kind`, `since`, `format=ndjson` (admin) |
+| GET | `/v1/{prefix}/lineage/events` | OpenLineage events; `after_id` cursor, `dataset`, `kind`, `since`, `order=desc`, `format=ndjson` (admin) |
+| GET | `/v1/{prefix}/lineage/carried-tags` | the tags each table carries from what it was made of (admin or broker) |
 | POST | `/v1/{prefix}/lineage` | ingest OpenLineage RunEvents (admin or broker; caller stamped) |
 | POST | `/v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` | DuckLake compaction + file cleanup |
 | POST | `/v1/{prefix}/namespaces/{ns}/result-sets` | run a SELECT as the caller, return its result as Parquet + a credential for it (cached; `mode: lookup`) |

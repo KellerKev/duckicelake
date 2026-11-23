@@ -9,7 +9,8 @@ import uuid
 import pytest
 
 from duckicelake import lineage
-from test_governance_phase3 import _make_table, _vended_duckdb, direct_catalog  # noqa: F401
+from test_governance_phase3 import (SCHEMA_JSON, _make_table, _make_table_only,  # noqa: F401
+                                    _vended_duckdb, direct_catalog)
 
 
 # ---- pure ---------------------------------------------------------------
@@ -197,3 +198,187 @@ def test_rest_commit_attribution(client, settings, direct_catalog):  # noqa: F81
               if e["event"]["outputs"][0]["facets"].get("duckicelake_write")]
     assert [w["principal"] for w in writes] == ["rest_writer"], writes
     assert writes[0]["event"]["run"]["facets"]["duckicelake_commit"]["writer"]["via"] == "rest"
+
+
+def test_replace_is_one_overwrite(client, settings, direct_catalog):  # noqa: F811
+    ns = _ns("rep")
+    _make_table(client, ns, "events")
+    alias = settings.catalog_name
+    with direct_catalog.cursor() as c:
+        c.execute(f'CREATE OR REPLACE TABLE "{alias}"."{ns}".events AS SELECT 1 AS id')
+    states = [e["event"]["outputs"] for e in _events(client, f"{ns}.events", "commit")]
+    assert [o[0]["facets"]["lifecycleStateChange"]["lifecycleStateChange"] for o in states] \
+        == ["CREATE", "OVERWRITE"], states
+    assert len(states[1]) == 1          # not a dropped table and a created one
+
+
+def test_names_are_matched_ignoring_case(client):
+    """A producer that folds case (Levitate reports the tables a write read in
+    lowercase) still links to the table: the event is stored under the name
+    the catalog has, and a lookup by any spelling finds it."""
+    ns = _ns("case")
+    client.post("/v1/lake/namespaces", json={"namespace": [ns]}).raise_for_status()
+    for t in ("RawOrders", "Report"):
+        client.post(f"/v1/lake/namespaces/{ns}/tables",
+                    json={"name": t, "schema": SCHEMA_JSON}).raise_for_status()
+    dns = _ds_ns(client)
+    client.post("/v1/lake/lineage", json=_run_event(
+        [f"{ns}.raworders"], [f"{ns}.REPORT"], ns=dns)).raise_for_status()
+    g = client.get("/v1/lake/lineage", params={"dataset": f"{ns}.report"}).json()
+    assert g["dataset"] == f"{ns}.Report"
+    assert [(e["from"], e["to"]) for e in g["edges"]] == [(f"{ns}.RawOrders", f"{ns}.Report")]
+    # the same node as the table's own commit, so both show up together
+    kinds = {e["kind"] for e in _events(client, f"{ns}.rawORDERS")}
+    assert kinds >= {"commit", "ingest"}, kinds
+    stored = _events(client, f"{ns}.Report", "ingest")[0]["event"]
+    assert stored["inputs"][0]["name"] == f"{ns}.RawOrders"
+    assert stored["run"]["facets"]["duckicelake_ingest"]["renamed"] == {
+        f"{ns}.raworders": f"{ns}.RawOrders", f"{ns}.REPORT": f"{ns}.Report"}
+
+
+def _carried(client, ns):
+    got = client.get("/v1/lake/lineage/carried-tags")
+    assert got.status_code == 200, got.text
+    return sorted((r["table"], r["tag"]) for r in got.json()["carried"] if r["schema"] == ns)
+
+
+def _carrying(ns, table, tags, dns, run_id=None):
+    e = _run_event([f"{ns}.src"], [f"{ns}.{table}"], ns=dns)
+    e["outputs"][0]["facets"] = {"duckicelake_carriedTags": {"tags": tags}}
+    if run_id:
+        e["run"]["runId"] = run_id
+    return e
+
+
+def test_carried_tags_follow_the_table(client, settings, direct_catalog):  # noqa: F811
+    ns = _ns("car")
+    _make_table(client, ns, "copy")
+    _make_table_only(client, ns, "other")
+    dns = _ds_ns(client)
+    alias = settings.catalog_name
+    client.post("/v1/lake/lineage", json=[
+        _carrying(ns, "COPY", ["PII.Email"], dns),
+        _carrying(ns, "copy", ["tier.gold"], dns),
+        _carrying(ns, "other", ["pii.email"], dns)]).raise_for_status()
+    assert _carried(client, ns) == [("copy", "pii.email"), ("copy", "tier.gold"),
+                                    ("other", "pii.email")]
+    assert client.get("/v1/lake/lineage", params={"dataset": f"{ns}.copy"}
+                      ).json()["carried_tags"] == ["pii.email", "tier.gold"]
+
+    # an insert changes nothing; a rename takes the tags along
+    with direct_catalog.cursor() as c:
+        c.execute(f'INSERT INTO "{alias}"."{ns}".copy VALUES (1, \'a@x.io\')')
+        c.execute(f'ALTER TABLE "{alias}"."{ns}".copy RENAME TO copy2')
+    assert _carried(client, ns) == [("copy2", "pii.email"), ("copy2", "tier.gold"),
+                                    ("other", "pii.email")]
+
+    # replaced by anyone, with anything: it starts afresh. The run that made
+    # the replacing commit keeps what it reported, even when its report was
+    # there before the commit was read.
+    run_id = str(uuid.uuid4())
+    client.post("/v1/lake/lineage", json=_carrying(ns, "copy2", ["tier.silver"], dns, run_id)
+                ).raise_for_status()
+    extra = '{"openlineage": {"run_id": "%s", "job_name": "j", "job_namespace": "t"}}' % run_id
+    with direct_catalog.cursor() as c:
+        c.execute("BEGIN")
+        c.execute(f'CALL "{alias}".set_commit_message(\'t\', \'replace\', extra_info => ?)', [extra])
+        c.execute(f'CREATE OR REPLACE TABLE "{alias}"."{ns}".copy2 AS SELECT 1 AS id')
+        c.execute("COMMIT")
+        c.execute(f'DROP TABLE "{alias}"."{ns}".other')
+    assert _carried(client, ns) == [("copy2", "tier.silver")]
+
+    bad = _carrying(ns, "copy2", "pii.email", dns)
+    assert client.post("/v1/lake/lineage", json=bad).status_code == 400
+
+
+def test_unpoliced_load_table_is_an_access_event(client):
+    """No policy applies, so the audit trail has no row for the read; lineage
+    records it, once per principal and table in the dedup window."""
+    ns = _ns("plain")
+    _make_table(client, ns, "events")
+    for _ in range(3):
+        client.get(f"/v1/lake/namespaces/{ns}/tables/events").raise_for_status()
+    access = [a for a in _events(client, f"{ns}.events", "access")
+              if a["event"]["job"]["name"] == "duckicelake.access.load_table"]
+    assert 1 <= len(access) <= 4, access       # at most one per proxy worker
+    facet = access[0]["event"]["run"]["facets"]["duckicelake_access"]
+    assert facet["decision"] == "ok" and facet["channel"] == "rest"
+    audit = client.get("/v1/lake/governance/audit", params={"limit": 500}).json()["entries"]
+    assert not [e for e in audit if e["operation"] == "load_table"
+                and e["object"] == f"{ns}.events"]
+
+
+def test_commit_without_a_recorded_writer(client, settings, direct_catalog):  # noqa: F811
+    """A commit from before the writer trigger existed: the event says nobody
+    was recorded, unless the audit trail shows exactly one principal
+    committing that table through REST at that moment."""
+    alias = settings.catalog_name
+    sc = direct_catalog.sidecar_sql
+
+    def write_without_trigger_row(ns, auditors):
+        before = lineage.current_snapshot_id(direct_catalog)
+        with direct_catalog.cursor() as c:
+            c.execute(f'INSERT INTO "{alias}"."{ns}".events VALUES (1, \'a@x.io\')')
+        with direct_catalog.pg_cursor() as cur:
+            cur.execute(f"DELETE FROM {sc}.duckicelake_snapshot_writer WHERE snapshot_id > %s",
+                        (before,))
+            for who in auditors:
+                cur.execute(
+                    f"INSERT INTO {sc}.duckicelake_governance_audit "
+                    "(principal_sub, operation, object, decision) VALUES (%s, 'commit_table', %s, 'ok')",
+                    (who, f"{ns}.events"))
+        writes = [e for e in _events(client, f"{ns}.events", "commit")
+                  if e["event"]["outputs"][0]["facets"].get("duckicelake_write")]
+        assert len(writes) == 1, writes
+        return writes[0]["principal"], writes[0]["event"]["run"]["facets"]["duckicelake_commit"]["writer"]
+
+    for label, auditors, want in (("none", [], (None, None, False)),
+                                  ("one", ["etl@x.io"], ("etl@x.io", "audit", True)),
+                                  ("two", ["a@x.io", "b@x.io"], (None, None, False))):
+        ns = _ns("old" + label)
+        _make_table(client, ns, "events")
+        _events(client, f"{ns}.events")           # harvest the create first
+        principal, writer = write_without_trigger_row(ns, auditors)
+        assert (principal, writer["via"], writer["recorded"]) == want, (label, writer)
+
+
+def test_writer_trigger_never_waits_long_for_a_busy_table(settings, direct_catalog, monkeypatch):  # noqa: F811
+    """Creating the trigger locks ducklake_snapshot against writers. Behind a
+    client's open transaction that would queue every later commit, so it
+    gives up quickly and is tried again later; once there, it is left alone."""
+    import time
+
+    import psycopg
+    sc = direct_catalog.sidecar_sql
+    schema = direct_catalog.sidecar_schema
+    monkeypatch.setattr(lineage, "TRIGGER_LOCK_TIMEOUT_MS", 300)
+
+    def has_trigger(cur):
+        cur.execute("SELECT count(*) FROM pg_trigger WHERE tgname = 'duckicelake_snapshot_writer' "
+                    "AND tgrelid = to_regclass(%s)", (f"{sc}.ducklake_snapshot",))
+        return cur.fetchone()[0] == 1
+
+    with direct_catalog.pg_cursor() as cur:
+        lineage.ensure_lineage_sidecars(cur, schema)
+        assert has_trigger(cur)
+        cur.execute(f"DROP TRIGGER duckicelake_snapshot_writer ON {sc}.ducklake_snapshot")
+        lineage.reset_lineage_cache()
+        try:
+            with psycopg.connect(settings.pg_dsn) as busy:       # a writer's open transaction
+                busy.execute(f"LOCK TABLE {sc}.ducklake_snapshot IN ROW EXCLUSIVE MODE")
+                t0 = time.monotonic()
+                lineage.ensure_lineage_sidecars(cur, schema)
+                assert time.monotonic() - t0 < 5
+                assert not has_trigger(cur) and schema in lineage._TRIGGER_PENDING
+                lineage.ensure_lineage_sidecars(cur, schema)      # not due yet: no new try
+                assert not has_trigger(cur)
+                busy.rollback()
+            lineage._TRIGGER_PENDING[schema] = 0                 # due
+            lineage.ensure_lineage_sidecars(cur, schema)
+            assert has_trigger(cur) and schema not in lineage._TRIGGER_PENDING
+            cur.execute("SHOW lock_timeout")
+            assert cur.fetchone()[0] in ("0", "0ms")
+        finally:
+            lineage.reset_lineage_cache()
+            lineage.ensure_lineage_sidecars(cur, schema)
+            assert has_trigger(cur)

@@ -4,11 +4,15 @@
        dataset-level graph around one table + who touched it (admin)
   GET  /v1/{prefix}/lineage/events[?after_id=&limit=&dataset=&kind=&since=&format=ndjson]
        the raw OpenLineage events, in id order — a cursor for forwarding
-       them to another lineage tool (admin)
+       them to another lineage tool; order=desc gives the latest ones
+       first instead (admin)
   POST /v1/{prefix}/lineage
        ingest OpenLineage RunEvents (one, a list, or {"events": [...]});
        the OpenLineage HTTP transport works with endpoint=v1/<prefix>/lineage
        (admin or broker; the caller is recorded on every event)
+  GET  /v1/{prefix}/lineage/carried-tags
+       the tags each table carries from what it was made of, as producers
+       reported them in `duckicelake_carriedTags` (admin or broker)
 
 Reads are admin-only like the audit trail: lineage names tables and the
 principals that read and wrote them. Each read first harvests the catalog's
@@ -76,7 +80,7 @@ def build_lineage_router(resolve_catalog, auth_cfg: AuthConfig | Callable[[], Au
     @router.get("/events", status_code=200)
     def get_events(prefix: str, request: Request, after_id: int = 0, limit: int = 500,
                    dataset: str | None = None, kind: str | None = None,
-                   since: str | None = None, format: str = "json"):
+                   since: str | None = None, format: str = "json", order: str = "asc"):
         _require(request)
         ctx = resolve_catalog(prefix, request)
         kinds = [k for k in (kind or "").split(",") if k] or None
@@ -84,6 +88,8 @@ def build_lineage_router(resolve_catalog, auth_cfg: AuthConfig | Callable[[], Au
             raise HTTPException(400, f"kind must be among {list(lineage.KINDS)}")
         if format not in ("json", "ndjson"):
             raise HTTPException(400, "format must be json or ndjson")
+        if order not in ("asc", "desc"):
+            raise HTTPException(400, "order must be asc or desc")
         try:
             since_dt = datetime.fromisoformat(since.replace("Z", "+00:00")) if since else None
         except ValueError:
@@ -91,12 +97,20 @@ def build_lineage_router(resolve_catalog, auth_cfg: AuthConfig | Callable[[], Au
         _fresh(ctx)
         rows = lineage.list_events(ctx.catalog, after_id=max(0, after_id),
                                    limit=max(1, min(limit, 5000)), dataset=dataset,
-                                   kinds=kinds, since=since_dt)
+                                   kinds=kinds, since=since_dt, newest_first=order == "desc")
         if format == "ndjson":
             body = "".join(json.dumps(r["event"]) + "\n" for r in rows)
-            headers = {"X-Last-Id": str(rows[-1]["id"])} if rows else {}
+            headers = {"X-Last-Id": str(max(r["id"] for r in rows))} if rows else {}
             return Response(body, media_type="application/x-ndjson", headers=headers)
-        return {"events": rows, "last_id": rows[-1]["id"] if rows else after_id}
+        return {"events": rows,
+                "last_id": max((r["id"] for r in rows), default=after_id)}
+
+    @router.get("/carried-tags", status_code=200)
+    def get_carried_tags(prefix: str, request: Request):
+        _require(request, broker_ok=True)
+        ctx = resolve_catalog(prefix, request)
+        _fresh(ctx)       # a replaced or dropped table must have lost its tags by now
+        return {"carried": lineage.carried_tags(ctx.catalog)}
 
     @router.post("", status_code=201)
     async def post_events(prefix: str, request: Request):
