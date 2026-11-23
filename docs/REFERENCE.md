@@ -459,6 +459,78 @@ Detaching a mask, untagging a column, or revoking a grant flips the affected
 reads back to cleartext on the **next** request, and the proxy drops the now-
 stale masking views / pre-masked exports for those tables automatically.
 
+### Governance as a spec (export / plan / apply)
+
+A catalog's governance round-trips through one declarative document, so it
+can live in git and be reviewed like code. It covers authored intent: tags,
+roles + members, object grants, tag assignments, masking and row-access
+policies with their attachments. Static S3 keys (credentials), object owners
+and the audit trail are deliberately not in it.
+
+```yaml
+version: 1
+kind: duckicelake/governance
+tags:
+- tag: pii.email
+roles:
+- role: pii_reader
+  members: [alice@acme.test]
+grants:
+- role: analysts
+  privilege: select
+  on: {schema: analytics, table: customers}
+tag_assignments:
+- tag: pii.email
+  on: {schema: analytics, table: customers, column: email}
+masking_policies:
+- name: mask_email
+  signature: (val VARCHAR)
+  body: left(val, 2) || '***'
+  unmasked_roles: [pii_reader]
+  attach:
+  - tag: pii.email
+row_access_policies:
+- name: eu_only
+  signature: (region VARCHAR)
+  body: region = 'EU'
+  attach:
+  - on: {schema: analytics, table: orders}
+    columns: [region]
+```
+
+```bash
+curl -s $P/spec > governance.yaml                          # export (?format=json too)
+curl -sX POST "$P/spec" --data-binary @governance.yaml     # plan (the default)
+curl -sX POST "$P/spec?mode=apply&if_version=42&source=$(git rev-parse HEAD)" --data-binary @governance.yaml
+# or: python -m duckicelake.governance_spec {export|plan|apply} <catalog> [file] [--prune]
+```
+
+- **Plan is a real dry run.** Apply and plan both run every change through
+  the same store methods as the authoring endpoints, inside **one** Postgres
+  transaction; a plan then rolls back. A plan that passes is exactly what
+  apply does, the one-mask-per-column invariant included (409 either way),
+  and a failing apply leaves nothing half-applied.
+- **Additive by default, authoritative with `prune=true`**: without it the
+  import only creates and updates; with it, whatever the catalog has that
+  the spec lacks is removed (dependents first: attachments, assignments,
+  grants, members, then policies, tags, roles). Tables whose policy set
+  shrank get their masking views / exports resynced, as a REST detach does.
+- **`if_version`** (the plan's `base_version`) makes apply refuse with 409 if
+  governance changed since the plan. The CLI always passes it.
+- **Strict**: unknown keys, duplicates, YAML aliases, bodies that are not one
+  expression, and references to a policy, tag or role the resulting state
+  does not define are 400s, because a typo in a security spec must not
+  quietly mean "no policy". Unknown tables/columns, values outside a tag's
+  `allowed_values`, and bypass roles nobody holds are warnings (governance
+  may be authored before the data lands).
+- **Audited**: every change writes its usual audit row, plus one
+  `import_governance_spec` row with the spec's content `digest` (formatting-
+  and order-independent), `source` (e.g. a git revision), `prune` and counts.
+- Export lists every tag and role the catalog *uses*, even ones only ever
+  referenced (the store never required a definition row); importing that
+  export creates the missing definitions once, after which export → import
+  is a no-op.
+
 ### How policies compose
 
 - **Can one tag carry multiple policies?** Yes — a tag can hold several
@@ -848,6 +920,8 @@ Design details: [docs/multi_catalog_isolation.md](multi_catalog_isolation.md).
 | DELETE | same paths (policies/tags/roles by name in the path; attachments/object-tags/grants by body) | delete / detach / untag / revoke; 409 while still referenced |
 | GET | `/v1/{prefix}/governance/effective-policies` | derived policy set + enforced plan for `?table=…&principal=…` |
 | GET | `/v1/{prefix}/governance/audit` | governance + enforcement audit trail |
+| GET | `/v1/{prefix}/governance/spec` | governance as a declarative spec (YAML; `?format=json`) |
+| POST | `/v1/{prefix}/governance/spec` | plan (default) or `?mode=apply` a spec; `prune`, `if_version`, `source` |
 | POST | `/v1/{prefix}/admin/namespaces/{ns}/tables/{tbl}/compact` | DuckLake compaction + file cleanup |
 | POST | `/v1/{prefix}/namespaces/{ns}/result-sets` | run a SELECT as the caller, return its result as Parquet + a credential for it (cached; `mode: lookup`) |
 | GET | `/v1/{prefix}/namespaces/{ns}/result-sets/{id}` | fresh credential for a live result set the caller owns |

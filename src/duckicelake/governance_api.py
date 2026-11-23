@@ -17,7 +17,11 @@ from __future__ import annotations
 from typing import Callable
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+
+from . import governance_spec
 
 from .auth import AuthConfig, claims_from_request, is_admin_scope, is_broker_scope
 from .sqlsafe import check_single_select
@@ -409,6 +413,56 @@ def build_governance_router(
             "view_sql": plan.view_sql,
         }
         return derived
+
+    # ---- governance as a declarative spec ------------------------------
+
+    @router.get("/spec", status_code=200)
+    def export_spec(prefix: str, request: Request, format: str = "yaml"):
+        """The catalog's governance as a spec document (YAML by default)."""
+        store, engine, ctx = _resolve(prefix, request)
+        if format not in ("yaml", "json"):
+            raise HTTPException(400, "format must be yaml or json")
+        doc, version = governance_spec.export(store, catalog=prefix)
+        if format == "json":
+            return {"governance_version": version, "spec": doc}
+        text = (f"# duckicelake governance spec, catalog {prefix}, "
+                f"governance version {version}\n" + governance_spec.dump_yaml(doc))
+        return Response(text, media_type="application/yaml",
+                        headers={"X-Governance-Version": version})
+
+    @router.post("/spec", status_code=200)
+    async def import_spec(prefix: str, request: Request, mode: str = "plan",
+                          prune: bool = False, if_version: str | None = None,
+                          source: str | None = None):
+        """Plan (default) or apply a spec. The body is YAML or JSON whatever
+        the content-type says (the console proxy always sends JSON's).
+        `prune=true` makes the spec authoritative: what it lacks is removed.
+        `if_version` refuses the apply (409) if governance moved since the
+        plan; `source` (e.g. a git revision) is recorded in the audit row."""
+        if mode not in ("plan", "apply"):
+            raise HTTPException(400, "mode must be plan or apply")
+        store, engine, ctx = _resolve(prefix, request)
+        principal = _principal(request)
+        raw = await request.body()
+        if source is not None and len(source) > 200:
+            raise HTTPException(400, "source is limited to 200 characters")
+
+        def _work():
+            doc = governance_spec.load_document(raw)
+            return governance_spec.run(store, doc, principal=principal,
+                                       apply=(mode == "apply"), prune=prune,
+                                       if_version=if_version, source=source)
+        try:
+            result = await run_in_threadpool(_work)
+        except governance_spec.SpecError as e:
+            raise HTTPException(400, str(e))
+        except governance_spec.VersionConflict as e:
+            raise HTTPException(409, str(e))
+        except GovernanceConflict as e:
+            raise HTTPException(409, str(e))
+        if mode == "apply" and result.get("resync"):
+            await run_in_threadpool(_resync, ctx, [tuple(t) for t in result["resync"]])
+        return result
 
     @router.get("/audit", status_code=200)
     def audit(prefix: str, request: Request, limit: int = 200):

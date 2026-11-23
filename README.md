@@ -126,6 +126,12 @@ audit trail. Full model — tag cascade, one-mask-per-column, upsert/rotate
 semantics, the hardening list from two adversarial review passes — in
 [docs/REFERENCE.md](docs/REFERENCE.md#governance-reference).
 
+**Policies are not locked in the catalog.** `GET /governance/spec` exports a
+catalog's whole governance model as one YAML document; `POST` it back to plan
+(a real dry run) or apply it in a single transaction, additive or
+authoritative (`prune=true`). Keep it in git, review it in a PR, apply it on
+merge — see [docs/REFERENCE.md](docs/REFERENCE.md#governance-as-a-spec-export--plan--apply).
+
 *Receipts:* [`masked_export.py`](src/duckicelake/masked_export.py) ·
 byte-proof tests in [`test_governance_phase4.py`](tests/test_governance_phase4.py)
 (masked principal's creds: 403 on base keys, 200 on masked copies) ·
